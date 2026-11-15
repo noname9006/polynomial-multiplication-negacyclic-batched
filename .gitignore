@@ -1,0 +1,11 @@
+# Build output, local case data, and the CMake build the platform makes.
+/build/
+/build-cpu/
+/work/
+/runs/
+*.exe
+*.o
+*.obj
+.vs/
+.vscode/
+__pycache__/
