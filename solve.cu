@@ -1,38 +1,340 @@
 // Your answer. Three functions, and nothing to declare.
 //
-// This file is deliberately portable C++: it builds with nvcc through the
-// generated CMakeLists (the submission path) and with g++ as a plain
-// translation unit (the local test path, see ../../tools/run_local.ps1). The
-// GPU path is added below under `#ifdef __CUDACC__` without disturbing it, so
-// the CPU implementation stays available as the reference and as a fallback.
+// Two paths, one answer:
+//
+//   * the device path (polymul_gpu.cuh), used when the machine has a GPU and
+//     the kernels proved themselves against the host path during fherma_init;
+//   * the portable path (polymul.hpp), which is always built and is what runs
+//     when there is no device, when an allocation fails, or when the untimed
+//     self-check disagrees with the host by one bit.
+//
+// That is deliberate. The device path is written on a machine with no GPU, so
+// the thing that decides whether to trust it is the one run that can compare it
+// to the reference on the machine that will actually measure it — and the
+// reference is compiled into the same binary.
 #include "fherma.h"
 
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <thread>
 
 #include "polymul.hpp"
 
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+
+#include "polymul_gpu.cuh"
+#endif
+
+// A kernel launch, spelled once. Under nvcc this is the launch itself; under
+// tools/hostcheck.ps1 — an ordinary compiler with the one-thread shim standing
+// in for the device — it is a plain call, which is what lets the host half of
+// this file be type-checked on a machine with no CUDA toolkit. Nothing else in
+// the file changes between the two.
+#if defined(PGPU_HOST_CHECK)
+#define PG_LAUNCH(kernel, grid, block, shared, stream, ...) \
+    ((void)(grid), (void)(block), (void)(shared), (void)(stream), kernel(__VA_ARGS__))
+#else
+#define PG_LAUNCH(kernel, grid, block, shared, stream, ...) \
+    kernel<<<grid, block, shared, stream>>>(__VA_ARGS__)
+#endif
+
 namespace {
+
+#ifdef __CUDACC__
+using pgpu::u32;
+using pgpu::u64;
+
+// Pairs carried through the pipeline in one pass. Everything for a pair is
+// k*N*8 bytes per operand, so this is what keeps the device working set near L2
+// instead of streaming 8 GB from HBM.
+constexpr u32 kPairsPerPass = 16;
+
+void* device_alloc(std::size_t bytes) {
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) {
+        cudaGetLastError();  // clear, the caller decides what to do
+        return nullptr;
+    }
+    return p;
+}
+
+template <class T>
+bool upload(T*& dst, const std::vector<T>& src) {
+    if (src.empty()) return true;
+    dst = static_cast<T*>(device_alloc(src.size() * sizeof(T)));
+    if (!dst) return false;
+    return cudaMemcpy(dst, src.data(), src.size() * sizeof(T), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+// Deterministic, so a disagreement is reproducible from the point alone.
+struct Rng {
+    u64 s;
+    explicit Rng(u64 seed) : s(seed ? seed : 0x9e3779b97f4a7c15ull) {}
+    u64 next() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        return s;
+    }
+};
+#endif
 
 struct State {
     polymul::Plan plan;
     std::unique_ptr<polymul::Engine> engine;
+
+#ifdef __CUDACC__
+    bool gpu_ok = false;           // the device path is trusted for this point
+    bool result_on_device = false; // run left the answer in d_c
+    bool inputs_on_device = false; // h2d has been called since the last run
+    cudaStream_t stream = nullptr;
+
+    u64* d_primes = nullptr;
+    u64* d_pinv = nullptr;
+    u64* d_r2 = nullptr;
+    u64* d_root_fwd = nullptr;
+    u64* d_root_inv = nullptr;
+    u64* d_twist_fwd = nullptr;
+    u64* d_twist_inv = nullptr;
+    u64* d_limb_w = nullptr;
+    u64* d_inv_p = nullptr;
+    u32* d_p_half = nullptr;
+    u32* d_p_mod_q = nullptr;
+    u32* d_q = nullptr;
+    u32* d_mu = nullptr;
+
+    u32* d_a = nullptr;
+    u32* d_b = nullptr;
+    u32* d_c = nullptr;
+    u64* d_resa = nullptr;
+    u64* d_resb = nullptr;
+
+    pgpu::Params par{};
+    std::size_t in_elems = 0;  // B*N*L u32 per operand
+
+    void release() {
+        void* all[] = {d_primes, d_pinv, d_r2, d_root_fwd, d_root_inv, d_twist_fwd,
+                       d_twist_inv, d_limb_w, d_inv_p, d_p_half, d_p_mod_q, d_q, d_mu,
+                       d_a, d_b, d_c, d_resa, d_resb};
+        for (void* p : all)
+            if (p) cudaFree(p);
+        if (stream) cudaStreamDestroy(stream);
+        d_primes = d_pinv = d_r2 = d_root_fwd = d_root_inv = nullptr;
+        d_twist_fwd = d_twist_inv = d_limb_w = d_inv_p = nullptr;
+        d_p_half = d_p_mod_q = d_q = d_mu = nullptr;
+        d_a = d_b = d_c = nullptr;
+        d_resa = d_resb = nullptr;
+        stream = nullptr;
+        gpu_ok = false;
+    }
+#endif
 };
 
 }  // namespace
 
-// Setup. Once per point, not measured. It sees only (B, N, W, L, q), so every
+// ---------------------------------------------------------------------------
+// device setup and the self-check
+// ---------------------------------------------------------------------------
+#ifdef __CUDACC__
+namespace {
+
+// Flatten the plan in place; the params are only meaningful once every upload
+// has landed, which is why this is separate from the uploads themselves.
+bool upload_tables(State& s) {
+    const polymul::Plan& plan = s.plan;
+    const std::size_t k = plan.k(), N = plan.N, L = plan.L;
+
+    std::vector<u64> primes(k), pinv(k), r2(k), root_fwd, root_inv, twist_fwd, twist_inv,
+        limb_w, inv_p(k * k, 0);
+    for (std::size_t m = 0; m < k; ++m) {
+        primes[m] = plan.primes[m];
+        pinv[m] = plan.mods[m].pinv;
+        r2[m] = plan.mods[m].r2;
+        root_fwd.insert(root_fwd.end(), plan.root_fwd[m].begin(), plan.root_fwd[m].end());
+        root_inv.insert(root_inv.end(), plan.root_inv[m].begin(), plan.root_inv[m].end());
+        twist_fwd.insert(twist_fwd.end(), plan.twist_fwd[m].begin(), plan.twist_fwd[m].end());
+        twist_inv.insert(twist_inv.end(), plan.twist_inv[m].begin(), plan.twist_inv[m].end());
+        limb_w.insert(limb_w.end(), plan.limb_w[m].begin(), plan.limb_w[m].end());
+    }
+    for (std::size_t m = 1; m < k; ++m)
+        for (std::size_t j = 0; j < m; ++j) inv_p[j * k + m] = plan.inv_p[j][m];
+
+    std::vector<u32> p_half(plan.P_half.limbs()), p_mod_q(plan.P_mod_q.limbs()), q(L),
+        mu(plan.mu.limbs());
+    plan.P_half.to_le(p_half.data(), p_half.size());
+    plan.P_mod_q.to_le(p_mod_q.data(), p_mod_q.size());
+    plan.q.to_le(q.data(), L);
+    plan.mu.to_le(mu.data(), mu.size());
+
+    if (!upload(s.d_primes, primes) || !upload(s.d_pinv, pinv) || !upload(s.d_r2, r2) ||
+        !upload(s.d_root_fwd, root_fwd) || !upload(s.d_root_inv, root_inv) ||
+        !upload(s.d_twist_fwd, twist_fwd) || !upload(s.d_twist_inv, twist_inv) ||
+        !upload(s.d_limb_w, limb_w) || !upload(s.d_inv_p, inv_p) ||
+        !upload(s.d_p_half, p_half) || !upload(s.d_p_mod_q, p_mod_q) ||
+        !upload(s.d_q, q) || !upload(s.d_mu, mu))
+        return false;
+
+    pgpu::Params& p = s.par;
+    p.N = static_cast<u32>(N);
+    p.L = static_cast<u32>(L);
+    p.k = static_cast<u32>(k);
+    p.B = 0;  // set per pass: the kernels index [prime][pair][i] with this stride
+    p.primes = s.d_primes;
+    p.pinv = s.d_pinv;
+    p.r2 = s.d_r2;
+    p.root_fwd = s.d_root_fwd;
+    p.root_inv = s.d_root_inv;
+    p.twist_fwd = s.d_twist_fwd;
+    p.twist_inv = s.d_twist_inv;
+    p.limb_w = s.d_limb_w;
+    p.inv_p = s.d_inv_p;
+    p.P_half = s.d_p_half;
+    p.P_mod_q = s.d_p_mod_q;
+    p.qlimbs = s.d_q;
+    p.mu = s.d_mu;
+    p.np = static_cast<u32>(p_half.size());
+    p.nq = static_cast<u32>(p_mod_q.size());
+    p.nmu = static_cast<u32>(mu.size());
+    p.m_limbs = static_cast<u32>(plan.m_limbs);
+    return true;
+}
+
+// The whole device pipeline for `pairs` pairs already resident in d_a/d_b.
+// Returns false if any launch or the synchronisation reported an error.
+bool gpu_multiply(State& s, u32 pairs) {
+    const u32 N = s.par.N, L = s.par.L, k = s.par.k;
+    const u32 tiles = (N + pgpu::TILE - 1) / pgpu::TILE;
+    const u32 block = 256;
+
+    for (u32 t0 = 0; t0 < pairs; t0 += kPairsPerPass) {
+        const u32 tb = (pairs - t0 < kPairsPerPass) ? pairs - t0 : kPairsPerPass;
+        pgpu::Params p = s.par;
+        p.B = tb;
+
+        const pgpu::u32* pa = s.d_a + static_cast<std::size_t>(t0) * N * L;
+        const pgpu::u32* pb = s.d_b + static_cast<std::size_t>(t0) * N * L;
+        pgpu::u32* pc = s.d_c + static_cast<std::size_t>(t0) * N * L;
+
+        const dim3 grid_rns(tiles, tb);
+        PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pa, s.d_resa);
+        PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pb, s.d_resb);
+        PG_LAUNCH(pgpu::k_ntt, tb * k, block, 0, s.stream, p, s.d_resa, s.d_resb);
+        const u32 crt_block = 256;
+        const dim3 grid_crt((N + crt_block - 1) / crt_block, tb);
+        PG_LAUNCH(pgpu::k_crt, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc);
+    }
+
+    if (cudaGetLastError() != cudaSuccess) return false;
+    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+}
+
+// Two random pairs, both ways, compared coefficient by coefficient. Runs in
+// fherma_init, which is not timed, and decides whether fherma_run may use the
+// device at all. Two rather than one on purpose: with a single pair every
+// [pair] index in the kernels is zero, which would hide a wrong pair stride.
+// Nothing about the case data is involved: the pairs are generated here from the
+// point's own constants.
+bool gpu_selfcheck(State& s, u32 pairs) {
+    const polymul::Plan& plan = s.plan;
+    const std::size_t N = plan.N, L = plan.L, per = N * L;
+
+    std::vector<u32> a(pairs * per), b(pairs * per), want(pairs * per, 0),
+        got(pairs * per, 0);
+    Rng rng(plan.primes[0] ^ (static_cast<u64>(N) << 32) ^ plan.q.limb(0));
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        a[i] = static_cast<u32>(rng.next());
+        b[i] = static_cast<u32>(rng.next());
+    }
+    // Canonical inputs: the specification promises coefficients in [0, q).
+    for (u32 i = 0; i < pairs * static_cast<u32>(N); ++i) {
+        for (u32* c : {a.data() + static_cast<std::size_t>(i) * L,
+                       b.data() + static_cast<std::size_t>(i) * L}) {
+            polymul::Big x = polymul::Big::from_le(c, L);
+            if (polymul::cmp(x, plan.q) < 0) continue;
+            polymul::Big quot, rem;
+            polymul::divmod(x, plan.q, quot, rem);
+            rem.to_le(c, L);
+        }
+    }
+
+    for (u32 j = 0; j < pairs; ++j)
+        s.engine->multiply(a.data() + static_cast<std::size_t>(j) * per,
+                           b.data() + static_cast<std::size_t>(j) * per,
+                           want.data() + static_cast<std::size_t>(j) * per);
+
+    if (cudaMemcpy(s.d_a, a.data(), a.size() * sizeof(u32), cudaMemcpyHostToDevice) !=
+            cudaSuccess ||
+        cudaMemcpy(s.d_b, b.data(), b.size() * sizeof(u32), cudaMemcpyHostToDevice) !=
+            cudaSuccess)
+        return false;
+    if (!gpu_multiply(s, pairs)) return false;
+    if (cudaMemcpy(got.data(), s.d_c, got.size() * sizeof(u32), cudaMemcpyDeviceToHost) !=
+        cudaSuccess)
+        return false;
+
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < got.size(); ++i)
+        if (got[i] != want[i]) ++bad;
+    if (bad) {
+        std::fprintf(stderr,
+                     "polymul: device path disagrees with the host on %zu of %zu limbs; "
+                     "using the host path\n",
+                     bad, got.size());
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+#endif  // __CUDACC__
+
+// Setup. Once per point, and not measured. It sees only (B, N, W, L, q), so every
 // parameter-dependent table is built here: primes, twiddles, CRT and Barrett
-// constants. On a GPU this is also where the device buffers, the streams and
-// the copies of those tables would be allocated.
+// constants, and — on a device — the same tables in device memory, plus the
+// self-check that decides whether they are used.
 void* fherma_init(const fherma::Point& p) {
     if (p.q.data.size() != p.L) throw std::runtime_error("point: q has the wrong limb count");
     auto state = std::make_unique<State>();
     state->plan = polymul::build_plan(p.N, p.W, p.L, p.q.data.data());
+
     const unsigned hw = std::thread::hardware_concurrency();
     const unsigned threads = hw == 0 ? 1u : (hw > 64u ? 64u : hw);
     state->engine = std::make_unique<polymul::Engine>(state->plan, threads);
+
+#ifdef __CUDACC__
+    const polymul::Plan& plan = state->plan;
+    const std::size_t per = static_cast<std::size_t>(plan.N) * plan.L;
+    state->in_elems = static_cast<std::size_t>(p.B) * per;
+
+    bool fits = plan.N > 0 && p.B > 0 && plan.L <= pgpu::MAXL && plan.k() <= pgpu::MAXK &&
+                plan.P.limbs() <= pgpu::MAXLIMB &&
+                plan.P.limbs() + plan.mu.limbs() <= 2 * pgpu::MAXLIMB;
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) fits = false;
+    if (fits && cudaSetDevice(0) != cudaSuccess) fits = false;
+
+    if (fits) {
+        const u32 k = static_cast<u32>(plan.k()), N = plan.N;
+        const u32 pass = p.B < kPairsPerPass ? p.B : kPairsPerPass;
+        const std::size_t pairs_bytes = static_cast<std::size_t>(pass) * k * N * 8;
+
+        if (cudaStreamCreate(&state->stream) != cudaSuccess) fits = false;
+        if (fits) fits = upload_tables(*state);
+        if (fits) state->d_a = static_cast<u32*>(device_alloc(state->in_elems * sizeof(u32)));
+        if (fits) state->d_b = static_cast<u32*>(device_alloc(state->in_elems * sizeof(u32)));
+        if (fits) state->d_c = static_cast<u32*>(device_alloc(state->in_elems * sizeof(u32)));
+        if (fits) state->d_resa = static_cast<u64*>(device_alloc(pairs_bytes));
+        if (fits) state->d_resb = static_cast<u64*>(device_alloc(pairs_bytes));
+        if (fits && (!state->d_a || !state->d_b || !state->d_c || !state->d_resa || !state->d_resb))
+            fits = false;
+        if (fits) fits = gpu_selfcheck(*state, p.B < 2 ? p.B : 2);
+        if (!fits) state->release();
+        state->gpu_ok = fits;
+    }
+#endif
+
     return state.release();
 }
 
@@ -55,11 +357,35 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     const std::size_t per = static_cast<std::size_t>(plan.N) * plan.L;
     if (static_cast<std::size_t>(in.a.data.size()) != static_cast<std::size_t>(B) * per)
         throw std::runtime_error("run: a has the wrong number of elements");
+    if (static_cast<std::size_t>(in.b.data.size()) != static_cast<std::size_t>(B) * per)
+        throw std::runtime_error("run: b has the wrong number of elements");
 
     fherma::Outputs out;
     out.c.shape = in.a.shape;
-    out.c.data.resize(in.a.data.size());
 
+#ifdef __CUDACC__
+    s->result_on_device = false;
+    if (s->gpu_ok && B > 0 && static_cast<std::size_t>(B) * per <= s->in_elems) {
+        const std::size_t bytes = static_cast<std::size_t>(B) * per * sizeof(std::uint32_t);
+        bool ok = true;
+        if (!s->inputs_on_device)
+            ok = cudaMemcpyAsync(s->d_a, in.a.data.data(), bytes, cudaMemcpyHostToDevice,
+                                 s->stream) == cudaSuccess &&
+                 cudaMemcpyAsync(s->d_b, in.b.data.data(), bytes, cudaMemcpyHostToDevice,
+                                 s->stream) == cudaSuccess;
+        if (ok && gpu_multiply(*s, static_cast<u32>(B))) {
+            out.c.data.resize(static_cast<std::size_t>(B) * per);  // filled by fherma_d2h
+            s->result_on_device = true;
+            return out;
+        }
+        // A launch or a synchronisation failed: stop trusting the device for the
+        // rest of the run rather than leaving the answer half written.
+        s->gpu_ok = false;
+        s->release();
+    }
+#endif
+
+    out.c.data.resize(static_cast<std::size_t>(B) * per);
     for (std::int64_t j = 0; j < B; ++j) {
         s->engine->multiply(in.a.data.data() + static_cast<std::size_t>(j) * per,
                             in.b.data.data() + static_cast<std::size_t>(j) * per,
@@ -68,37 +394,51 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     return out;
 }
 
-// Optional.
-void fherma_free(void* state) {
-    delete static_cast<State*>(state);
+// ---------------------------------------------------------------------------
+// the optional transfers
+// ---------------------------------------------------------------------------
+//
+// Both may only copy, byte for byte, into and out of buffers prepared in
+// fherma_init — no packing, no conversion, no arithmetic. When the device path
+// is not in use they do nothing at all, so the harness reports no transfer.
+#ifdef __CUDACC__
+void fherma_h2d(void* state, const fherma::Inputs& in) {
+    auto* s = static_cast<State*>(state);
+    s->inputs_on_device = false;
+    if (!s->gpu_ok || in.a.data.empty()) return;
+    if (in.a.data.size() != s->in_elems || in.b.data.size() != s->in_elems) return;
+
+    const std::size_t bytes = s->in_elems * sizeof(std::uint32_t);
+    if (cudaMemcpyAsync(s->d_a, in.a.data.data(), bytes, cudaMemcpyHostToDevice, s->stream) !=
+        cudaSuccess)
+        return;
+    if (cudaMemcpyAsync(s->d_b, in.b.data.data(), bytes, cudaMemcpyHostToDevice, s->stream) !=
+        cudaSuccess)
+        return;
+    s->inputs_on_device = true;
 }
 
-// ---------------------------------------------------------------------------
-// Where the GPU path goes
-// ---------------------------------------------------------------------------
-//
-// The shape of the work is fixed by the CPU path above; only the executor
-// changes. In order of payoff:
-//
-//   1. decompose + twist   (N*L*k modular multiply-adds — a (L x k) matrix per
-//                           coefficient; tensor cores if you split into bytes)
-//   2. NTT per prime       (k * 3 * N log N butterflies; cuPQC-NTT ships a
-//                           staged length-N transform, or write your own
-//                           shared-memory kernel)
-//   3. pointwise product   (k * N Montgomery multiplies)
-//   4. inverse NTT+untwist (k * N log N + k * N)
-//   5. Garner/CRT+Barrett  (k^2/2 small reductions and one 111x55-limb product
-//                           per coefficient; the "tensor-core CRT" step)
-//
-// Chunk over B so the working set of one prime pass stays in L2: at
-// N = 65536, W = 1747, k = 57, one pair is 3 * 57 * 65536 * 8 B ~= 90 MB.
-//
-// Nothing in this file is device code, which is worth keeping true for as long
-// as possible. Probe the device once in `fherma_init`; if anything is missing —
-// no device, a failed allocation, a failed upload — leave a flag clear and let
-// `fherma_run` take the host path above. A submission that declines its fast
-// path is still exact and merely slower; one that throws is a run with no
-// result at all, and this is being edited from a machine with no GPU.
-//
-// `fherma_h2d` may only copy a and b byte for byte, `fherma_d2h` only copy c,
-// and fherma_run must synchronise before returning. See the challenge rules.
+fherma::Outputs fherma_d2h(void* state, fherma::Outputs answer) {
+    auto* s = static_cast<State*>(state);
+    if (s->gpu_ok && s->result_on_device && !answer.c.data.empty()) {
+        const std::size_t bytes = answer.c.data.size() * sizeof(std::uint32_t);
+        if (cudaMemcpyAsync(answer.c.data.data(), s->d_c, bytes, cudaMemcpyDeviceToHost,
+                            s->stream) == cudaSuccess)
+            cudaStreamSynchronize(s->stream);
+        else
+            cudaGetLastError();
+    }
+    s->result_on_device = false;
+    s->inputs_on_device = false;
+    return answer;
+}
+#endif
+
+// Optional.
+void fherma_free(void* state) {
+    auto* s = static_cast<State*>(state);
+#ifdef __CUDACC__
+    if (s) s->release();
+#endif
+    delete s;
+}

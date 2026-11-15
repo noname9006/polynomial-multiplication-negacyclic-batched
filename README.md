@@ -4,15 +4,16 @@ A working, exact implementation of
 [`polynomial-multiplication/negacyclic-batched@1.0.0`](https://www.fherma.io/kernels/polynomial-multiplication/specifications/negacyclic-batched),
 plus the local harness needed to test it on a machine that has no GPU.
 
-It is written as a portable C++ core, so the same files
+It is written as a portable C++ core with a CUDA path over it, so the same files
 
 * build with `g++` here, where every answer can be checked against an
   independent Python oracle, and
 * build with `nvcc` through the generated `CMakeLists.txt`, which is what the
   platform does.
 
-The CPU path is therefore two things at once: the correctness reference for a
-CUDA implementation, and a legal submission on its own.
+The CPU path is therefore three things at once: the correctness reference for
+the CUDA kernels, the fallback that runs when the device self-check disagrees,
+and a legal submission on its own.
 
 ## Measured so far
 
@@ -26,6 +27,11 @@ The CPU path is roughly three orders of magnitude off the GPU field, which is
 the expected outcome — it exists to be *right*, and to be the reference the
 CUDA kernels are diffed against.
 
+The CUDA path has not been measured here: this machine has neither `nvcc` nor a
+GPU. What is checked locally is its arithmetic, bit for bit against the host
+path, and its host half; the device self-check described below is what decides
+on the measuring machine whether it is used at all.
+
 ## Layout
 
 This directory is the repository: its root is the implementation the platform
@@ -35,6 +41,7 @@ builds (`fherma.toml` sits here, and the platform runs
 ```
 .
   polymul.hpp     the whole algorithm: big integers, RNS, NTT, Garner, Barrett
+  polymul_gpu.cuh the same arithmetic and stage order as device kernels
   solve.cu        fherma_init / fherma_run / fherma_free  (the answer)
   main.cpp        generated harness — do not edit
   fherma.h        generated types — `fherma implementation init <spec> --update` rewrites them
@@ -44,6 +51,11 @@ builds (`fherma.toml` sits here, and the platform runs
     bundle.py         make point directories, verify answers against the definition
     run_local.ps1     build + make + run + verify, one command
     selftest.ps1      the eight-point regression matrix
+    gpucheck.cpp      the device kernels against the host path, one thread per block
+    hostcheck.ps1     type-check solve.cu and the kernels with g++ (no nvcc needed)
+    qtable.py         writes qtable.hpp: the q each gpucheck point uses
+    shim/             a one-thread stand-in for the CUDA execution model
+    fakecuda/         declarations of <cuda_runtime.h> for hostcheck
   build-cpu/          local g++ build (disposable, gitignored)
   work/               generated case data and outputs (disposable, gitignored)
 ```
@@ -68,6 +80,39 @@ right version (here it is `.venv-fherma/Scripts/python.exe`).
 
 Verification of a big point does not use schoolbook multiplication; see
 [Verification](#verification).
+
+### The device half, without a device
+
+None of the CUDA work can be compiled or run here: there is no `nvcc` and no
+GPU. Two checks stand in for that, and both are cheap:
+
+```powershell
+# the kernels' arithmetic against the host path, bit for bit
+g++ -O2 -std=c++17 -o build-cpu/gpucheck.exe tools/gpucheck.cpp
+./build-cpu/gpucheck.exe
+
+# every name, type and call in solve.cu, plus the kernels, type-checked
+./tools/hostcheck.ps1
+```
+
+`gpucheck` includes `polymul_gpu.cuh` under `tools/shim/cuda_shim.hpp`, which
+maps the execution model to one block of one thread. That is faithful for these
+kernels — every thread owns whole elements and the only cross-thread dependency
+is the barrier between NTT stages — so it exercises the Montgomery products, the
+carry chain in `big_mul_add`, the twiddles, Garner, Barrett and the signed
+branch, and compares the finished coefficients with `Engine::multiply`. It runs
+the ranked point's arithmetic (k = 57, L = 55, P = 3,534 bits) at N = 1,024, and
+several smaller points end to end, in 0.2 s.
+
+What the shim cannot check is the parallel decomposition: whether block `b` and
+thread `t` are handed the right elements. That is what the self-check below does,
+on the real device.
+
+`hostcheck.ps1` compiles `solve.cu` as C++ with `__CUDACC__` defined and
+`<cuda_runtime.h>` declared by `tools/fakecuda`, and turns each kernel launch
+into a plain call. It cannot check launch geometry, the register budget or the
+generated code — only that the file is well-formed, which is otherwise a
+platform round trip to discover.
 
 ## Algorithm
 
@@ -129,6 +174,59 @@ to keep the tables resident, process pairs in blocks that fit in L2 (126 MB on
 the RTX PRO 6000), and stream `a`/`b` through the primes rather than
 materialising all `k` residues for a whole batch.
 
+## The CUDA path
+
+Three kernels, one per stage, in `polymul_gpu.cuh`; `solve.cu` owns the device
+memory, the stream, and the decision whether to use them at all.
+
+1. **`k_residues`** — one block per (pair, tile of 128 coefficients):
+   `blockIdx.y` is the pair, `blockIdx.x` the tile. The tile's raw coefficients
+   (128 × 55 u32 = 28 KiB) are staged in shared memory once, and the block then
+   walks all 57 primes, writing `Σ_l a_l · 2^{32l} mod p_m` in Montgomery form,
+   twisted. Reading the coefficient once per tile instead of once per prime is
+   what makes the stage cheap: 14 MiB per operand instead of 57 × 14 MiB, plus
+   29.9 MiB of residues out.
+
+2. **`k_ntt`** — one block per (pair, prime), 256 threads. Forward transform of
+   both operands, pointwise product into `a`, inverse transform, untwist. It is
+   in place, so `b`'s residues are dead afterwards.
+
+3. **`k_crt`** — one thread per coefficient, `blockIdx.y` the pair. Garner
+   digits `d_0 … d_{56}`, then the exact integer `X = Σ d_m Π_{j<m} p_j` by
+   `big_mul_add` in base 2^32, then `q̂ = ⌊X·μ / 2^{32·112}⌋`, `r = X - q̂q`, and
+   the signed branch. The same steps in the same order as `Engine::multiply`,
+   which is why the two answers are comparable limb for limb.
+
+Pairs go through in passes of 16: the two residue buffers are 478 MB each and
+each NTT launch is 912 blocks, which is 5 blocks per SM on the 188-SM card. The
+ranked batch is eight such passes, queued on one stream.
+
+Device arithmetic is Montgomery with `__umul64hi` only — device code has no
+guaranteed `unsigned __int128` — so a non-Montgomery `a·b mod p` is two
+Montgomery products rather than a 128-bit division.
+
+**Trust.** `fherma_init` sends two random pairs through the whole device
+pipeline and compares them, limb for limb, with the host path — the same
+buffers, the same kernels `fherma_run` will use. Two rather than one because a
+single pair makes every `pair` index zero, which would hide a wrong stride. Any
+mismatch, allocation failure, launch failure, or a point outside the built-in
+limits (k ≤ 64, L ≤ 64, P ≤ 192 limbs) leaves the host path in place, and the
+host path is in the same binary, so there is nothing to fall back *to*. Init is
+not timed, so this costs the ranking nothing.
+
+**Transfers.** `fherma_h2d` and `fherma_d2h` copy byte for byte, nothing else —
+as the rules require since 13 November, when they moved outside the ranked time
+(limits 0.45 s in, 0.25 s out). `fherma_run` still copies if they were not
+called, and is then measured with the copy.
+
+**Cost before measuring.** The NTT is one block per (pair, prime) walking all
+16 stages in global memory, so every stage reads and writes the full 512 KiB:
+three transforms plus pointwise and untwist ≈ 52 MB per (pair, prime), and
+57 × 128 of those is ≈ 380 GB per batch. At the card's ~6 TB/s that is 60 ms of
+pure traffic before any arithmetic, so the first optimisation is not arithmetic
+at all: a shared-memory 4-step transform (N = 256 × 256) turns 16 passes over
+memory into one read and one write per transform.
+
 ## Verification
 
 `tools/bundle.py` writes point directories in the on-disk protocol `main.cpp`
@@ -179,7 +277,14 @@ Checklist:
   placing. `fherma.toml` already targets the batched spec.
 * `fherma_init` may not look at `a` or `b`; it does not, and must not.
 * `fherma_run` must return only after all its work is done. The CPU path is
-  synchronous by construction; a CUDA path needs `cudaStreamSynchronize`.
+  synchronous by construction; the CUDA path synchronises the stream before it
+  returns, and `fherma_d2h` only copies.
+* `fherma_h2d` and `fherma_d2h` may only copy, byte for byte, and may not launch
+  a kernel or change the representation. Ours copy and nothing else; the limits
+  are 0.45 s in and 0.25 s out for 3.69 GB and 1.84 GB.
+* If the run page reports seconds rather than milliseconds, the device self-check
+  refused and the host path ran: stderr says which (a disagreement, a failed
+  launch, an allocation). That is the switch to look at first.
 * `N`, `W`, `L`, `q` are parameters, not constants. Handled: every table is
   built from them at setup, and the regression matrix includes `N = 1`,
   `N = 2`, `W = 2`, `W = 254` (not a multiple of 32) and the two real widths.
@@ -198,25 +303,25 @@ pipeline over it, untimed setup and all.
 
 ### The CUDA architecture question
 
-The generated `CMakeLists.txt` defaults to `-arch=sm_89`, but the runner on the
-leaderboard is `fherma-gpu-rtx6000` — an RTX PRO 6000, i.e. Blackwell,
-`sm_120`. Two consequences:
+The generated `CMakeLists.txt` builds with `-arch=sm_89` by default — the Ada
+generation, which is what the `fherma-gpu-rtx6000` tag in the leaderboard names
+(the RTX 6000 Ada, 48 GB, compute capability 8.9) and what the challenge image's
+cuPQC 0.6.0 was built for. `-arch=sm_89` emits SASS for 8.9 and no PTX, so if the
+measuring machine turned out to be a different compute capability the kernels
+would not load at all.
 
-* A pure host answer (what is here today) has no device code, so the arch does
-  not matter.
-* Once kernels are added, the default build relies on the PTX in the fatbin
-  being JIT-compiled for `sm_120` at first launch. That works, but the JIT cost
-  lands wherever the first kernel launch happens — so launch a trivial kernel
-  from `fherma_init` to pay it outside the timed window, or build natively:
+That failure is not silent, and it is not a wrong answer: the self-check in
+`fherma_init` launches the real kernels, the launch fails, and the host path
+takes over. The run page would then show ~55 s per case instead of milliseconds,
+which is exactly the signal to change one thing:
 
-  ```toml
-  [build]
-  command = "cmake -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 && cmake --build build"
-  ```
+```toml
+[build]
+command = "cmake -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 && cmake --build build"
+```
 
-  Native `sm_120` is the faster option, but only try it if you can also verify
-  that cuPQC's device-LTO objects link for that architecture — `-dlto` is on, and
-  cuPQC 0.6.0 in the challenge image was most likely built for `sm_89`.
+Native is the faster option for any given card; the reason not to guess is that
+the arch has to be one the image's `nvcc` knows, and the image is cuPQC 0.6.0's.
 
 ## What the leaderboard numbers say
 
@@ -231,7 +336,25 @@ a rounding error to leave on CUDA cores.
 
 ## Where the GPU path goes
 
-`polymul.hpp` fixes the algorithm; only the executor changes. The stage order,
-the per-stage sizes and the chunking hint are written out at the bottom of
-`solve.cu`. In payoff order: NTT over primes, pointwise product, inverse NTT,
-the `L × k` decomposition matmul, then the CRT/Barrett reconstruction.
+The stage order and the per-stage sizes are fixed by `polymul.hpp`; only the
+executor changes. In payoff order:
+
+1. **The NTT** (≈ 380 GB of traffic per batch). Reshape N = 65,536 = 256 × 256
+   and do a 4-step transform: eight stages over the columns with the rows held
+   in shared memory, a twiddle multiply, eight stages over the rows. One read
+   and one write per transform instead of sixteen.
+2. **The reconstruction.** It is `128 · N · k²/2 ≈ 1.3e10` serially dependent
+   modular reductions per batch — the leaderboard entries call theirs a
+   *tensor-core CRT* for that reason. The exact-integer path here can be
+   replaced by a weighted sum `Σ res_j · W_j mod q` with
+   `W_j = (P/p_j) · ((P/p_j)^{-1} mod p_j) mod q` precomputed at init, which is
+   one 62-bit × 1,747-bit product per prime and one Barrett reduction at the
+   end, and by a double-precision approximate-CRT sign test (P/2 is 22 bits
+   above the largest possible coefficient, so there is room).
+3. **Fewer passes.** Sixteen pairs at a time is a compromise; the residue
+   buffers could be sized to the whole batch once the NTT no longer thrashes
+   them.
+
+Measured against the field: 21.1 ms is the winning figure, so a first device
+run in the low hundreds of milliseconds is a place on the board, not a
+contender. The two items above are what separate the two.
