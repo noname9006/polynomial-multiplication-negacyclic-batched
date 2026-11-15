@@ -126,6 +126,84 @@ Big from_hex(const char* hex) {
     return x;
 }
 
+// The same stage order and the same launches as gpu_multiply in solve.cu, one
+// block at a time: every block index the real grid would create is visited.
+void device_multiply(const Flat& f, const u32* a, const u32* b, u64* resa, u64* resb,
+                     u32* out, u32 B) {
+    const u32 N = f.par.N, k = f.par.k;
+
+    threadIdx.x = 0;
+    threadIdx.y = 0;
+    threadIdx.z = 0;
+    blockDim.x = 1;
+    blockDim.y = 1;
+    blockDim.z = 1;
+    blockIdx.y = 0;
+    blockIdx.z = 0;
+
+    const u32 tiles = (N + pgpu::TILE - 1) / pgpu::TILE;
+    for (u32 j = 0; j < B; ++j)
+        for (u32 t = 0; t < tiles; ++t) {
+            blockIdx.x = t;
+            blockIdx.y = j;
+            pgpu::k_residues(f.par, a, resa);
+            pgpu::k_residues(f.par, b, resb);
+        }
+
+    const bool two_pass =
+        N >= pgpu::STEP && N % pgpu::STEP == 0 && N / pgpu::STEP <= pgpu::MAXROWS;
+    if (two_pass) {
+        const u32 rows = N / pgpu::STEP;
+        const u32 cols = pgpu::STEP / pgpu::LINES;
+        const u32 rtiles = (rows + pgpu::LINES - 1) / pgpu::LINES;
+        for (u32 j = 0; j < B; ++j)
+            for (u32 m = 0; m < k; ++m)
+                for (u32 t = 0; t < cols; ++t) {
+                    blockIdx.x = t;
+                    blockIdx.y = m;
+                    blockIdx.z = j;
+                    pgpu::k_cols_fwd(f.par, resa, resb);
+                }
+        for (u32 j = 0; j < B; ++j)
+            for (u32 m = 0; m < k; ++m)
+                for (u32 t = 0; t < rtiles; ++t) {
+                    blockIdx.x = t;
+                    blockIdx.y = m;
+                    blockIdx.z = j;
+                    pgpu::k_rows_fwd_dot(f.par, resa, resb);
+                }
+        for (u32 j = 0; j < B; ++j)
+            for (u32 m = 0; m < k; ++m)
+                for (u32 t = 0; t < rtiles; ++t) {
+                    blockIdx.x = t;
+                    blockIdx.y = m;
+                    blockIdx.z = j;
+                    pgpu::k_rows_inv(f.par, resa);
+                }
+        for (u32 j = 0; j < B; ++j)
+            for (u32 m = 0; m < k; ++m)
+                for (u32 t = 0; t < cols; ++t) {
+                    blockIdx.x = t;
+                    blockIdx.y = m;
+                    blockIdx.z = j;
+                    pgpu::k_cols_inv_twist(f.par, resa);
+                }
+    } else {
+        for (u32 j = 0; j < B; ++j)
+            for (u32 m = 0; m < k; ++m) {
+                blockIdx.x = j * k + m;
+                pgpu::k_ntt(f.par, resa, resb);
+            }
+    }
+
+    for (u32 j = 0; j < B; ++j)
+        for (u32 i = 0; i < N; ++i) {
+            blockIdx.x = i;
+            blockIdx.y = j;
+            pgpu::k_crt(f.par, resa, out + static_cast<std::size_t>(j) * N * f.par.L);
+        }
+}
+
 void run_point(u32 N, u32 W, u32 B) {
     std::printf("N=%u W=%u B=%u\n", N, W, B);
 
@@ -160,32 +238,10 @@ void run_point(u32 N, u32 W, u32 B) {
         engine.multiply(a.data() + j * per, b.data() + j * per, want.data() + j * per);
 
     // Device side, one thread per block.
-    threadIdx.x = 0;
-    blockDim.x = 1;
-
     std::vector<u64> resa(static_cast<std::size_t>(plan.k()) * B * N);
     std::vector<u64> resb(resa.size());
 
-    for (u32 j = 0; j < B; ++j) {
-        const u32 tiles = (N + pgpu::TILE - 1) / pgpu::TILE;
-        for (u32 t = 0; t < tiles; ++t) {
-            blockIdx.x = t;
-            blockIdx.y = j;
-            pgpu::k_residues(f.par, a.data(), resa.data());
-            pgpu::k_residues(f.par, b.data(), resb.data());
-        }
-        for (u32 m = 0; m < plan.k(); ++m) {
-            blockIdx.x = j * static_cast<u32>(plan.k()) + m;
-            pgpu::k_ntt(f.par, resa.data(), resb.data());
-        }
-        // One thread per coefficient in the real launch; one block per
-        // coefficient here, with the shim's single thread and blockDim of 1.
-        for (u32 i = 0; i < N; ++i) {
-            blockIdx.x = i;
-            blockIdx.y = j;
-            pgpu::k_crt(f.par, resa.data(), got.data() + static_cast<std::size_t>(j) * per);
-        }
-    }
+    device_multiply(f, a.data(), b.data(), resa.data(), resb.data(), got.data(), B);
 
     std::size_t bad = 0;
     for (std::size_t i = 0; i < B * per; ++i)
@@ -233,6 +289,9 @@ int main() {
     run_point(32, 868, 1);
     // The ranked point's arithmetic without its length: k=57, L=55, P=3534 bits.
     run_point(1024, 1747, 1);
+    // The ranked point's length with a narrow q, so all sixteen stages and the
+    // column/row split run at N=65536 without paying k=57 for it.
+    run_point(65536, 64, 1);
 
     if (failures) {
         std::printf("\n%d check(s) failed\n", failures);

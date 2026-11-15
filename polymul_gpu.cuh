@@ -201,6 +201,204 @@ __device__ inline void ntt_inv(u64* a, u32 n, u64 p, u64 pinv, const u64* roots)
     }
 }
 
+// --------------------------------------------------------- ntt, two passes
+//
+// The sixteen stages of a length-65536 transform are not all alike. Read the
+// array as 256 rows of 256, and the stages with half-length at least 256 pair
+// two elements of the same column; the stages below 256 pair two elements of
+// the same row. So a block that holds a strip of whole columns in shared memory
+// can run its eight stages there, and one that holds a strip of whole rows can
+// run the other eight — one read and one write per transform instead of one per
+// stage.
+//
+// The stages, their order and their twiddles are unchanged: element (r, c) of
+// the view is at r*STEP + c, and the twiddle is still roots[len + j] with
+// j = (i mod len), which for a column stage with len = h*STEP is
+// roots[len + j*STEP + c]. The two passes therefore produce the same values as
+// ntt_fwd and ntt_inv above, stage for stage, which is what lets gpucheck
+// compare them limb for limb.
+//
+// Only the length of a line and the twiddle's stride differ, so the four
+// kernels below are the same butterfly with those two parameters fixed.
+enum {
+    STEP = 256,     // shared-memory line length, and the split of the stages
+    LINES = 8,      // lines a block carries in shared memory
+    MAXROWS = 256   // largest number of lines in the view, i.e. N <= STEP*MAXROWS
+};
+
+__device__ inline void bfly_fwd(u64& u, u64& v, u64 tw, u64 p, u64 pinv) {
+    const u64 x = u, y = v;
+    u = mod_add(x, y, p);
+    v = mont_mul(x >= y ? x - y : x + p - y, tw, pinv, p);
+}
+
+__device__ inline void bfly_inv(u64& u, u64& v, u64 tw, u64 p, u64 pinv) {
+    const u64 x = u, y = mont_mul(v, tw, pinv, p);
+    u = mod_add(x, y, p);
+    v = x >= y ? x - y : x + p - y;
+}
+
+// Forward stages that stay inside a column: half-lengths rows/2 .. 1, column c.
+// Both operands, because the pointwise product comes after this pass.
+__global__ void k_cols_fwd(const Params p, u64* __restrict__ a, u64* __restrict__ b) {
+    const u32 m = blockIdx.y, pair = blockIdx.z;
+    const u32 rows = p.N / STEP;
+    const u32 col0 = blockIdx.x * LINES;
+    const u64 pr = p.primes[m], pv = p.pinv[m];
+    const u64* roots = p.root_fwd + static_cast<u64>(m) * p.N;
+    const u64 base = (static_cast<u64>(m) * p.B + pair) * p.N;
+
+    __shared__ u64 sa[LINES][MAXROWS];
+    __shared__ u64 sb[LINES][MAXROWS];
+
+    for (u32 t = threadIdx.x; t < LINES * rows; t += blockDim.x) {
+        const u32 ci = t % LINES, rr = t / LINES;
+        const u64 g = base + static_cast<u64>(rr) * STEP + col0 + ci;
+        sa[ci][rr] = a[g];
+        sb[ci][rr] = b[g];
+    }
+    __syncthreads();
+
+    const u32 half = rows / 2;
+    for (u32 h = rows >> 1; h; h >>= 1) {
+        const u32 len = h * STEP;
+        for (u32 bf = threadIdx.x; bf < LINES * half; bf += blockDim.x) {
+            const u32 ci = bf / half;
+            const u32 x = bf - ci * half;
+            const u32 g = x / h, j = x - g * h;
+            const u32 k = g * 2 * h + j;
+            const u64 tw = roots[len + static_cast<u64>(j) * STEP + col0 + ci];
+            bfly_fwd(sa[ci][k], sa[ci][k + h], tw, pr, pv);
+            bfly_fwd(sb[ci][k], sb[ci][k + h], tw, pr, pv);
+        }
+        __syncthreads();
+    }
+
+    for (u32 t = threadIdx.x; t < LINES * rows; t += blockDim.x) {
+        const u32 ci = t % LINES, rr = t / LINES;
+        const u64 g = base + static_cast<u64>(rr) * STEP + col0 + ci;
+        a[g] = sa[ci][rr];
+        b[g] = sb[ci][rr];
+    }
+}
+
+// Forward stages that stay inside a row, then the pointwise product. `b` is not
+// written back: its residues are dead once the product exists.
+__global__ void k_rows_fwd_dot(const Params p, u64* __restrict__ a, u64* __restrict__ b) {
+    const u32 m = blockIdx.y, pair = blockIdx.z;
+    const u32 rows = p.N / STEP;
+    const u32 line0 = blockIdx.x * LINES;
+    const u32 here = rows - line0 < static_cast<u32>(LINES) ? rows - line0 : static_cast<u32>(LINES);
+    const u64 pr = p.primes[m], pv = p.pinv[m];
+    const u64* roots = p.root_fwd + static_cast<u64>(m) * p.N;
+    const u64 base = (static_cast<u64>(m) * p.B + pair) * p.N;
+
+    __shared__ u64 sa[LINES][MAXROWS];
+    __shared__ u64 sb[LINES][MAXROWS];
+
+    for (u32 t = threadIdx.x; t < here * STEP; t += blockDim.x) {
+        const u32 li = t / STEP, k = t - li * STEP;
+        const u64 g = base + static_cast<u64>(line0 + li) * STEP + k;
+        sa[li][k] = a[g];
+        sb[li][k] = b[g];
+    }
+    __syncthreads();
+
+    for (u32 h = STEP / 2; h; h >>= 1) {
+        for (u32 bf = threadIdx.x; bf < here * (STEP / 2); bf += blockDim.x) {
+            const u32 li = bf / (STEP / 2);
+            const u32 x = bf - li * (STEP / 2);
+            const u32 g = x / h, j = x - g * h;
+            const u32 k = g * 2 * h + j;
+            const u64 tw = roots[h + j];
+            bfly_fwd(sa[li][k], sa[li][k + h], tw, pr, pv);
+            bfly_fwd(sb[li][k], sb[li][k + h], tw, pr, pv);
+        }
+        __syncthreads();
+    }
+
+    for (u32 t = threadIdx.x; t < here * STEP; t += blockDim.x) {
+        const u32 li = t / STEP, k = t - li * STEP;
+        const u64 g = base + static_cast<u64>(line0 + li) * STEP + k;
+        a[g] = mont_mul(sa[li][k], sb[li][k], pv, pr);
+    }
+}
+
+// Inverse stages that stay inside a row: half-lengths 1 .. STEP/2.
+__global__ void k_rows_inv(const Params p, u64* __restrict__ a) {
+    const u32 m = blockIdx.y, pair = blockIdx.z;
+    const u32 rows = p.N / STEP;
+    const u32 line0 = blockIdx.x * LINES;
+    const u32 here = rows - line0 < static_cast<u32>(LINES) ? rows - line0 : static_cast<u32>(LINES);
+    const u64 pr = p.primes[m], pv = p.pinv[m];
+    const u64* roots = p.root_inv + static_cast<u64>(m) * p.N;
+    const u64 base = (static_cast<u64>(m) * p.B + pair) * p.N;
+
+    __shared__ u64 sa[LINES][MAXROWS];
+
+    for (u32 t = threadIdx.x; t < here * STEP; t += blockDim.x) {
+        const u32 li = t / STEP, k = t - li * STEP;
+        sa[li][k] = a[base + static_cast<u64>(line0 + li) * STEP + k];
+    }
+    __syncthreads();
+
+    for (u32 h = 1; h < STEP; h <<= 1) {
+        for (u32 bf = threadIdx.x; bf < here * (STEP / 2); bf += blockDim.x) {
+            const u32 li = bf / (STEP / 2);
+            const u32 x = bf - li * (STEP / 2);
+            const u32 g = x / h, j = x - g * h;
+            const u32 k = g * 2 * h + j;
+            bfly_inv(sa[li][k], sa[li][k + h], roots[h + j], pr, pv);
+        }
+        __syncthreads();
+    }
+
+    for (u32 t = threadIdx.x; t < here * STEP; t += blockDim.x) {
+        const u32 li = t / STEP, k = t - li * STEP;
+        a[base + static_cast<u64>(line0 + li) * STEP + k] = sa[li][k];
+    }
+}
+
+// Inverse stages that stay inside a column, then the untwist — twist_inv
+// carries both psi^-i and N^-1, so it is the last thing that touches a residue.
+__global__ void k_cols_inv_twist(const Params p, u64* __restrict__ a) {
+    const u32 m = blockIdx.y, pair = blockIdx.z;
+    const u32 rows = p.N / STEP;
+    const u32 col0 = blockIdx.x * LINES;
+    const u64 pr = p.primes[m], pv = p.pinv[m];
+    const u64* roots = p.root_inv + static_cast<u64>(m) * p.N;
+    const u64* ti = p.twist_inv + static_cast<u64>(m) * p.N;
+    const u64 base = (static_cast<u64>(m) * p.B + pair) * p.N;
+
+    __shared__ u64 sa[LINES][MAXROWS];
+
+    for (u32 t = threadIdx.x; t < LINES * rows; t += blockDim.x) {
+        const u32 ci = t % LINES, rr = t / LINES;
+        sa[ci][rr] = a[base + static_cast<u64>(rr) * STEP + col0 + ci];
+    }
+    __syncthreads();
+
+    const u32 half = rows / 2;
+    for (u32 h = 1; h < rows; h <<= 1) {
+        const u32 len = h * STEP;
+        for (u32 bf = threadIdx.x; bf < LINES * half; bf += blockDim.x) {
+            const u32 ci = bf / half;
+            const u32 x = bf - ci * half;
+            const u32 g = x / h, j = x - g * h;
+            const u32 k = g * 2 * h + j;
+            const u64 tw = roots[len + static_cast<u64>(j) * STEP + col0 + ci];
+            bfly_inv(sa[ci][k], sa[ci][k + h], tw, pr, pv);
+        }
+        __syncthreads();
+    }
+
+    for (u32 t = threadIdx.x; t < LINES * rows; t += blockDim.x) {
+        const u32 ci = t % LINES, rr = t / LINES;
+        const u64 g = base + static_cast<u64>(rr) * STEP + col0 + ci;
+        a[g] = mont_mul(sa[ci][rr], ti[static_cast<u64>(rr) * STEP + col0 + ci], pv, pr);
+    }
+}
+
 // ---------------------------------------------------------------- kernel: rns
 //
 // One block covers TILE coefficients of one pair, and walks every prime, so the

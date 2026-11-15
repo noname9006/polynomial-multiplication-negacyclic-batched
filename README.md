@@ -101,8 +101,10 @@ kernels — every thread owns whole elements and the only cross-thread dependenc
 is the barrier between NTT stages — so it exercises the Montgomery products, the
 carry chain in `big_mul_add`, the twiddles, Garner, Barrett and the signed
 branch, and compares the finished coefficients with `Engine::multiply`. It runs
-the ranked point's arithmetic (k = 57, L = 55, P = 3,534 bits) at N = 1,024, and
-several smaller points end to end, in 0.2 s.
+the ranked point's arithmetic (k = 57, L = 55, P = 3,534 bits) at N = 1,024, the
+ranked point's length (N = 65,536, all sixteen stages of the two-pass split) at
+a narrow q, and several smaller points end to end — every point through both
+paths, in 0.6 s.
 
 What the shim cannot check is the parallel decomposition: whether block `b` and
 thread `t` are handed the right elements. That is what the self-check below does,
@@ -187,9 +189,17 @@ memory, the stream, and the decision whether to use them at all.
    what makes the stage cheap: 14 MiB per operand instead of 57 × 14 MiB, plus
    29.9 MiB of residues out.
 
-2. **`k_ntt`** — one block per (pair, prime), 256 threads. Forward transform of
-   both operands, pointwise product into `a`, inverse transform, untwist. It is
-   in place, so `b`'s residues are dead afterwards.
+2. **The NTT** — two passes, four kernels, one launch per pass. Read the array
+   as `N/256` rows of 256: the stages with half-length ≥ 256 pair two elements
+   of the same column, the rest pair two elements of the same row. So a block
+   holds a strip of eight whole columns (or rows) in shared memory and runs its
+   eight stages there, then writes the strip back. The forward column pass
+   carries both operands; the forward row pass ends with the pointwise product
+   and does not write `b` back, since it is dead; the inverse row pass follows;
+   the inverse column pass untwists on the way out (`twist_inv` carries both
+   ψ^-i and N^-1). The stages, their order and their twiddles are the same as
+   the host's — only where the data sits between them has changed — so the
+   values are identical stage for stage.
 
 3. **`k_crt`** — one thread per coefficient, `blockIdx.y` the pair. Garner
    digits `d_0 … d_{56}`, then the exact integer `X = Σ d_m Π_{j<m} p_j` by
@@ -197,9 +207,10 @@ memory, the stream, and the decision whether to use them at all.
    the signed branch. The same steps in the same order as `Engine::multiply`,
    which is why the two answers are comparable limb for limb.
 
-Pairs go through in passes of 16: the two residue buffers are 478 MB each and
-each NTT launch is 912 blocks, which is 5 blocks per SM on the 188-SM card. The
-ranked batch is eight such passes, queued on one stream.
+Pairs go through in passes of 16: the two residue buffers are 478 MB each, and
+each NTT launch is 29,184 blocks of 256 threads (32 column tiles × 57 primes ×
+16 pairs), which is 22 waves on the 188-SM card. The ranked batch is eight such
+passes, queued on one stream.
 
 Device arithmetic is Montgomery with `__umul64hi` only — device code has no
 guaranteed `unsigned __int128` — so a non-Montgomery `a·b mod p` is two
@@ -219,13 +230,14 @@ as the rules require since 13 November, when they moved outside the ranked time
 (limits 0.45 s in, 0.25 s out). `fherma_run` still copies if they were not
 called, and is then measured with the copy.
 
-**Cost before measuring.** The NTT is one block per (pair, prime) walking all
-16 stages in global memory, so every stage reads and writes the full 512 KiB:
-three transforms plus pointwise and untwist ≈ 52 MB per (pair, prime), and
-57 × 128 of those is ≈ 380 GB per batch. At the card's ~6 TB/s that is 60 ms of
-pure traffic before any arithmetic, so the first optimisation is not arithmetic
-at all: a shared-memory 4-step transform (N = 256 × 256) turns 16 passes over
-memory into one read and one write per transform.
+**Cost before measuring.** Per (pair, prime) the two NTT passes move
+5.5 MB — read a+b, write a+b, then read a+b and write a, then two read-writes
+of a — against 52 MB for the stage-at-a-time version it replaced. At 57 primes
+and 128 pairs that is 40 GB per batch instead of 380 GB, and at the card's
+~6 TB/s about 7 ms of traffic rather than 60. The residue stage adds 11 GB and
+the reconstruction reads 30 MB per pair, so what is left is arithmetic: the
+`k_crt` chain is the one to watch, and the first place to look if the measured
+time is far from these numbers.
 
 ## Verification
 
@@ -339,22 +351,22 @@ a rounding error to leave on CUDA cores.
 The stage order and the per-stage sizes are fixed by `polymul.hpp`; only the
 executor changes. In payoff order:
 
-1. **The NTT** (≈ 380 GB of traffic per batch). Reshape N = 65,536 = 256 × 256
-   and do a 4-step transform: eight stages over the columns with the rows held
-   in shared memory, a twiddle multiply, eight stages over the rows. One read
-   and one write per transform instead of sixteen.
-2. **The reconstruction.** It is `128 · N · k²/2 ≈ 1.3e10` serially dependent
-   modular reductions per batch — the leaderboard entries call theirs a
-   *tensor-core CRT* for that reason. The exact-integer path here can be
-   replaced by a weighted sum `Σ res_j · W_j mod q` with
-   `W_j = (P/p_j) · ((P/p_j)^{-1} mod p_j) mod q` precomputed at init, which is
-   one 62-bit × 1,747-bit product per prime and one Barrett reduction at the
-   end, and by a double-precision approximate-CRT sign test (P/2 is 22 bits
-   above the largest possible coefficient, so there is room).
+1. **The reconstruction.** It is `128 · N · k²/2 ≈ 1.3e10` serially dependent
+   modular reductions per batch, and about 90% of the host's own time, so it is
+   now the largest remaining stage. The exact-integer path here can be replaced
+   by a weighted sum `Σ res_j · W_j mod q` with
+   `W_j = (P/p_j) · ((P/p_j)^{-1} mod p_j) mod q` precomputed at init: one
+   62-bit × 1,747-bit product per prime, one small quotient, and one
+   multiply-subtract — no 111-limb `X`, no `digit[]`, a 4× smaller footprint in
+   local memory. The sign comes from the classic double-precision test,
+   `frac(Σ res_j · c_j)` with `c_j = ((P/p_j)^{-1} mod p_j) / p_j`, which has 22
+   bits of margin at P/2.
+2. **The residue stage.** 14 MiB per operand read, 30 MiB written; a smaller
+   tile or one block per coefficient row would trim it, but it is only 2 ms.
 3. **Fewer passes.** Sixteen pairs at a time is a compromise; the residue
    buffers could be sized to the whole batch once the NTT no longer thrashes
    them.
 
 Measured against the field: 21.1 ms is the winning figure, so a first device
-run in the low hundreds of milliseconds is a place on the board, not a
-contender. The two items above are what separate the two.
+run in the low tens of milliseconds is a contender and one in the hundreds is a
+place on the board.

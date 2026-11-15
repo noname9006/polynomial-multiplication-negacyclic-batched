@@ -201,6 +201,13 @@ bool upload_tables(State& s) {
     return true;
 }
 
+// Whether this length takes the two-pass transform: N has to be a whole number
+// of STEP-long lines, and MAXROWS of them at most, which is every point of this
+// challenge. Anything else keeps the stage-at-a-time kernel.
+bool two_pass(u32 N) {
+    return N >= pgpu::STEP && N % pgpu::STEP == 0 && N / pgpu::STEP <= pgpu::MAXROWS;
+}
+
 // The whole device pipeline for `pairs` pairs already resident in d_a/d_b.
 // Returns false if any launch or the synchronisation reported an error.
 bool gpu_multiply(State& s, u32 pairs) {
@@ -220,7 +227,20 @@ bool gpu_multiply(State& s, u32 pairs) {
         const dim3 grid_rns(tiles, tb);
         PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pa, s.d_resa);
         PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pb, s.d_resb);
-        PG_LAUNCH(pgpu::k_ntt, tb * k, block, 0, s.stream, p, s.d_resa, s.d_resb);
+
+        if (two_pass(N)) {
+            const u32 rows = N / pgpu::STEP;
+            const dim3 grid_cols(pgpu::STEP / pgpu::LINES, k, tb);
+            const dim3 grid_rows((rows + pgpu::LINES - 1) / pgpu::LINES, k, tb);
+            PG_LAUNCH(pgpu::k_cols_fwd, grid_cols, block, 0, s.stream, p, s.d_resa, s.d_resb);
+            PG_LAUNCH(pgpu::k_rows_fwd_dot, grid_rows, block, 0, s.stream, p, s.d_resa,
+                      s.d_resb);
+            PG_LAUNCH(pgpu::k_rows_inv, grid_rows, block, 0, s.stream, p, s.d_resa);
+            PG_LAUNCH(pgpu::k_cols_inv_twist, grid_cols, block, 0, s.stream, p, s.d_resa);
+        } else {
+            PG_LAUNCH(pgpu::k_ntt, tb * k, block, 0, s.stream, p, s.d_resa, s.d_resb);
+        }
+
         const u32 crt_block = 256;
         const dim3 grid_crt((N + crt_block - 1) / crt_block, tb);
         PG_LAUNCH(pgpu::k_crt, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc);
