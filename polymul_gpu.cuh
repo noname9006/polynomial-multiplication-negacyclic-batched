@@ -14,12 +14,17 @@
 // instead. Slower, never wrong.
 #pragma once
 
-// Types are spelled out rather than taken from <cstdint>: this has to compile as
-// device code as well as under the shim.
+// The same types as polymul.hpp, not lookalikes: solve.cu assigns the one's
+// vectors to the other's, and `unsigned long long` is not `unsigned long` on
+// Linux even though both are 64 bits on Windows. <cstdint> is fine in device
+// code; what it is not fine in is a kernel signature, and nothing here crosses
+// a launch boundary.
+#include <cstdint>
+
 namespace pgpu {
 
-typedef unsigned int u32;
-typedef unsigned long long u64;
+typedef std::uint32_t u32;
+typedef std::uint64_t u64;
 
 // Built-for limits. fherma_init checks the real point against these.
 enum {

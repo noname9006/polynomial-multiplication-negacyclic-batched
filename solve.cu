@@ -18,6 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 
 #include "polymul.hpp"
 
@@ -45,6 +46,14 @@ namespace {
 #ifdef __CUDACC__
 using pgpu::u32;
 using pgpu::u64;
+
+// The kernels' types have to be the host's types, not lookalikes: upload_tables
+// assigns one's vectors to the other's, and that is a different type on Linux
+// (unsigned long vs unsigned long long) even though it is the same on Windows.
+// This is the machine-independent way to say so.
+static_assert(std::is_same<pgpu::u32, polymul::u32>::value &&
+                  std::is_same<pgpu::u64, polymul::u64>::value,
+              "pgpu and polymul must spell their integers the same way");
 
 // Pairs carried through the pipeline in one pass. Everything for a pair is
 // k*N*8 bytes per operand, so this is what keeps the device working set near L2
