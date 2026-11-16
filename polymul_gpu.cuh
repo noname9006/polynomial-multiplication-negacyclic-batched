@@ -539,7 +539,7 @@ __global__ void k_crt(const Params p, const u64* __restrict__ res,
             }
         }
 
-        u32* dst = out + static_cast<u64>(i) * L;
+        u32* dst = out + (static_cast<u64>(pair) * n + i) * L;
         for (u32 l = 0; l < L; ++l) dst[l] = l < nr ? red[l] : 0u;
     }
 }
@@ -685,7 +685,7 @@ __global__ void k_crt_w(const Params p, const u64* __restrict__ res,
         }
     }
 
-    u32* dst = out + static_cast<u64>(i) * L;
+    u32* dst = out + (static_cast<u64>(pair) * n + i) * L;
 #pragma unroll
     for (u32 l = 0; l < NQ; ++l) {
         if (2 * l < L) dst[2 * l] = static_cast<u32>(S[l]);

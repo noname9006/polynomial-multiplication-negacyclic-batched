@@ -218,7 +218,10 @@ void device_multiply(const Flat& f, const u32* a, const u32* b, u64* resa, u64* 
         for (u32 i = 0; i < N; ++i) {
             blockIdx.x = i;
             blockIdx.y = j;
-            u32* dst = out + static_cast<std::size_t>(j) * N * f.par.L;
+            // The kernel owns the pair offset: pass the whole buffer, exactly as
+            // solve.cu does. Handing it a per-pair pointer here would hide the
+            // very bug this checks for.
+            u32* dst = out;
             switch (f.par.crt_nq) {
                 case 4: pgpu::k_crt_w<4>(f.par, resa, dst); break;
                 case 6: pgpu::k_crt_w<6>(f.par, resa, dst); break;
@@ -319,9 +322,13 @@ int main() {
     run_point(32, 868, 1);
     // The ranked point's arithmetic without its length: k=57, L=55, P=3534 bits.
     run_point(1024, 1747, 1);
+    // ... and with two pairs, so the pair stride is checked in the two-pass path
+    // and in the CRT write, not only in the stage-at-a-time kernels.
+    run_point(1024, 1747, 2);
     // The ranked point's length with a narrow q, so all sixteen stages and the
     // column/row split run at N=65536 without paying k=57 for it.
     run_point(65536, 64, 1);
+    run_point(65536, 64, 2);
 
     if (failures) {
         std::printf("\n%d check(s) failed\n", failures);

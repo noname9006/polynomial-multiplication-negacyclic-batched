@@ -238,11 +238,18 @@ Montgomery products rather than a 128-bit division.
 **Trust.** `fherma_init` sends two random pairs through the whole device
 pipeline and compares them, limb for limb, with the host path — the same
 buffers, the same kernels `fherma_run` will use. Two rather than one because a
-single pair makes every `pair` index zero, which would hide a wrong stride. Any
-mismatch, allocation failure, launch failure, or a point outside the built-in
-limits (k ≤ 64, L ≤ 64, P ≤ 192 limbs) leaves the host path in place, and the
-host path is in the same binary, so there is nothing to fall back *to*. Init is
-not timed, so this costs the ranking nothing.
+single pair makes every `pair` index zero, which would hide a wrong stride. That
+is not hypothetical: the first run on the card had both CRT kernels writing
+`out + i*L` instead of `out + (pair*N + i)*L`, so pair 1 overwrote pair 0 and
+everything past the first pair stayed as the driver left it — 7,208,959 of
+7,208,960 limbs wrong, and the self-check said so in one line before the host
+answer still passed the case. `gpucheck` had missed it because it handed the
+kernel a per-pair pointer; it now passes the whole buffer and lets
+`blockIdx.y` do the offset, which is what `solve.cu` does. Any mismatch,
+allocation failure, launch failure, or a point outside the built-in limits
+(k ≤ 64, L ≤ 64, P ≤ 192 limbs) leaves the host path in place, and the host path
+is in the same binary, so there is nothing to fall back *to*. Init is not timed,
+so this costs the ranking nothing.
 
 **Transfers.** `fherma_h2d` and `fherma_d2h` copy byte for byte, nothing else —
 as the rules require since 13 November, when they moved outside the ranked time
