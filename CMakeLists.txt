@@ -19,12 +19,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# The GPU to build for. sm_89 is the NVIDIA L40S the runners carry; override
-# with -DFHERMA_CUDA_ARCH=sm_90 for another card. CMAKE_CUDA_ARCHITECTURES is
+# The GPU to build for. The platform's own runner page names the card:
+# fherma-gpu-rtx6000 carries an NVIDIA RTX PRO 6000 Blackwell Server Edition,
+# compute capability 12.0 — not the Ada board this file was generated against.
+# sm_89 SASS would not load there at all, and the self-check would quietly keep
+# the host path, so the default is the card that actually runs it. Override with
+# -DFHERMA_CUDA_ARCH=sm_89 for an Ada machine. CMAKE_CUDA_ARCHITECTURES is
 # left off deliberately: it emits -gencode, which nvcc refuses alongside the
 # -dlto that cuPQC's device-LTO objects need, so the architecture is passed as
 # -arch= instead.
-set(FHERMA_CUDA_ARCH sm_89 CACHE STRING "nvcc -arch value")
+set(FHERMA_CUDA_ARCH sm_120 CACHE STRING "nvcc -arch value")
 
 add_executable(solution main.cpp solve.cu)
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

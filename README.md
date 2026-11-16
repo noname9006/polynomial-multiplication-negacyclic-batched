@@ -228,8 +228,8 @@ memory, the stream, and the decision whether to use them at all.
 
 Pairs go through in passes of 16: the two residue buffers are 478 MB each, and
 each NTT launch is 29,184 blocks of 256 threads (32 column tiles × 57 primes ×
-16 pairs) — about 68 waves on the L40S's 142 SMs if three blocks fit per SM. The
-ranked batch is eight such passes, queued on one stream.
+16 pairs) — about 52 waves on the runner's 188 SMs if three blocks fit per SM.
+The ranked batch is eight such passes, queued on one stream.
 
 Device arithmetic is Montgomery with `__umul64hi` only — device code has no
 guaranteed `unsigned __int128` — so a non-Montgomery `a·b mod p` is two
@@ -249,19 +249,19 @@ as the rules require since 13 November, when they moved outside the ranked time
 (limits 0.45 s in, 0.25 s out). `fherma_run` still copies if they were not
 called, and is then measured with the copy.
 
-**Cost before measuring.** The card is an L40S: 48 GB and 864 GB/s, not the
-6 TB/s of an H100, which changes what "close to the floor" means. Per
+**Cost before measuring.** The card is an RTX PRO 6000 Blackwell: 96 GB,
+188 SMs, 1.79 TB/s — which is what makes this shape of work affordable. Per
 (pair, prime) the two NTT passes move 5.5 MB — read a+b, write a+b, then read
 a+b and write a, then two read-writes of a — against 52 MB for the
 stage-at-a-time version it replaced. At 57 primes and 128 pairs that is 40 GB
-per batch, about 46 ms of traffic at 864 GB/s; the floor for this decomposition
-is 4 MB per (pair, prime), ~34 ms, because a 512 KB transform cannot stay in a
-100 KB shared memory. The residue stage adds 3.8 GB written and 3.6 GB read (the
-inputs themselves), and the reconstruction reads 30 MB per pair. So the honest
-expectation is tens of milliseconds, not single digits, and the ranked figure
-will be set by how well the kernels overlap with the traffic — which is exactly
-what cannot be answered on a machine with no GPU. The residue stage is the one
-to watch for arithmetic, at 55 Montgomery products per (coefficient, prime).
+per batch, about 22 ms of traffic; the floor for this decomposition is 4 MB per
+(pair, prime), ~16 ms, because a 512 KB transform cannot stay in a 100 KB shared
+memory. The residue stage adds 3.8 GB written and 3.6 GB read (the inputs
+themselves), and the reconstruction reads 30 MB per pair. So the honest
+expectation is the low tens of milliseconds, and the ranked figure will be set
+by how well the kernels overlap with the traffic — which is exactly what cannot
+be answered on a machine with no GPU. The residue stage is the one to watch for
+arithmetic, at 55 Montgomery products per (coefficient, prime).
 
 ## Verification
 
@@ -339,24 +339,27 @@ pipeline over it, untimed setup and all.
 
 ### The CUDA architecture question
 
-The generated `CMakeLists.txt` builds with `-arch=sm_89`, and that is the correct
-answer rather than a guess: its comment names the card — "sm_89 is the NVIDIA
-L40S the runners carry" — and the leaderboard's own tag, `fherma-gpu-rtx6000`,
-is the RTX 6000 Ada, the same compute capability 8.9. `-arch=sm_89` emits SASS
-for 8.9 and no PTX, so a different compute capability would not load the
-kernels at all; that is why nothing here depends on it working.
+`CMakeLists.txt` builds with `-arch=sm_120`, and that is read off the platform
+rather than guessed: the challenge's own runner page lists
+`fherma-gpu-rtx6000` as an NVIDIA RTX PRO 6000 Blackwell Server Edition —
+compute capability 12.0, 96 GB, 1.79 TB/s. It does not match the `sm_89` the
+generated file shipped with (the Ada generation, which the file's comment names
+as an L40S), and `-arch=sm_89` emits SASS for 8.9 and no PTX, so those kernels
+would not load on the runner at all. That is why nothing here depends on it
+working.
 
-If the measuring card ever changed, the failure would not be silent and would
-not be a wrong answer: the self-check in `fherma_init` launches the real
-kernels, the launch fails, and the host path takes over — ~55 s per case instead
-of milliseconds on the run page. Then, and only then:
+If the card changed again, the failure would not be silent and would not be a
+wrong answer: the self-check in `fherma_init` launches the real kernels, the
+launch fails, and the host path takes over — ~55 s per case instead of
+milliseconds on the run page. Then, and only then:
 
 ```toml
 [build]
-command = "cmake -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 && cmake --build build"
+command = "cmake -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_89 && cmake --build build"
 ```
 
-The arch has to be one the image's `nvcc` knows, and the image is cuPQC 0.6.0's.
+The arch has to be one the image's `nvcc` knows, and the image is CUDA 12.8 +
+cuPQC 0.6.0's.
 
 ## What the leaderboard numbers say
 
