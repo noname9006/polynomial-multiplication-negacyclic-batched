@@ -104,19 +104,24 @@ struct State {
     u32* d_p_mod_q = nullptr;
     u32* d_q = nullptr;
     u32* d_mu = nullptr;
+    u64* d_crt_w = nullptr;
+    u64* d_crt_c = nullptr;
+    u64* d_q64 = nullptr;
+    u64* d_pmod64 = nullptr;
+    u64* d_qsh64 = nullptr;
 
     u32* d_a = nullptr;
     u32* d_b = nullptr;
     u32* d_c = nullptr;
     u64* d_resa = nullptr;
     u64* d_resb = nullptr;
-
     pgpu::Params par{};
     std::size_t in_elems = 0;  // B*N*L u32 per operand
 
     void release() {
         void* all[] = {d_primes, d_pinv, d_r2, d_root_fwd, d_root_inv, d_twist_fwd,
                        d_twist_inv, d_limb_w, d_inv_p, d_p_half, d_p_mod_q, d_q, d_mu,
+                       d_crt_w, d_crt_c, d_q64, d_pmod64, d_qsh64,
                        d_a, d_b, d_c, d_resa, d_resb};
         for (void* p : all)
             if (p) cudaFree(p);
@@ -124,6 +129,7 @@ struct State {
         d_primes = d_pinv = d_r2 = d_root_fwd = d_root_inv = nullptr;
         d_twist_fwd = d_twist_inv = d_limb_w = d_inv_p = nullptr;
         d_p_half = d_p_mod_q = d_q = d_mu = nullptr;
+        d_crt_w = d_crt_c = d_q64 = d_pmod64 = d_qsh64 = nullptr;
         d_a = d_b = d_c = nullptr;
         d_resa = d_resb = nullptr;
         stream = nullptr;
@@ -176,6 +182,23 @@ bool upload_tables(State& s) {
         !upload(s.d_q, q) || !upload(s.d_mu, mu))
         return false;
 
+    // The weighted-sum CRT is optional: no table (q wider than the kernels are
+    // built for) means the Garner kernel runs instead, which is slower and just
+    // as exact.
+    std::vector<u64> crt_w, crt_c, q64, pmod64, qsh64;
+    if (plan.crt_nq) {
+        for (std::size_t j = 0; j < k; ++j)
+            crt_w.insert(crt_w.end(), plan.crt_w[j].begin(), plan.crt_w[j].end());
+        for (std::size_t j = 0; j < k; ++j)
+            crt_c.insert(crt_c.end(), plan.crt_c[j].begin(), plan.crt_c[j].end());
+        q64 = plan.q64;
+        pmod64 = plan.pmod64;
+        qsh64 = plan.qsh64;
+        if (!upload(s.d_crt_w, crt_w) || !upload(s.d_crt_c, crt_c) || !upload(s.d_q64, q64) ||
+            !upload(s.d_pmod64, pmod64) || !upload(s.d_qsh64, qsh64))
+            return false;
+    }
+
     pgpu::Params& p = s.par;
     p.N = static_cast<u32>(N);
     p.L = static_cast<u32>(L);
@@ -198,6 +221,13 @@ bool upload_tables(State& s) {
     p.nq = static_cast<u32>(p_mod_q.size());
     p.nmu = static_cast<u32>(mu.size());
     p.m_limbs = static_cast<u32>(plan.m_limbs);
+    p.crt_nq = plan.crt_nq;
+    p.crt_w = s.d_crt_w;
+    p.crt_c = s.d_crt_c;
+    p.q64 = s.d_q64;
+    p.pmod64 = s.d_pmod64;
+    p.qsh64 = s.d_qsh64;
+    p.qneg_inv = plan.qneg_inv;
     return true;
 }
 
@@ -243,7 +273,18 @@ bool gpu_multiply(State& s, u32 pairs) {
 
         const u32 crt_block = 256;
         const dim3 grid_crt((N + crt_block - 1) / crt_block, tb);
-        PG_LAUNCH(pgpu::k_crt, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc);
+        switch (p.crt_nq) {
+            case 4: PG_LAUNCH(pgpu::k_crt_w<4>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 6: PG_LAUNCH(pgpu::k_crt_w<6>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 8: PG_LAUNCH(pgpu::k_crt_w<8>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 12: PG_LAUNCH(pgpu::k_crt_w<12>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 16: PG_LAUNCH(pgpu::k_crt_w<16>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 24: PG_LAUNCH(pgpu::k_crt_w<24>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 32: PG_LAUNCH(pgpu::k_crt_w<32>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 48: PG_LAUNCH(pgpu::k_crt_w<48>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            case 64: PG_LAUNCH(pgpu::k_crt_w<64>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+            default: PG_LAUNCH(pgpu::k_crt, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
+        }
     }
 
     if (cudaGetLastError() != cudaSuccess) return false;

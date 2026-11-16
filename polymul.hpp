@@ -166,6 +166,23 @@ inline Big shl_limbs(const Big& a, std::size_t n) {
     return r;
 }
 
+inline Big shl_bits(const Big& a, unsigned bits) {
+    if (a.zero()) return Big();
+    const std::size_t limbs = bits / 32;
+    const unsigned sh = bits % 32;
+    Big r;
+    r.d.assign(limbs, 0u);
+    u64 carry = 0;
+    for (std::size_t i = 0; i < a.d.size(); ++i) {
+        const u64 cur = (static_cast<u64>(a.d[i]) << sh) | carry;
+        r.d.push_back(static_cast<u32>(cur));
+        carry = sh ? (cur >> 32) : 0;
+    }
+    if (carry) r.d.push_back(static_cast<u32>(carry));
+    r.trim();
+    return r;
+}
+
 inline Big shr_limbs(const Big& a, std::size_t n) {
     if (n >= a.d.size()) return Big();
     Big r;
@@ -322,10 +339,111 @@ struct Plan {
     Big P, P_half, P_mod_q, mu;
     std::size_t m_limbs = 0;
 
+    // ------------------------------------------------ weighted-sum CRT tables
+    // The Garner chain above costs k^2/2 multiply-adds per coefficient, and the
+    // big integers it walks are 112 limbs wide. The same reconstruction written
+    // as one weighted sum costs k*n64 multiply-adds over 28-limb numbers, so
+    // this is the difference between ~20k and ~2k per coefficient.
+    //
+    //   S = sum_j res_j * crt_w[j],   crt_w[j] = e_j * 2^128 mod q
+    //
+    // where e_j is the j-th CRT idempotent, (P/p_j)*(P/p_j)^{-1} mod p_j. Then S
+    // is congruent to X*2^128, so two single-limb Montgomery steps (R0 = 2^128,
+    // a compile-time shift) end the reduction: no Barrett divide, no 112-limb
+    // product, no quotient estimate.
+    //
+    // S is the exact integer sum_j res_j*e_j, which is congruent to the
+    // convolution but not equal to it: it lies in [0, 2^68 q), off by a multiple
+    // of P. That multiple is t = round(X/P), and crt_c carries the fractional
+    // part of each term with 192 bits of headroom:
+    //
+    //   crt_c[j] = floor(e_j * 2^192 / P),  t = round(sum res_j*crt_c[j] / 2^192)
+    //
+    // The estimate's error is at most sum res_j < 2^68 out of 2^192, i.e. below
+    // 2^-124, while the true fractional part is at least (P - bound)/2P away
+    // from 1/2 at every point, so the rounding is exact and not a heuristic.
+    u32 crt_nq = 0;                       // 64-bit limbs of the sum; 0 = no table
+    std::vector<std::vector<u64>> crt_w;  // k rows, 64 limbs each, first crt_nq live
+    std::vector<std::vector<u64>> crt_c;  // k rows of 3 limbs (192 bits)
+    std::vector<u64> q64;                 // 64 limbs: q, zero padded
+    std::vector<u64> pmod64;              // 64 limbs: (P mod q) * 2^128 mod q
+    std::vector<u64> qsh64;               // 64 limbs: q * 2^68, the offset that
+                                          // keeps T positive (t < 2^68)
+    u64 qneg_inv = 0;                     // -q^{-1} mod 2^64, the CIOS multiplier
+
     std::size_t k() const { return primes.size(); }
 };
 
 inline void build_tables(Plan& pl, std::size_t m);
+
+// Sizes the device kernel is compiled for. Picking the smallest one that holds
+// n64 + 2 limbs keeps the register array as small as the point allows; a point
+// outside the list (q wider than 62 limbs) simply has no table and the device
+// path keeps the Garner kernel.
+inline u32 crt_pick_nq(std::size_t n64) {
+    for (u32 nq : {4u, 6u, 8u, 12u, 16u, 24u, 32u, 48u, 64u})
+        if (nq >= n64 + 2) return nq;
+    return 0;
+}
+
+// The weighted-sum tables described in Plan. Setup only (a second or so of
+// long division for the real point), and never timed.
+inline void build_crt_tables(Plan& pl) {
+    const std::size_t k = pl.k(), NQ = pl.crt_nq;
+    const Big& q = pl.q;
+    Big qq, rr;
+
+    // The CRT idempotents: e_j = (P/p_j) * (P/p_j)^{-1} mod p_j, with e_j < P
+    // and e_j == 1 (mod p_j), 0 (mod p_m) for m != j. Then X = sum res_j e_j is
+    // the unique value in [0, kP) congruent to the convolution modulo P.
+    std::vector<Big> idem(k);
+    for (std::size_t j = 0; j < k; ++j) {
+        Big mj;
+        divmod(pl.P, Big(pl.primes[j]), mj, rr);
+        Big inv_q, mj_mod;
+        divmod(mj, Big(pl.primes[j]), inv_q, mj_mod);
+        const u64 inv = inv_mod(static_cast<u64>(mj_mod.limb(0)) |
+                                    (static_cast<u64>(mj_mod.limb(1)) << 32),
+                                pl.primes[j]);
+        idem[j] = mul(mj, Big(inv));
+    }
+
+    // 2^128: two Montgomery steps of R = 2^64, both compile-time shifts.
+    const Big r0 = shl_limbs(Big(1), 4);
+
+    // Base 2^32 on the host, base 2^64 in the tables: pack two limbs at a time.
+    const auto to64 = [](const Big& x, u64* out, std::size_t n) {
+        for (std::size_t l = 0; l < n; ++l)
+            out[l] = static_cast<u64>(x.limb(2 * l)) |
+                     (static_cast<u64>(x.limb(2 * l + 1)) << 32);
+    };
+
+    pl.q64.assign(64, 0);
+    to64(q, pl.q64.data(), NQ);
+    pl.pmod64.assign(64, 0);
+    pl.crt_w.assign(k, std::vector<u64>(64, 0));
+    pl.crt_c.assign(k, std::vector<u64>(3, 0));
+
+    for (std::size_t j = 0; j < k; ++j) {
+        divmod(idem[j], q, qq, rr);            // rr = e_j mod q
+        divmod(mul(rr, r0), q, qq, rr);        // rr = e_j * 2^(64NQ) mod q
+        to64(rr, pl.crt_w[j].data(), NQ);
+
+        divmod(shl_limbs(idem[j], 6), pl.P, qq, rr);  // floor(e_j * 2^192 / P)
+        to64(qq, pl.crt_c[j].data(), 3);
+    }
+
+    divmod(mul(pl.P_mod_q, r0), q, qq, rr);  // (P mod q) * 2^128 mod q
+    to64(rr, pl.pmod64.data(), NQ);
+
+    pl.qsh64.assign(64, 0);
+    to64(shl_bits(q, 68), pl.qsh64.data(), NQ);  // q * 2^68 stays inside crt_nq
+
+    u64 inv = 1;
+    const u64 q0 = static_cast<u64>(q.limb(0)) | (static_cast<u64>(q.limb(1)) << 32);
+    for (int i = 0; i < 6; ++i) inv *= 2 - q0 * inv;  // q^{-1} mod 2^64
+    pl.qneg_inv = ~inv + 1;
+}
 
 inline Plan build_plan(u32 N, u32 W, u32 L, const u32* q_limbs) {
     if (N == 0 || (N & (N - 1)) != 0) throw std::runtime_error("polymul: N must be a power of two");
@@ -379,6 +497,9 @@ inline Plan build_plan(u32 N, u32 W, u32 L, const u32* q_limbs) {
     Bm.d.assign(pl.m_limbs + 1, 0u);
     Bm.d[pl.m_limbs] = 1u;  // 2^(32*m_limbs)
     divmod(Bm, pl.q, pl.mu, rr);
+
+    pl.crt_nq = crt_pick_nq((pl.q.bits() + 63) / 64);
+    if (pl.crt_nq) build_crt_tables(pl);
     return pl;
 }
 

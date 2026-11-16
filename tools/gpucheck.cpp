@@ -41,6 +41,7 @@ struct Flat {
     std::vector<u64> primes, pinv, r2;
     std::vector<u64> root_fwd, root_inv, twist_fwd, twist_inv, limb_w, inv_p;
     std::vector<u32> P_half, P_mod_q, qlimbs, mu;
+    std::vector<u64> crt_w, crt_c, q64, pmod64, qsh64;
     pgpu::Params par{};
 };
 
@@ -92,6 +93,23 @@ Flat flatten(const polymul::Plan& plan) {
     f.par.nq = static_cast<u32>(f.P_mod_q.size());
     f.par.nmu = static_cast<u32>(f.mu.size());
     f.par.m_limbs = static_cast<u32>(plan.m_limbs);
+
+    f.par.crt_nq = plan.crt_nq;
+    if (plan.crt_nq) {
+        for (std::size_t j = 0; j < k; ++j)
+            f.crt_w.insert(f.crt_w.end(), plan.crt_w[j].begin(), plan.crt_w[j].end());
+        for (std::size_t j = 0; j < k; ++j)
+            f.crt_c.insert(f.crt_c.end(), plan.crt_c[j].begin(), plan.crt_c[j].end());
+        f.q64 = plan.q64;
+        f.pmod64 = plan.pmod64;
+        f.qsh64 = plan.qsh64;
+        f.par.crt_w = f.crt_w.data();
+        f.par.crt_c = f.crt_c.data();
+        f.par.q64 = f.q64.data();
+        f.par.pmod64 = f.pmod64.data();
+        f.par.qsh64 = f.qsh64.data();
+        f.par.qneg_inv = plan.qneg_inv;
+    }
     return f;
 }
 
@@ -200,7 +218,19 @@ void device_multiply(const Flat& f, const u32* a, const u32* b, u64* resa, u64* 
         for (u32 i = 0; i < N; ++i) {
             blockIdx.x = i;
             blockIdx.y = j;
-            pgpu::k_crt(f.par, resa, out + static_cast<std::size_t>(j) * N * f.par.L);
+            u32* dst = out + static_cast<std::size_t>(j) * N * f.par.L;
+            switch (f.par.crt_nq) {
+                case 4: pgpu::k_crt_w<4>(f.par, resa, dst); break;
+                case 6: pgpu::k_crt_w<6>(f.par, resa, dst); break;
+                case 8: pgpu::k_crt_w<8>(f.par, resa, dst); break;
+                case 12: pgpu::k_crt_w<12>(f.par, resa, dst); break;
+                case 16: pgpu::k_crt_w<16>(f.par, resa, dst); break;
+                case 24: pgpu::k_crt_w<24>(f.par, resa, dst); break;
+                case 32: pgpu::k_crt_w<32>(f.par, resa, dst); break;
+                case 48: pgpu::k_crt_w<48>(f.par, resa, dst); break;
+                case 64: pgpu::k_crt_w<64>(f.par, resa, dst); break;
+                default: pgpu::k_crt(f.par, resa, dst); break;  // no table: Garner
+            }
         }
 }
 

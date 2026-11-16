@@ -52,6 +52,7 @@ builds (`fherma.toml` sits here, and the platform runs
     run_local.ps1     build + make + run + verify, one command
     selftest.ps1      the eight-point regression matrix
     gpucheck.cpp      the device kernels against the host path, one thread per block
+    crtcheck.cpp      the weighted-sum CRT's integer identities, checked with Big
     hostcheck.ps1     type-check solve.cu and the kernels with g++ (no nvcc needed)
     qtable.py         writes qtable.hpp: the q each gpucheck point uses
     shim/             a one-thread stand-in for the CUDA execution model
@@ -99,12 +100,19 @@ g++ -O2 -std=c++17 -o build-cpu/gpucheck.exe tools/gpucheck.cpp
 maps the execution model to one block of one thread. That is faithful for these
 kernels — every thread owns whole elements and the only cross-thread dependency
 is the barrier between NTT stages — so it exercises the Montgomery products, the
-carry chain in `big_mul_add`, the twiddles, Garner, Barrett and the signed
-branch, and compares the finished coefficients with `Engine::multiply`. It runs
+twiddles, the weighted-sum CRT and the two Montgomery steps that finish it, and
+compares the finished coefficients with `Engine::multiply`. It runs
 the ranked point's arithmetic (k = 57, L = 55, P = 3,534 bits) at N = 1,024, the
 ranked point's length (N = 65,536, all sixteen stages of the two-pass split) at
 a narrow q, and several smaller points end to end — every point through both
 paths, in 0.6 s.
+
+`crtcheck` is the same idea one level lower: it takes the reconstruction's
+tables and its claim — `S ≡ X·2^128 (mod q)`, `t = round(X/P)` from the 192-bit
+weights, `0 ≤ T < q·2^128` — and verifies each one with `Big` arithmetic over
+random residue sets, so a mistake in the number theory fails on this machine
+instead of on the run page. It also reads the ranked point's 1,747-bit `q` from
+a point directory (`crtcheck q.bin 65536 1747`).
 
 What the shim cannot check is the parallel decomposition: whether block `b` and
 thread `t` are handed the right elements. That is what the self-check below does,
@@ -201,11 +209,22 @@ memory, the stream, and the decision whether to use them at all.
    the host's — only where the data sits between them has changed — so the
    values are identical stage for stage.
 
-3. **`k_crt`** — one thread per coefficient, `blockIdx.y` the pair. Garner
-   digits `d_0 … d_{56}`, then the exact integer `X = Σ d_m Π_{j<m} p_j` by
-   `big_mul_add` in base 2^32, then `q̂ = ⌊X·μ / 2^{32·112}⌋`, `r = X - q̂q`, and
-   the signed branch. The same steps in the same order as `Engine::multiply`,
-   which is why the two answers are comparable limb for limb.
+3. **`k_crt_w`** — one thread per coefficient, `blockIdx.y` the pair. Not the
+   Garner chain: the same reconstruction as one weighted sum,
+   `S = Σ_j res_j·W'_j` with `W'_j = e_j·2^128 mod q` (`e_j` the CRT idempotent),
+   which is 57×28 multiply-adds instead of a 57²/2-digit chain over 112-limb
+   numbers — about 2k operations per coefficient instead of 20k. The sign comes
+   from a second, 192-bit sum over `C_j = ⌊e_j·2^192/P⌋`:
+   `t = round(Σ res_j·C_j / 2^192)` is `round(X/P)` exactly, because the
+   estimate is off by less than `2^-124` while the true fractional part is at
+   least `(P - bound)/2P ≈ 2^-24` from one half. Then
+   `T = S + q·2^68 - t·(P mod q)·2^128` is positive and below `q·2^128`, so
+   two single-limb Montgomery steps plus two conditional subtractions finish it.
+   The accumulator is a compile-time-size register array (one kernel instance per
+   size, `NQ` from 4 to 64), so no coefficient touches local memory.
+
+   `k_crt`, the Garner chain, is still there and still exact: it runs when `q` is
+   wider than the tables are built for, and it is what the host path uses.
 
 Pairs go through in passes of 16: the two residue buffers are 478 MB each, and
 each NTT launch is 29,184 blocks of 256 threads (32 column tiles × 57 primes ×
@@ -236,8 +255,9 @@ of a — against 52 MB for the stage-at-a-time version it replaced. At 57 primes
 and 128 pairs that is 40 GB per batch instead of 380 GB, and at the card's
 ~6 TB/s about 7 ms of traffic rather than 60. The residue stage adds 11 GB and
 the reconstruction reads 30 MB per pair, so what is left is arithmetic: the
-`k_crt` chain is the one to watch, and the first place to look if the measured
-time is far from these numbers.
+residue stage is now the one to watch, at 55 Montgomery products per
+(coefficient, prime), and the first place to look if the measured time is far
+from these numbers.
 
 ## Verification
 
@@ -342,30 +362,30 @@ since 13 November. 3.69 GB of inputs and 1.84 GB of output would take ~90 ms at
 PCIe Gen5 rates, so the field is not transfer-bound — the ranked figure is
 device arithmetic, and the top entries describe themselves as RNS NTT plus a
 *tensor-core CRT*. That matches the shape of the work: the NTT stages are
-`128 · 57 · 3 · (N/2)·log₂N ≈ 1.1e10` butterflies, and Garner reconstruction is
-`128 · N · k²/2 ≈ 1.3e10` small modular reductions, so the reconstruction is not
-a rounding error to leave on CUDA cores.
+`128 · 57 · 3 · (N/2)·log₂N ≈ 1.1e10` butterflies, and a Garner chain would be
+`128 · N · k²/2 ≈ 1.3e10` serially dependent reductions — which is why the
+reconstruction here is a weighted sum instead (2k per coefficient), and why the
+leaders put that sum on matrix units.
 
 ## Where the GPU path goes
 
 The stage order and the per-stage sizes are fixed by `polymul.hpp`; only the
 executor changes. In payoff order:
 
-1. **The reconstruction.** It is `128 · N · k²/2 ≈ 1.3e10` serially dependent
-   modular reductions per batch, and about 90% of the host's own time, so it is
-   now the largest remaining stage. The exact-integer path here can be replaced
-   by a weighted sum `Σ res_j · W_j mod q` with
-   `W_j = (P/p_j) · ((P/p_j)^{-1} mod p_j) mod q` precomputed at init: one
-   62-bit × 1,747-bit product per prime, one small quotient, and one
-   multiply-subtract — no 111-limb `X`, no `digit[]`, a 4× smaller footprint in
-   local memory. The sign comes from the classic double-precision test,
-   `frac(Σ res_j · c_j)` with `c_j = ((P/p_j)^{-1} mod p_j) / p_j`, which has 22
-   bits of margin at P/2.
-2. **The residue stage.** 14 MiB per operand read, 30 MiB written; a smaller
-   tile or one block per coefficient row would trim it, but it is only 2 ms.
-3. **Fewer passes.** Sixteen pairs at a time is a compromise; the residue
+1. **The residue stage.** Each coefficient is 55 limbs, and each of the 57
+   primes walks all of them: `128 · 57 · 65536 · 55 ≈ 2.6e10` limb multiply-adds
+   per batch, twice the NTT's butterfly count. It is the largest stage left, and
+   the fix is the usual one — keep the coefficient in registers and accumulate
+   all 57 residues in one pass over its limbs, so each limb is loaded once
+   instead of 57 times and the carry chain is shared.
+2. **Fewer passes.** Sixteen pairs at a time is a compromise; the residue
    buffers could be sized to the whole batch once the NTT no longer thrashes
    them.
+3. **The NTT itself.** Four launches per pass is close to the traffic floor at
+   these sizes, but the butterflies still run one per thread with a
+   shared-memory twiddle read. Four elements per thread would halve the
+   twiddle traffic, and the top entries' *tensor-core* CRT suggests they moved
+   the reconstruction into matrix units rather than CUDA cores.
 
 Measured against the field: 21.1 ms is the winning figure, so a first device
 run in the low tens of milliseconds is a contender and one in the hundreds is a

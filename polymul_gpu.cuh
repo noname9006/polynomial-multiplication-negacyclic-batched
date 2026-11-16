@@ -46,6 +46,16 @@ struct Params {
     const u32* qlimbs;     // L limbs
     const u32* mu;         // nmu limbs
     u32 np, nq, nmu, m_limbs;
+
+    // weighted-sum CRT (see Plan): the same tables, in base 2^64.
+    // crt_w is one row of 64 limbs per prime, columns past crt_nq are zero.
+    const u64* crt_w;    // k * 64
+    const u64* crt_c;    // k * 3
+    const u64* q64;      // 64 limbs, q zero padded
+    const u64* pmod64;   // 64, (P mod q) * 2^128 mod q
+    const u64* qsh64;    // 64, q * 2^68
+    u64 qneg_inv;        // -q^{-1} mod 2^64
+    u32 crt_nq;          // 0 = no table, use k_crt
 };
 
 // ------------------------------------------------------------------ arithmetic
@@ -526,6 +536,155 @@ __global__ void k_crt(const Params p, const u64* __restrict__ res,
 
         u32* dst = out + static_cast<u64>(i) * L;
         for (u32 l = 0; l < L; ++l) dst[l] = l < nr ? red[l] : 0u;
+    }
+}
+
+// ---------------------------------------------------------- kernel: crt, fast
+//
+// The weighted-sum reconstruction from Plan, one thread per coefficient. Two
+// things make it fast and one makes it exact:
+//
+//   * the accumulator has a compile-time size and every index into it is a
+//     constant after unrolling, so it lives in registers. A 30-limb array in
+//     local memory is 32 transactions per warp access — that is not a
+//     micro-optimisation, it is the difference between the CRT being free and
+//     being the whole batch;
+//   * the reduction is two single-limb Montgomery steps (R = 2^128, folded into
+//     the weights at setup), so no Barrett divide and no 112-limb product;
+//   * t = round(X/P) comes from the 192-bit fractional weights: exact to
+//     2^-124 against a margin of (P - bound)/2P >= 2^-24, so the reconstruction
+//     is exact for every input and not merely with high probability.
+template <u32 NQ>
+__device__ inline void mont_step(u64* x, const u64* q, u64 qneg_inv) {
+    const u64 m = x[0] * qneg_inv;  // the limb that makes (x + m*q) end in zero
+    u64 carry = 0;
+#pragma unroll
+    for (u32 l = 0; l < NQ; ++l) {
+        const u64 lo = m * q[l];
+        const u64 hi = __umul64hi(m, q[l]);
+        const u64 s1 = x[l] + lo;
+        const u64 s2 = s1 + carry;
+        carry = hi + ((s1 < lo) ? 1ull : 0ull) + ((s2 < s1) ? 1ull : 0ull);
+        if (l) x[l - 1] = s2;  // (x + m*q) >> 64, in place, one limb down
+    }
+    x[NQ - 1] = carry;
+}
+
+// S = sum_j res_j * crt_w[j], then the sign fix, then the two Montgomery steps.
+template <u32 NQ>
+__global__ void k_crt_w(const Params p, const u64* __restrict__ res,
+                        u32* __restrict__ out) {
+    const u32 pair = blockIdx.y;
+    const u32 n = p.N, L = p.L, k = p.k;
+    const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    __shared__ u64 sq[NQ], spq[NQ], sqs[NQ];
+    for (u32 t = threadIdx.x; t < NQ; t += blockDim.x) {
+        sq[t] = p.q64[t];
+        spq[t] = p.pmod64[t];
+        sqs[t] = p.qsh64[t];
+    }
+    __syncthreads();
+
+    u64 S[NQ];
+#pragma unroll
+    for (u32 l = 0; l < NQ; ++l) S[l] = 0;
+    u64 F[5];
+#pragma unroll
+    for (u32 l = 0; l < 5; ++l) F[l] = 0;
+
+    const u64* rp = res + static_cast<u64>(pair) * n + i;
+    const u64 stride = static_cast<u64>(p.B) * n;
+    for (u32 j = 0; j < k; ++j) {
+        const u64 a = rp[static_cast<u64>(j) * stride];
+        const u64* w = p.crt_w + static_cast<u64>(j) * 64;
+        u64 c = 0;
+#pragma unroll
+        for (u32 l = 0; l < NQ; ++l) {  // S += a * W'_j, loose carry
+            const u64 lo = a * w[l];
+            const u64 hi = __umul64hi(a, w[l]);
+            const u64 s1 = S[l] + lo;
+            const u64 s2 = s1 + c;
+            S[l] = s2;
+            c = hi + ((s1 < lo) ? 1ull : 0ull) + ((s2 < s1) ? 1ull : 0ull);
+        }
+        const u64* cf = p.crt_c + static_cast<u64>(j) * 3;
+        u64 fc = 0;
+#pragma unroll
+        for (u32 l = 0; l < 3; ++l) {  // F += a * C_j, the 192-bit fraction
+            const u64 lo = a * cf[l];
+            const u64 hi = __umul64hi(a, cf[l]);
+            const u64 s1 = F[l] + lo;
+            const u64 s2 = s1 + fc;
+            F[l] = s2;
+            fc = hi + ((s1 < lo) ? 1ull : 0ull) + ((s2 < s1) ? 1ull : 0ull);
+        }
+        const u64 f3 = F[3] + fc;  // F < 2^260, so F[4] only takes the carry
+        F[4] += (f3 < F[3]) ? 1ull : 0ull;
+        F[3] = f3;
+    }
+
+    // t = round(F / 2^192) = round(X/P): two limbs, at most 2^68.
+    const u64 t0 = F[3] + ((F[2] >> 63) & 1ull);
+    const u64 t1 = F[4] + ((t0 < F[3]) ? 1ull : 0ull);
+
+    // T = S + q*2^68 - t*(P mod q)*2^128: congruent to C*2^128 mod q, positive
+    // because q*2^68 > t*(P mod q)*2^128, and below q*2^128 for the reduction.
+    u64 cn = 0;
+#pragma unroll
+    for (u32 l = 0; l < NQ; ++l) {
+        const u64 s1 = S[l] + sqs[l];
+        const u64 s2 = s1 + cn;
+        cn = ((s1 < S[l]) ? 1ull : 0ull) + ((s2 < s1) ? 1ull : 0ull);
+        S[l] = s2;
+    }
+    u64 pc = 0, borrow = 0;
+#pragma unroll
+    for (u32 l = 0; l < NQ; ++l) {
+        u64 lo = t0 * spq[l];
+        u64 hi = __umul64hi(t0, spq[l]);
+        if (l) {
+            const u64 s1 = lo + t1 * spq[l - 1];
+            hi += __umul64hi(t1, spq[l - 1]) + ((s1 < lo) ? 1ull : 0ull);
+            lo = s1;
+        }
+        const u64 s2 = lo + pc;
+        pc = hi + ((s2 < lo) ? 1ull : 0ull);
+        const u64 d = S[l] - s2;
+        const u64 e = d - borrow;
+        borrow = ((S[l] < s2) ? 1ull : 0ull) + ((d < borrow) ? 1ull : 0ull);
+        S[l] = e;
+    }
+
+    mont_step<NQ>(S, sq, p.qneg_inv);
+    mont_step<NQ>(S, sq, p.qneg_inv);
+
+    // Two steps leave the value below 3q; two conditional subtractions settle it.
+    for (u32 pass = 0; pass < 2; ++pass) {
+        u64 br = 0;
+#pragma unroll
+        for (u32 l = 0; l < NQ; ++l) {
+            const u64 d = S[l] - sq[l];
+            br = ((S[l] < sq[l]) ? 1ull : 0ull) + ((d < br) ? 1ull : 0ull);
+        }
+        if (br) break;
+        u64 bw = 0;
+#pragma unroll
+        for (u32 l = 0; l < NQ; ++l) {
+            const u64 d = S[l] - sq[l];
+            const u64 b1 = (S[l] < sq[l]) ? 1ull : 0ull;
+            const u64 e = d - bw;
+            bw = b1 + ((d < bw) ? 1ull : 0ull);
+            S[l] = e;
+        }
+    }
+
+    u32* dst = out + static_cast<u64>(i) * L;
+#pragma unroll
+    for (u32 l = 0; l < NQ; ++l) {
+        if (2 * l < L) dst[2 * l] = static_cast<u32>(S[l]);
+        if (2 * l + 1 < L) dst[2 * l + 1] = static_cast<u32>(S[l] >> 32);
     }
 }
 

@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
 # stderr into a terminating error when the preference is Stop, which would hide
 # the compiler's own message behind a stack trace.
 $arguments = @(
-    "-std=c++17", "-fsyntax-only", "-Wall", "-Wextra",
+    "-std=c++17", "-fsyntax-only", "-Wall -Wno-unknown-pragmas", "-Wextra",
     "-D__CUDACC__", "-DPGPU_HOST_CHECK",
     "-include", (Join-Path $root "tools/shim/cuda_shim.hpp"),
     "-I", (Join-Path $root "tools/fakecuda"),
