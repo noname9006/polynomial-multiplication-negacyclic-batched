@@ -338,6 +338,9 @@ bool gpu_multiply(State& s, u32 pairs) {
             s.ms_ntt += t1;
             s.ms_crt += t2;
         }
+        std::fprintf(stderr,
+                     "polymul stages (ms): residues %.3f  ntt %.3f  crt %.3f  total %.3f\n",
+                     s.ms_res, s.ms_ntt, s.ms_crt, s.ms_res + s.ms_ntt + s.ms_crt);
     }
     return true;
 }
