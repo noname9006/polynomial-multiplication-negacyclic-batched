@@ -290,8 +290,8 @@ bool gpu_multiply(State& s, u32 pairs) {
         pgpu::u32* pc = s.d_c + static_cast<std::size_t>(t0) * N * L;
 
         const dim3 grid_rns(tiles, tb);
-        PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pa, s.d_resa);
-        PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pb, s.d_resb);
+        PG_LAUNCH(pgpu::k_residues, grid_rns, 1024, 0, s.stream, p, pa, s.d_resa);
+        PG_LAUNCH(pgpu::k_residues, grid_rns, 1024, 0, s.stream, p, pb, s.d_resb);
         if (s.timing_ok && pass_idx < State::kMaxPasses)
             cudaEventRecord(s.ev_r[pass_idx], s.stream);
 

@@ -435,17 +435,40 @@ __global__ void k_residues(const Params p, const u32* __restrict__ src,
         smem[t] = src[(static_cast<u64>(pair) * p.N + base) * L + t];
     __syncthreads();
 
-    for (u32 m = 0; m < p.k; ++m) {
+    // 1024 threads: 128 coefficient lanes x 8 prime lanes. Each thread owns one
+    // (coefficient, prime) pair and walks only its limbs, so the serial work per
+    // thread is 1/8 of the old 256-thread kernel while the staged coefficient
+    // bytes are unchanged. blockDim.x must be 1024; the grid is unchanged.
+    constexpr u32 PGROUPS = 8;
+    if (blockDim.x < TILE * PGROUPS) {
+        // One-thread-per-block host shim (gpucheck): keep the original serial
+        // walk so the arithmetic stays checkable without a device.
+        for (u32 m = 0; m < p.k; ++m) {
+            const u64 pr = p.primes[m], pv = p.pinv[m];
+            const u64* lw = p.limb_w + static_cast<u64>(m) * L;
+            u64* out = dst + (static_cast<u64>(m) * p.B + pair) * p.N + base;
+            for (u32 cc = 0; cc < cnt; ++cc) {
+                const u32* coef = smem + cc * L;
+                u64 r = 0;
+                for (u32 l = 0; l < L; ++l)
+                    r = mod_add(r, mont_mul(coef[l], lw[l], pv, pr), pr);
+                out[cc] = mont_mul(r, p.twist_fwd[static_cast<u64>(m) * p.N + base + cc], pv, pr);
+            }
+        }
+        return;
+    }
+    const u32 c = threadIdx.x % TILE;
+    const u32 lane = threadIdx.x / TILE;
+    if (c >= cnt) return;
+    const u32* coef = smem + c * L;
+    for (u32 m = lane; m < p.k; m += PGROUPS) {
         const u64 pr = p.primes[m], pv = p.pinv[m];
         const u64* lw = p.limb_w + static_cast<u64>(m) * L;
+        u64 r = 0;
+        for (u32 l = 0; l < L; ++l)
+            r = mod_add(r, mont_mul(coef[l], lw[l], pv, pr), pr);
         u64* out = dst + (static_cast<u64>(m) * p.B + pair) * p.N + base;
-        for (u32 c = threadIdx.x; c < cnt; c += blockDim.x) {
-            const u32* coef = smem + c * L;
-            u64 r = 0;
-            for (u32 l = 0; l < L; ++l)
-                r = mod_add(r, mont_mul(coef[l], lw[l], pv, pr), pr);
-            out[c] = mont_mul(r, p.twist_fwd[static_cast<u64>(m) * p.N + base + c], pv, pr);
-        }
+        out[c] = mont_mul(r, p.twist_fwd[static_cast<u64>(m) * p.N + base + c], pv, pr);
     }
 }
 
