@@ -17,8 +17,11 @@
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "polymul.hpp"
 
@@ -127,6 +130,14 @@ struct State {
     pgpu::Params par{};
     std::size_t in_elems = 0;  // B*N*L u32 per operand
 
+    // Per-stage timing, reported through fherma_metrics. Cumulative over the
+    // passes of one case; reset by the metrics call after each case.
+    static constexpr u32 kMaxPasses = 8;  // B=128 / 16 pairs per pass
+    cudaEvent_t ev_b[kMaxPasses] = {}, ev_r[kMaxPasses] = {},
+                ev_n[kMaxPasses] = {}, ev_c[kMaxPasses] = {};
+    float ms_res = 0.f, ms_ntt = 0.f, ms_crt = 0.f;
+    bool timing_ok = false;
+
     void release() {
         void* all[] = {d_primes, d_pinv, d_r2, d_root_fwd, d_root_inv, d_twist_fwd,
                        d_twist_inv, d_limb_w, d_inv_p, d_p_half, d_p_mod_q, d_q, d_mu,
@@ -134,6 +145,12 @@ struct State {
                        d_a, d_b, d_c, d_resa, d_resb};
         for (void* p : all)
             if (p) cudaFree(p);
+        for (u32 i = 0; i < kMaxPasses; ++i) {
+            if (ev_b[i]) cudaEventDestroy(ev_b[i]);
+            if (ev_r[i]) cudaEventDestroy(ev_r[i]);
+            if (ev_n[i]) cudaEventDestroy(ev_n[i]);
+            if (ev_c[i]) cudaEventDestroy(ev_c[i]);
+        }
         if (stream) cudaStreamDestroy(stream);
         d_primes = d_pinv = d_r2 = d_root_fwd = d_root_inv = nullptr;
         d_twist_fwd = d_twist_inv = d_limb_w = d_inv_p = nullptr;
@@ -143,6 +160,7 @@ struct State {
         d_resa = d_resb = nullptr;
         stream = nullptr;
         gpu_ok = false;
+        timing_ok = false;
     }
 #endif
 };
@@ -254,8 +272,11 @@ bool gpu_multiply(State& s, u32 pairs) {
     const u32 tiles = (N + pgpu::TILE - 1) / pgpu::TILE;
     const u32 block = 256;
 
+    u32 pass_idx = 0;
     for (u32 t0 = 0; t0 < pairs; t0 += kPairsPerPass) {
         const u32 tb = (pairs - t0 < kPairsPerPass) ? pairs - t0 : kPairsPerPass;
+        if (s.timing_ok && pass_idx < State::kMaxPasses)
+            cudaEventRecord(s.ev_b[pass_idx], s.stream);
         pgpu::Params p = s.par;
         p.B = tb;
 
@@ -266,6 +287,8 @@ bool gpu_multiply(State& s, u32 pairs) {
         const dim3 grid_rns(tiles, tb);
         PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pa, s.d_resa);
         PG_LAUNCH(pgpu::k_residues, grid_rns, block, 0, s.stream, p, pb, s.d_resb);
+        if (s.timing_ok && pass_idx < State::kMaxPasses)
+            cudaEventRecord(s.ev_r[pass_idx], s.stream);
 
         if (two_pass(N)) {
             const u32 rows = N / pgpu::STEP;
@@ -279,6 +302,8 @@ bool gpu_multiply(State& s, u32 pairs) {
         } else {
             PG_LAUNCH(pgpu::k_ntt, tb * k, block, 0, s.stream, p, s.d_resa, s.d_resb);
         }
+        if (s.timing_ok && pass_idx < State::kMaxPasses)
+            cudaEventRecord(s.ev_n[pass_idx], s.stream);
 
         const u32 crt_block = 256;
         const dim3 grid_crt((N + crt_block - 1) / crt_block, tb);
@@ -294,10 +319,27 @@ bool gpu_multiply(State& s, u32 pairs) {
             case 64: PG_LAUNCH(pgpu::k_crt_w<64>, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
             default: PG_LAUNCH(pgpu::k_crt, grid_crt, crt_block, 0, s.stream, p, s.d_resa, pc); break;
         }
+        if (s.timing_ok && pass_idx < State::kMaxPasses)
+            cudaEventRecord(s.ev_c[pass_idx], s.stream);
+        ++pass_idx;
     }
 
     if (cudaGetLastError() != cudaSuccess) return false;
-    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+    if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+
+    if (s.timing_ok) {
+        const u32 np = pass_idx < State::kMaxPasses ? pass_idx : State::kMaxPasses;
+        for (u32 q = 0; q < np; ++q) {
+            float t0 = 0.f, t1 = 0.f, t2 = 0.f;
+            cudaEventElapsedTime(&t0, s.ev_b[q], s.ev_r[q]);
+            cudaEventElapsedTime(&t1, s.ev_r[q], s.ev_n[q]);
+            cudaEventElapsedTime(&t2, s.ev_n[q], s.ev_c[q]);
+            s.ms_res += t0;
+            s.ms_ntt += t1;
+            s.ms_crt += t2;
+        }
+    }
+    return true;
 }
 
 // Two random pairs, both ways, compared coefficient by coefficient. Runs in
@@ -400,6 +442,18 @@ void* fherma_init(const fherma::Point& p) {
         if (fits && (!state->d_a || !state->d_b || !state->d_c || !state->d_resa || !state->d_resb))
             fits = false;
         if (fits) fits = gpu_selfcheck(*state, p.B < 2 ? p.B : 2);
+        if (fits) {
+            for (u32 i = 0; i < State::kMaxPasses; ++i) {
+                if (cudaEventCreate(&state->ev_b[i]) != cudaSuccess ||
+                    cudaEventCreate(&state->ev_r[i]) != cudaSuccess ||
+                    cudaEventCreate(&state->ev_n[i]) != cudaSuccess ||
+                    cudaEventCreate(&state->ev_c[i]) != cudaSuccess) {
+                    fits = false;
+                    break;
+                }
+            }
+        }
+        state->timing_ok = fits;
         if (!fits) state->release();
         state->gpu_ok = fits;
     }
@@ -503,6 +557,20 @@ fherma::Outputs fherma_d2h(void* state, fherma::Outputs answer) {
     return answer;
 }
 #endif
+
+// Optional: per-stage device timings, accumulated over the passes of one case.
+// The harness calls this after each case, outside the timed window.
+std::vector<std::pair<std::string, double>> fherma_metrics(void* state) {
+    auto* s = static_cast<State*>(state);
+    std::vector<std::pair<std::string, double>> out;
+    if (s && s->timing_ok) {
+        out.push_back({"residue_ms", s->ms_res});
+        out.push_back({"ntt_ms", s->ms_ntt});
+        out.push_back({"crt_ms", s->ms_crt});
+        s->ms_res = s->ms_ntt = s->ms_crt = 0.f;
+    }
+    return out;
+}
 
 // Optional.
 void fherma_free(void* state) {

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fherma {
@@ -53,3 +54,6 @@ void fherma_free(void* state);
 // neither is the score; left out, neither is called.
 void fherma_h2d(void* state, const fherma::Inputs& in);
 fherma::Outputs fherma_d2h(void* state, fherma::Outputs answer);
+
+// Optional, from fherma-lang 0.21.0: numbers the solution knows about itself.
+std::vector<std::pair<std::string, double>> fherma_metrics(void* state);

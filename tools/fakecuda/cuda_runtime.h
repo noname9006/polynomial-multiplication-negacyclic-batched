@@ -22,6 +22,9 @@ enum cudaMemcpyKind {
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
+struct CUevent_st;
+typedef CUevent_st* cudaEvent_t;
+
 struct dim3 {
     unsigned int x, y, z;
     dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1) : x(vx), y(vy), z(vz) {}
@@ -40,4 +43,8 @@ cudaError_t cudaSetDevice(int device);
 cudaError_t cudaGetLastError();
 cudaError_t cudaPeekAtLastError();
 cudaError_t cudaDeviceSynchronize();
+cudaError_t cudaEventCreate(cudaEvent_t* event);
+cudaError_t cudaEventDestroy(cudaEvent_t event);
+cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream = nullptr);
+cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end);
 const char* cudaGetErrorString(cudaError_t error);
