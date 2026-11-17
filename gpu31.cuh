@@ -499,7 +499,7 @@ constexpr unsigned group_primes = 8;
 constexpr unsigned max_tile     = 512;   // ari_tile::max_tile
 constexpr unsigned low_columns  = 16;    // ari_tile::low_columns
 constexpr unsigned high_workers = 16;    // ari_tile::high_workers
-constexpr unsigned crt_tile_x   = 32;    // full warp (was 16 in the reference)
+constexpr unsigned crt_tile_x   = 16;    // fherma_crt::tile_x
 constexpr unsigned crt_tile_y   = 8;     // fherma_crt::tile_y
 
 // ---- reindex (reference ari_shoup::reindex) --------------------------------
