@@ -31,6 +31,7 @@
 #include "polymul_gpu.cuh"
 #if !defined(PGPU_HOST_CHECK)
 #include "gpu31.cuh"
+#include "crt_cupqc.cuh"
 #include "crt_mma.cuh"
 #endif
 #endif
@@ -106,9 +107,11 @@ struct State {
     // the older 62-bit pgpu path stays compiled as a fallback but is untouched.
 #if !defined(PGPU_HOST_CHECK)
     std::unique_ptr<gpu31::Device> gpu31_dev;
+    std::unique_ptr<crt_cupqc::Plan> crt_cupqc_plan;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
     bool gpu31_ok = false;
     bool crt_mma_ok = false;  // MMA CRT proved identical to the reference CRT
+    bool crt_cupqc_ok = false;  // cuPQC CRT proved identical to the reference CRT
 #endif
 
     bool gpu_ok = false;           // the device path is trusted for this point
@@ -471,6 +474,46 @@ bool gpu31_selfcheck(State& s, gpu31::Device& dev, u32 pairs) {
     return true;
 }
 
+// Generic CRT-vs-reference check: runs `runner` on random residues and compares
+// its output byte-for-byte against gpu31's reference CRT. Used for both the
+// cuPQC and MMA candidates.
+template <class Runner>
+bool crt_vs_reference(State& s, Runner runner, u32 pair_count, const char* name) {
+    const unsigned n = s.plan.N, k = s.gpu31_dev->plan().K;
+    const u32 pairs = pair_count < 2 ? pair_count : 2;
+    cudaStream_t stm = s.stream;
+    const std::size_t nres = std::size_t(pairs) * k * n;
+    std::vector<u32> host(nres);
+    Rng rng(0x5eed1234ull ^ (u64(n) << 20) ^ k);
+    for (auto& v : host) v = static_cast<u32>(rng.next()) & 0x7fffffffu;
+    if (cudaMemcpy(s.d_a, host.data(), nres * sizeof(u32),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+        return false;
+    u32* src = s.d_a;
+    const auto& args = s.gpu31_dev->crt_args();
+    if (s.gpu31_dev->crt_reference(src, s.d_c, pairs, stm) != cudaSuccess) return false;
+    if (runner(src, s.d_b, args, pairs, stm) != cudaSuccess) return false;
+    if (cudaStreamSynchronize(stm) != cudaSuccess) return false;
+    const std::size_t nout = std::size_t(pairs) * n * s.plan.L;
+    std::vector<u32> want(nout), got(nout);
+    if (cudaMemcpy(want.data(), s.d_c, nout * sizeof(u32), cudaMemcpyDeviceToHost) !=
+            cudaSuccess ||
+        cudaMemcpy(got.data(), s.d_b, nout * sizeof(u32), cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+        return false;
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < nout; ++i)
+        if (want[i] != got[i]) ++bad;
+    if (bad) {
+        std::fprintf(stderr,
+                     "polymul: %s CRT disagrees with reference on %zu of %zu limbs; "
+                     "keeping reference CRT\n",
+                     name, bad, nout);
+        return false;
+    }
+    return true;
+}
+
 // Check the tensor-core CRT against the reference CRT on random residue data,
 // using the same device buffers. If even one limb differs, we keep the reference.
 bool crt_mma_selfcheck(State& s, crt_mma::CrtMmaPlan& plan, u32 pair_count) {
@@ -589,16 +632,41 @@ void* fherma_init(const fherma::Point& p) {
                 state->gpu31_dev = std::move(dev);
                 state->gpu31_ok = true;
 
-                // Try the tensor-core CRT, but only keep it if it is bit-identical
+                // Try faster CRT backends, keeping each only if it is bit-identical
                 // to the reference CRT on deterministic residue data.
+                const auto& pl = state->gpu31_dev->plan();
+                std::vector<u32> q_limbs(p.q.data.begin(), p.q.data.end());
+                // 1) cuPQC warp-cooperative Barrett CRT (the promising path).
                 try {
-                    const auto& pl = state->gpu31_dev->plan();
-                    state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
-                        pl.crt_weights, pl.L, pl.K + 1);
-                    state->crt_mma_ok =
-                        crt_mma_selfcheck(*state, *state->crt_mma_plan, 2);
+                    state->crt_cupqc_plan = std::make_unique<crt_cupqc::Plan>(
+                        pl.crt_weights, pl.L, pl.K + 1, q_limbs, pl.K);
+                    if (state->crt_cupqc_plan->cupqc_ok) {
+                        crt_cupqc::Plan* p_plan = state->crt_cupqc_plan.get();
+                        state->crt_cupqc_ok = crt_vs_reference(
+                            *state,
+                            [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                                return p_plan->run(r, o, a, b, s);
+                            },
+                            2, "cuPQC");
+                    }
                 } catch (const std::exception& e) {
-                    std::fprintf(stderr, "polymul: MMA CRT setup failed: %s\n", e.what());
+                    std::fprintf(stderr, "polymul: cuPQC CRT setup failed: %s\n", e.what());
+                }
+                // 2) Conflict-free CUDA-core CRT (if cuPQC unavailable/not identical).
+                if (!state->crt_cupqc_ok) {
+                    try {
+                        state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
+                            pl.crt_weights, pl.L, pl.K + 1);
+                        crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
+                        state->crt_mma_ok = crt_vs_reference(
+                            *state,
+                            [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                                return p_plan->run(r, o, a, b, s);
+                            },
+                            2, "MMA");
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "polymul: MMA CRT setup failed: %s\n", e.what());
+                    }
                 }
             }
         } catch (const std::exception& e) {
@@ -650,14 +718,19 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         if (ok) {
 #if !defined(PGPU_HOST_CHECK)
             if (s->gpu31_ok) {
+                const u32 Bc = static_cast<u32>(B);
+                const bool use_cupqc = s->crt_cupqc_ok && s->crt_cupqc_plan != nullptr;
                 const bool use_mma = s->crt_mma_ok && s->crt_mma_plan != nullptr;
-                ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c,
-                                       static_cast<u32>(B), s->stream,
-                                       /*skip_crt=*/use_mma) == cudaSuccess;
-                if (ok && use_mma)
+                ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c, Bc, s->stream,
+                                       /*skip_crt=*/(use_cupqc || use_mma)) == cudaSuccess;
+                if (ok && use_cupqc)
+                    ok = s->crt_cupqc_plan->run(s->gpu31_dev->residues_device(), s->d_c,
+                                                s->gpu31_dev->crt_args(), Bc, s->stream)
+                         == cudaSuccess;
+                else if (ok && use_mma)
                     ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), s->d_c,
-                                              s->gpu31_dev->crt_args(),
-                                              static_cast<u32>(B), s->stream) == cudaSuccess;
+                                              s->gpu31_dev->crt_args(), Bc, s->stream)
+                         == cudaSuccess;
                 // The rules require fherma_run to return only after its device
                 // work has finished. Without this, the kernels would run during
                 // fherma_d2h, outside the ranked window - a violation.
