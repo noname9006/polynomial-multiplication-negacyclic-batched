@@ -61,7 +61,7 @@ static_assert(std::is_same<pgpu::u32, polymul::u32>::value &&
 // Pairs carried through the pipeline in one pass. Everything for a pair is
 // k*N*8 bytes per operand, so this is what keeps the device working set near L2
 // instead of streaming 8 GB from HBM.
-constexpr u32 kPairsPerPass = 16;
+constexpr u32 kPairsPerPass = 128;
 
 void* device_alloc(std::size_t bytes) {
     void* p = nullptr;
