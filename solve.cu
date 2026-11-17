@@ -594,10 +594,14 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
                                  s->stream) == cudaSuccess;
         if (ok) {
 #if !defined(PGPU_HOST_CHECK)
-            if (s->gpu31_ok)
+            if (s->gpu31_ok) {
                 ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c,
                                        static_cast<u32>(B), s->stream) == cudaSuccess;
-            else
+                // The rules require fherma_run to return only after its device
+                // work has finished.Without this, the kernels would run during
+                // fherma_d2h, outside the ranked window - a violation.
+                if (ok) ok = cudaStreamSynchronize(s->stream) == cudaSuccess;
+            } else
 #endif
                 ok = gpu_multiply(*s, static_cast<u32>(B));
         }
