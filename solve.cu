@@ -629,6 +629,16 @@ void* fherma_init(const fherma::Point& p) {
                 state->gpu31_dev = std::move(dev);
                 state->gpu31_ok = true;
 
+                // The 62-bit path's scratch buffers are now dead weight: gpu_multiply()
+                // is their only consumer, and fherma_run reaches it only when gpu31_ok
+                // is false (a failed copy/sync falls straight to the host path). Free
+                // ~7.6 GB here. Leave the pointers nullptr so State::release(), which
+                // frees each pointer only `if (p)`, cannot double-free them.
+                cudaFree(state->d_resa);
+                cudaFree(state->d_resb);
+                state->d_resa = nullptr;
+                state->d_resb = nullptr;
+
                 // Try the conflict-free CRT, keeping it only if bit-identical to
                 // the reference CRT on deterministic residue data.
                 const auto& pl = state->gpu31_dev->plan();
