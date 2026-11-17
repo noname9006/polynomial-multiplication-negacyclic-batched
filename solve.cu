@@ -600,7 +600,10 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
                 // The rules require fherma_run to return only after its device
                 // work has finished.Without this, the kernels would run during
                 // fherma_d2h, outside the ranked window - a violation.
-                if (ok) ok = cudaStreamSynchronize(s->stream) == cudaSuccess;
+                if (ok) {
+                    ok = cudaStreamSynchronize(s->stream) == cudaSuccess;
+                    s->gpu31_dev->report_profile();
+                }
             } else
 #endif
                 ok = gpu_multiply(*s, static_cast<u32>(B));

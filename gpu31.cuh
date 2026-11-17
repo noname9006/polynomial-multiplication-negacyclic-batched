@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
@@ -715,6 +716,12 @@ struct Device {
     // per-pair scratch, sized for capacity_ pairs
     u32 *d_ra = nullptr, *d_rb = nullptr, *d_rc = nullptr;
 
+    // Per-stage timing (diagnostic). 8 events bracket the 7 pipeline stages.
+    static constexpr int kStages = 7;
+    cudaEvent_t ev_[kStages + 1] = {};
+    float ms_[kStages] = {};
+    bool profiling_ = false;
+
     explicit Device(const fherma::Point& p) : plan_(p), capacity_(p.B) {
         if (p.B == 0) throw std::runtime_error("gpu31: point B must be positive");
         try {
@@ -753,6 +760,9 @@ struct Device {
                 throw std::runtime_error("gpu31: cannot query device properties");
             if (crt_shared_ > prop.sharedMemPerBlock)
                 throw std::runtime_error("gpu31: CRT tile exceeds shared memory capacity");
+            for (int i = 0; i <= kStages; ++i)
+                if (cudaEventCreate(&ev_[i]) != cudaSuccess) break;
+            profiling_ = (ev_[kStages] != nullptr);
         } catch (...) {
             release();
             throw;
@@ -773,12 +783,14 @@ struct Device {
         if (B > capacity_ || !d_a || !d_b || !d_c) return cudaErrorInvalidValue;
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
         cudaError_t st = cudaSuccess;
+        if (profiling_) cudaEventRecord(ev_[0], stream);
 
         // 1. bit-reverse coefficient positions in the pair's a/b arrays (in place)
         reindex<<<dim3((n + reindex_rows - 1) / reindex_rows, 1, B),
                   dim3(warp_size, reindex_rows), 0, stream>>>(
             const_cast<u32*>(d_a), const_cast<u32*>(d_b), n, l, logN);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
+        if (profiling_) cudaEventRecord(ev_[1], stream);
 
         // 2. Shoup-reduce limbs, apply bit-reversed twist -> ra / rb
         const std::size_t enc_shared = 2 * warp_size * (l | 1u) * sizeof(u32);
@@ -787,28 +799,55 @@ struct Device {
                        dim3(warp_size, group_primes), enc_shared, stream>>>(
             d_a, d_b, d_ra, d_rb, d_primes, d_weights, d_reversed_twist, n, l, k);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
+        if (profiling_) cudaEventRecord(ev_[2], stream);
 
         // 3. forward NTT of both operands
         if ((st = transform<true>(d_ra, d_rb, d_roots, n, k, B, stream)) != cudaSuccess) return st;
+        if (profiling_) cudaEventRecord(ev_[3], stream);
 
         // 4. pointwise product, written in bit-reversed order for the inverse
         multiply_reverse<<<dim3((n + 255) / 256, k, B), 256, 0, stream>>>(
             d_ra, d_rb, d_rc, d_primes, n, k, logN);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
+        if (profiling_) cudaEventRecord(ev_[4], stream);
 
         // 5. inverse NTT of the product
         if ((st = transform<false>(d_rc, nullptr, d_inv_roots, n, k, B, stream)) != cudaSuccess) return st;
+        if (profiling_) cudaEventRecord(ev_[5], stream);
 
         // 6. untwist / normalize
         decode<<<dim3((n + 255) / 256, k, B), 256, 0, stream>>>(
             d_rc, d_primes, d_untwist, n, k);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
+        if (profiling_) cudaEventRecord(ev_[6], stream);
 
         // 7. centered CRT -> canonical [pair][coefficient][limb] output in d_c
         reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
                              dim3(crt_tile_x, crt_tile_y), crt_shared_, stream>>>(
             crt_args_, d_rc, d_c);
-        return cudaGetLastError();
+        st = cudaGetLastError();
+        if (profiling_) cudaEventRecord(ev_[7], stream);
+        return st;
+    }
+
+    // Read and print the stage times. Call after the stream has synchronised.
+    void report_profile() const {
+        if (!profiling_) return;
+        static const char* names[kStages] = {
+            "reindex", "encode", "ntt_fwd", "pointwise", "ntt_inv", "decode", "crt"};
+        float sum = 0.f;
+        for (int i = 0; i < kStages; ++i) {
+            float t = 0.f;
+            cudaEventElapsedTime(&t, ev_[i], ev_[i + 1]);
+            sum += t;
+        }
+        std::fprintf(stderr, "gpu31 stages (ms):");
+        for (int i = 0; i < kStages; ++i) {
+            float t = 0.f;
+            cudaEventElapsedTime(&t, ev_[i], ev_[i + 1]);
+            std::fprintf(stderr, " %s %.3f", names[i], t);
+        }
+        std::fprintf(stderr, " | total %.3f\n", sum);
     }
 
 private:
@@ -841,6 +880,8 @@ private:
         if (d_ra) cudaFree(d_ra);
         if (d_rb) cudaFree(d_rb);
         if (d_rc) cudaFree(d_rc);
+        for (int i = 0; i <= kStages; ++i)
+            if (ev_[i]) cudaEventDestroy(ev_[i]);
         d_primes = nullptr;
         d_weights = nullptr;
         d_roots = nullptr;
