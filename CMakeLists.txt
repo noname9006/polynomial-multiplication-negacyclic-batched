@@ -37,7 +37,7 @@ set_target_properties(solution PROPERTIES
   CUDA_ARCHITECTURES OFF
   CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(solution PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH};-dlto;-Xptxas=-v>)
+  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH};-dlto>)
 target_link_options(solution PRIVATE
   $<DEVICE_LINK:-arch=${FHERMA_CUDA_ARCH};-dlto>)
 
