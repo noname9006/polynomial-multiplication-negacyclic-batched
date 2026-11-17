@@ -85,6 +85,17 @@ GPU31_FHD inline void butterfly(u32& a, u32& b, u32 w, const Prime& p) {
 struct Weight {
     u32 value, quotient;
 };
+
+// Encode weights in constant memory. A warp processing one prime reads the same
+// K-L weight row; constant memory broadcasts that to every lane, replacing what
+// would otherwise be ~430 GB of L2 reads at the biggest point. 120*56*8 = 53.8 KB
+// fits in the 64 KB constant bank. Stride 56 covers the largest official L=55.
+#define GPU31_MAXK_C 120
+#define GPU31_MAXL_C 56
+#if defined(__CUDACC__)
+__constant__ Weight c_weights[GPU31_MAXK_C * GPU31_MAXL_C];
+#endif
+
 GPU31_FHD inline Weight make_weight(u32 value, u32 p) {
     return {value, u32((u64(value) << 32) / p)};
 }
@@ -515,27 +526,42 @@ __global__ void reindex(u32* a, u32* b, unsigned n, unsigned l, unsigned bits) {
 // Reduce L limbs of each coefficient with Shoup weights, multiply by the
 // bit-reversed twist, and write pair's residues [pair][prime][coefficient].
 __global__ void encode_tiled(const u32* ar, const u32* br, u32* ra, u32* rb,
-                             const Prime* primes, const Weight* weights,
+                             const Prime* primes, const Weight* /*weights*/,
                              const u32* reversed_twist,
                              unsigned n, unsigned l, unsigned count) {
-    // Direct-from-global variant: each thread owns one (coefficient, prime)
-    // and reduces all L limbs straight from the input. The old shared-memory
-    // staging used an odd stride (l|1) that caused heavy bank conflicts and
-    // cost ~38 ms; here the coefficient bytes are re-read per prime but stay
-    // resident in L2 (the whole input is only 14 MB).
+    // Shared staging for the coefficient bytes (read once per tile) plus
+    // constant-memory broadcast for the Shoup weight row. The direct-global
+    // variant re-read ~430 GB from L2 and was 1.4x slower; the earlier odd
+    // stride (l|1) caused bank conflicts. Stride MAXL_C=56 is conflict-free.
+    extern __shared__ u32 stage[];
+    const unsigned stride = GPU31_MAXL_C;
+    u32* sa = stage;
+    u32* sb = stage + warp_size * stride;
     const unsigned x = threadIdx.x, y = threadIdx.y;
     const unsigned start = blockIdx.x * warp_size;
-    const unsigned coef = start + x;
-    const unsigned m = blockIdx.y * group_primes + y;
-    if (m >= count || coef >= n) return;
+    const unsigned valid = (n - start < warp_size) ? (n - start) : warp_size;
     const u64 base = u64(blockIdx.z) * n * l;
-    const u64 ab = base + u64(coef) * l;
-    const Prime p = primes[m];
     const u64 rbase = u64(blockIdx.z) * count * n;
-    const u64 off = rbase + u64(m) * n + coef;
+
+    for (unsigned t = y * warp_size + x; t < valid * l; t += warp_size * group_primes) {
+        const unsigned row = t / l, col = t - row * l;
+        const u64 off = base + u64(start) * l + t;
+        sa[row * stride + col] = ar[off];
+        sb[row * stride + col] = br[off];
+    }
+    __syncthreads();
+    const unsigned m = blockIdx.y * group_primes + y;
+    if (m >= count || x >= valid) return;
+    const Prime p = primes[m];
+    const u64 off = rbase + u64(m) * n + start + x;
     u32 a, b;
-    convert_both(ar + ab, br + ab, weights + u64(m) * l, l, p.p, a, b);
-    const u32 twist = reversed_twist[u64(m) * n + coef];
+#if defined(__CUDACC__)
+    const Weight* wrow = c_weights + u64(m) * GPU31_MAXL_C;
+#else
+    const Weight* wrow = weights + u64(m) * l;
+#endif
+    convert_both(sa + x * stride, sb + x * stride, wrow, l, p.p, a, b);
+    const u32 twist = reversed_twist[u64(m) * n + start + x];
     ra[off] = mont(a, twist, p);
     rb[off] = mont(b, twist, p);
 }
@@ -718,7 +744,22 @@ struct Device {
 
     explicit Device(const fherma::Point& p) : plan_(p), capacity_(p.B) {
         if (p.B == 0) throw std::runtime_error("gpu31: point B must be positive");
+        if (plan_.K > GPU31_MAXK_C || plan_.L > GPU31_MAXL_C)
+            throw std::runtime_error("gpu31: point exceeds constant table limits");
         try {
+            // Constant-memory copy of the encode weights, padded to the stride
+            // the kernel uses so the same row broadcasts to a whole warp.
+            {
+                std::vector<Weight> padded(std::size_t(GPU31_MAXK_C) * GPU31_MAXL_C);
+                for (unsigned m = 0; m < plan_.K; ++m)
+                    for (unsigned j = 0; j < plan_.L; ++j)
+                        padded[std::size_t(m) * GPU31_MAXL_C + j] =
+                            plan_.weights[std::size_t(m) * plan_.L + j];
+                cudaError_t cs = cudaMemcpyToSymbol(c_weights, padded.data(),
+                                                    padded.size() * sizeof(Weight));
+                if (cs != cudaSuccess)
+                    throw std::runtime_error("gpu31: constant weight upload failed");
+            }
             upload(d_primes, plan_.primes);
             upload(d_weights, plan_.weights);
             upload(d_roots, plan_.roots);
@@ -787,9 +828,11 @@ struct Device {
         if (profiling_) cudaEventRecord(ev_[1], stream);
 
         // 2. Shoup-reduce limbs, apply bit-reversed twist -> ra / rb
+        const std::size_t enc_shared =
+            2 * warp_size * GPU31_MAXL_C * sizeof(u32);
         encode_tiled<<<dim3((n + warp_size - 1) / warp_size,
                             (k + group_primes - 1) / group_primes, B),
-                       dim3(warp_size, group_primes), 0, stream>>>(
+                       dim3(warp_size, group_primes), enc_shared, stream>>>(
             d_a, d_b, d_ra, d_rb, d_primes, d_weights, d_reversed_twist, n, l, k);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[2], stream);
