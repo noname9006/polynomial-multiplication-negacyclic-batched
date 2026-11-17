@@ -427,14 +427,12 @@ struct EncodeMmaPlan {
 
 private:
     static cudaError_t invalid() {
-#if defined(PGPU_HOST_CHECK)
+        // cudaErrorInvalidValue == 1 in the real runtime; spelling it as a cast
+        // also compiles against tools/fakecuda's declaration-only header.
         return static_cast<cudaError_t>(1);
-#else
-        return cudaErrorInvalidValue;
-#endif
     }
     template <class T>
-    static auto const& plan_of(const T& x, int) -> decltype(x.plan()) {
+    static auto plan_of(const T& x, int) -> decltype(x.plan()) {
         return x.plan();
     }
     template <class T>
@@ -489,7 +487,7 @@ private:
             // Omitting this is exactly what broke the earlier MMA CRT kernel.
             (void)cudaFuncSetAttribute(
                 encode_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                int(ENC_THREADS * ENC_MAX_L / 32u * ENC_M * 2u * sizeof(u32)));
+                int(2u * ENC_M * ENC_MAX_L * sizeof(u32)));   // 16 KiB cap
 #endif
         } catch (...) {
             release();
@@ -508,7 +506,7 @@ private:
             return invalid();
 #if defined(__CUDACC__) && !defined(PGPU_HOST_CHECK)
         if (simple) {
-            if (!d_weights || !d_radix) return cudaErrorInvalidValue;
+            if (!d_weights || !d_radix) return invalid();
             const std::size_t smem = 2u * 32u * 57u * sizeof(u32);
             (void)cudaFuncSetAttribute(
                 encode_simple_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -588,7 +586,9 @@ inline bool encode_mma_selftest(unsigned iterations = 4096,
         Weight radix{0, 0};
         for (unsigned l = 0; l < L; ++l) {
             const u32 a = u32(next());
-            const u32 W = u32(next()) % p;
+            // finish() folds the high word with radix W_0 = 2^32 mod p, just
+            // as gpu31 builds it; only the remaining weights are arbitrary.
+            const u32 W = (l == 0) ? u32((u64(1) << 32) % p) : u32(next()) % p;
             const u32 Q = u32((u64(W) << 32) / p);
             const Weight w{W, Q};
             if (l == 0) radix = w;

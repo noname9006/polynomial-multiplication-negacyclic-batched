@@ -31,6 +31,7 @@
 #include "polymul_gpu.cuh"
 #if !defined(PGPU_HOST_CHECK)
 #include "gpu31.cuh"
+#include "crt_mma_tc.cuh"
 #include "crt_mma.cuh"
 #endif
 #endif
@@ -106,9 +107,11 @@ struct State {
     // the older 62-bit pgpu path stays compiled as a fallback but is untouched.
 #if !defined(PGPU_HOST_CHECK)
     std::unique_ptr<gpu31::Device> gpu31_dev;
+    std::unique_ptr<crt_mma_tc::CrtMmaPlan> crt_mma_tc_plan;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
     bool gpu31_ok = false;
-    bool crt_mma_ok = false;  // fixed CRT proved identical to the reference CRT
+    bool crt_mma_ok = false;      // fixed CRT proved identical to the reference CRT
+    bool crt_mma_tc_ok = false;   // tensor-core CRT proved identical
 #endif
 
     bool gpu_ok = false;           // the device path is trusted for this point
@@ -630,18 +633,35 @@ void* fherma_init(const fherma::Point& p) {
                 state->gpu31_ok = true;
 
                 const auto& pl = state->gpu31_dev->plan();
+                // 1) Proper tensor-core CRT (u8 MMA) — the potential big win.
                 try {
-                    state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
+                    state->crt_mma_tc_plan = std::make_unique<crt_mma_tc::CrtMmaPlan>(
                         pl.crt_weights, pl.L, pl.K + 1);
-                    crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
-                    state->crt_mma_ok = crt_vs_reference(
+                    crt_mma_tc::CrtMmaPlan* p = state->crt_mma_tc_plan.get();
+                    state->crt_mma_tc_ok = crt_vs_reference(
                         *state,
-                        [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
-                            return p_plan->run(r, o, a, b, s);
+                        [p](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                            return p->run(r, o, a, b, s);
                         },
-                        2, "CRT");
+                        2, "TC-CRT");
                 } catch (const std::exception& e) {
-                    std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
+                    std::fprintf(stderr, "polymul: TC-CRT setup failed: %s\n", e.what());
+                }
+                // 2) Conflict-free CUDA-core CRT fallback.
+                if (!state->crt_mma_tc_ok) {
+                    try {
+                        state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
+                            pl.crt_weights, pl.L, pl.K + 1);
+                        crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
+                        state->crt_mma_ok = crt_vs_reference(
+                            *state,
+                            [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                                return p_plan->run(r, o, a, b, s);
+                            },
+                            2, "CRT");
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
+                    }
                 }
             }
         } catch (const std::exception& e) {
@@ -694,13 +714,13 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 #if !defined(PGPU_HOST_CHECK)
             if (s->gpu31_ok) {
                 const u32 Bc = static_cast<u32>(B);
-                const bool use_cupqc = s->crt_cupqc_ok && s->crt_cupqc_plan != nullptr;
+                const bool use_tc = s->crt_mma_tc_ok && s->crt_mma_tc_plan != nullptr;
                 const bool use_mma = s->crt_mma_ok && s->crt_mma_plan != nullptr;
                 ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c, Bc, s->stream,
-                                       /*skip_crt=*/(use_cupqc || use_mma)) == cudaSuccess;
-                if (ok && use_cupqc)
-                    ok = s->crt_cupqc_plan->run(s->gpu31_dev->residues_device(), s->d_c,
-                                                s->gpu31_dev->crt_args(), Bc, s->stream)
+                                       /*skip_crt=*/(use_tc || use_mma)) == cudaSuccess;
+                if (ok && use_tc)
+                    ok = s->crt_mma_tc_plan->run(s->gpu31_dev->residues_device(), s->d_c,
+                                                 s->gpu31_dev->crt_args(), Bc, s->stream)
                          == cudaSuccess;
                 else if (ok && use_mma)
                     ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), s->d_c,
