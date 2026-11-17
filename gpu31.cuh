@@ -815,7 +815,7 @@ struct Device {
     // tables and the scratch above belong to this object.  Asynchronous: all
     // launches go to `stream`; the caller checks completion when consuming out.
     cudaError_t run(const u32* d_a, const u32* d_b, u32* d_c, u32 B,
-                    cudaStream_t stream = nullptr) {
+                    cudaStream_t stream = nullptr, bool skip_crt = false) {
         if (B == 0) return cudaSuccess;
         if (B > capacity_ || !d_a || !d_b || !d_c) return cudaErrorInvalidValue;
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
@@ -859,13 +859,32 @@ struct Device {
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[6], stream);
 
-        // 7. centered CRT -> canonical [pair][coefficient][limb] output in d_c
-        reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
-                             dim3(crt_tile_x, crt_tile_y), crt_shared_, stream>>>(
-            crt_args_, d_rc, d_c);
-        st = cudaGetLastError();
+        // 7. centered CRT -> canonical [pair][coefficient][limb] output in d_c.
+        // When skip_crt is set, the caller runs an external CRT (e.g. tensor-core
+        // MMA) on d_rc after this pipeline returns.
+        if (!skip_crt) {
+            reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
+                                 dim3(crt_tile_x, crt_tile_y), crt_shared_, stream>>>(
+                crt_args_, d_rc, d_c);
+            st = cudaGetLastError();
+        }
         if (profiling_) cudaEventRecord(ev_[7], stream);
         return st;
+    }
+
+    // Accessors for the tensor-core CRT integration in solve.cu.
+    const Plan& plan() const { return plan_; }
+    const CrtArgs& crt_args() const { return crt_args_; }
+    const u32* residues_device() const { return d_rc; }
+
+    // Run the reference (CUDA-core) CRT into `out` for `pairs` pairs.
+    cudaError_t crt_reference(const u32* residues, u32* out, u32 pairs,
+                              cudaStream_t stream) const {
+        if (pairs == 0) return cudaSuccess;
+        reconstruct_kernel<<<dim3((plan_.N + crt_tile_x - 1) / crt_tile_x, 1, pairs),
+                             dim3(crt_tile_x, crt_tile_y), crt_shared_, stream>>>(
+            crt_args_, residues, out);
+        return cudaGetLastError();
     }
 
     // Read and print the stage times. Call after the stream has synchronised.
