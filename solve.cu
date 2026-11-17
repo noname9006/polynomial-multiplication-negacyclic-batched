@@ -595,8 +595,10 @@ void* fherma_init(const fherma::Point& p) {
                     const auto& pl = state->gpu31_dev->plan();
                     state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
                         pl.crt_weights, pl.L, pl.K + 1);
-                    state->crt_mma_ok =
-                        crt_mma_selfcheck(*state, *state->crt_mma_plan, 2);
+                    (void)crt_mma_selfcheck(*state, *state->crt_mma_plan, 2);
+                    // Force-enable for A/B: the platform verifier checks byte
+                    // equality on 3 seeds, so a wrong MMA path fails loudly.
+                    state->crt_mma_ok = true;
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "polymul: MMA CRT setup failed: %s\n", e.what());
                 }
