@@ -841,10 +841,19 @@ private:
         if (d_ra) cudaFree(d_ra);
         if (d_rb) cudaFree(d_rb);
         if (d_rc) cudaFree(d_rc);
-        d_primes = d_weights = d_roots = d_inv_roots = nullptr;
-        d_twist = d_untwist = d_reversed_twist = nullptr;
-        d_crt_primes = d_crt_weights = d_crt_q = nullptr;
-        d_ra = d_rb = d_rc = nullptr;
+        d_primes = nullptr;
+        d_weights = nullptr;
+        d_roots = nullptr;
+        d_inv_roots = nullptr;
+        d_twist = nullptr;
+        d_untwist = nullptr;
+        d_reversed_twist = nullptr;
+        d_crt_primes = nullptr;
+        d_crt_weights = nullptr;
+        d_crt_q = nullptr;
+        d_ra = nullptr;
+        d_rb = nullptr;
+        d_rc = nullptr;
     }
 
     template <bool Two>
