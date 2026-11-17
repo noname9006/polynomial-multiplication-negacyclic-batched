@@ -121,6 +121,27 @@ GPU31_FHD inline u32 finish(u64 sum, Weight radix, u32 p) {
     if (hi >= p) hi -= p;
     return add(lo, hi, p);
 }
+
+// Fast path: a single __uint128_t accumulation replaces L per-limb Shoup
+// reductions. Since lazy_product(a_l,W_l,p) == a_l*W_l (mod p),
+//   r = (sum_l a_l*W_l) mod p.
+// sum < 2^70; reduce via X = hiw*2^64 + mid32*2^32 + lo32 with w0 = 2^32 mod p.
+// Requires p > 2^30 (true for every gpu31 plan). 2 mul reductions total.
+GPU31_FHD inline u32 reduce128(u32 lo32, u32 mid32, u32 hiw,
+                               const Weight& w0, u32 p, u64 r2) {
+    u32 acc = canonical_word(lo32, p);
+    u32 t = lazy_product(mid32, w0, p);
+    if (t >= p) t -= p;
+    acc += t; if (acc >= p) acc -= p;
+    const u64 z = u64(hiw) * r2;            // hiw < 16, r2 < p < 2^31 -> z < 2^36
+    const u32 zl = u32(z), zh = u32(z >> 32);
+    const u32 zlc = canonical_word(zl, p);
+    u32 tz = lazy_product(zh, w0, p);
+    if (tz >= p) tz -= p;
+    t = zlc + tz; if (t >= p) t -= p;
+    acc += t; if (acc >= p) acc -= p;
+    return acc;
+}
 GPU31_FHD inline u32 convert(const u32* input, const Weight* w, unsigned limbs, u32 p) {
     u64 sum = 0;
     for (unsigned j = 0; j < limbs; ++j) sum += lazy_product(input[j], w[j], p);
@@ -559,10 +580,22 @@ __global__ void encode_tiled(const u32* ar, const u32* br, u32* ra, u32* rb,
     u32 a, b;
 #if defined(__CUDACC__)
     const Weight* wrow = c_weights + u64(m) * GPU31_MAXL_C;
+    // Fast single-pass reduction: sum a_l*W_l in 128 bits, reduce once.
+    __uint128_t suma = 0, sumb = 0;
+    const u32* ca = sa + x * stride;
+    const u32* cb = sb + x * stride;
+    #pragma unroll 4
+    for (unsigned j = 0; j < l; ++j) {
+        suma += (__uint128_t)(u64(ca[j]) * u64(wrow[j].value));
+        sumb += (__uint128_t)(u64(cb[j]) * u64(wrow[j].value));
+    }
+    const u64 loa = u64(suma), lob = u64(sumb);
+    a = reduce128(u32(loa), u32(loa >> 32), u32(suma >> 64), wrow[0], p.p, p.r2);
+    b = reduce128(u32(lob), u32(lob >> 32), u32(sumb >> 64), wrow[0], p.p, p.r2);
 #else
     const Weight* wrow = weights + u64(m) * l;
-#endif
     convert_both(sa + x * stride, sb + x * stride, wrow, l, p.p, a, b);
+#endif
     const u32 twist = reversed_twist[u64(m) * n + start + x];
     ra[off] = mont(a, twist, p);
     rb[off] = mont(b, twist, p);
