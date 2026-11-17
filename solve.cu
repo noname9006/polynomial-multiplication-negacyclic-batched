@@ -29,6 +29,9 @@
 #include <cuda_runtime.h>
 
 #include "polymul_gpu.cuh"
+#if !defined(PGPU_HOST_CHECK)
+#include "gpu31.cuh"
+#endif
 #endif
 
 // A kernel launch, spelled once. Under nvcc this is the launch itself; under
@@ -98,6 +101,13 @@ struct State {
     std::unique_ptr<polymul::Engine> engine;
 
 #ifdef __CUDACC__
+    // Fast 31-bit RNS path; built and checked in fherma_init. When it is used,
+    // the older 62-bit pgpu path stays compiled as a fallback but is untouched.
+#if !defined(PGPU_HOST_CHECK)
+    std::unique_ptr<gpu31::Device> gpu31_dev;
+    bool gpu31_ok = false;
+#endif
+
     bool gpu_ok = false;           // the device path is trusted for this point
     bool result_on_device = false; // run left the answer in d_c
     bool inputs_on_device = false; // h2d has been called since the last run
@@ -407,6 +417,58 @@ bool gpu_selfcheck(State& s, u32 pairs) {
     return true;
 }
 
+// Verify the 31-bit path against the portable host engine on deterministic,
+// canonical random pairs. Same idea as gpu_selfcheck, but through gpu31::Device.
+#if !defined(PGPU_HOST_CHECK)
+bool gpu31_selfcheck(State& s, gpu31::Device& dev, u32 pairs) {
+    const polymul::Plan& plan = s.plan;
+    const std::size_t N = plan.N, L = plan.L, per = N * L;
+    std::vector<u32> a(pairs * per), b(pairs * per), want(pairs * per, 0),
+        got(pairs * per, 0);
+    Rng rng(plan.primes[0] ^ (static_cast<u64>(N) << 31) ^ plan.q.limb(0) ^ 0xa5a5a5a5u);
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        a[i] = static_cast<u32>(rng.next());
+        b[i] = static_cast<u32>(rng.next());
+    }
+    for (u32 i = 0; i < pairs * static_cast<u32>(N); ++i) {
+        for (u32* c : {a.data() + static_cast<std::size_t>(i) * L,
+                       b.data() + static_cast<std::size_t>(i) * L}) {
+            polymul::Big x = polymul::Big::from_le(c, L);
+            if (polymul::cmp(x, plan.q) < 0) continue;
+            polymul::Big quot, rem;
+            polymul::divmod(x, plan.q, quot, rem);
+            rem.to_le(c, L);
+        }
+    }
+    for (u32 j = 0; j < pairs; ++j)
+        s.engine->multiply(a.data() + static_cast<std::size_t>(j) * per,
+                           b.data() + static_cast<std::size_t>(j) * per,
+                           want.data() + static_cast<std::size_t>(j) * per);
+
+    if (cudaMemcpy(s.d_a, a.data(), a.size() * sizeof(u32), cudaMemcpyHostToDevice) !=
+            cudaSuccess ||
+        cudaMemcpy(s.d_b, b.data(), b.size() * sizeof(u32), cudaMemcpyHostToDevice) !=
+            cudaSuccess)
+        return false;
+    if (dev.run(s.d_a, s.d_b, s.d_c, pairs, s.stream) != cudaSuccess) return false;
+    if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    if (cudaMemcpy(got.data(), s.d_c, got.size() * sizeof(u32), cudaMemcpyDeviceToHost) !=
+        cudaSuccess)
+        return false;
+
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < got.size(); ++i)
+        if (got[i] != want[i]) ++bad;
+    if (bad) {
+        std::fprintf(stderr,
+                     "polymul: gpu31 disagrees with host on %zu of %zu limbs; keeping fallback\n",
+                     bad, got.size());
+        return false;
+    }
+    return true;
+}
+#endif  // !PGPU_HOST_CHECK
+
 }  // namespace
 #endif  // __CUDACC__
 
@@ -472,6 +534,23 @@ void* fherma_init(const fherma::Point& p) {
         if (!fits) state->release();
         state->gpu_ok = fits;
     }
+
+    // Prefer the batched 31-bit RNS path when it proves itself against the host.
+    // It reuses the device buffers and stream set up above; the 62-bit path stays
+    // compiled and ready if construction or the self-check fails.
+#if !defined(PGPU_HOST_CHECK)
+    if (state->gpu_ok) {
+        try {
+            auto dev = std::make_unique<gpu31::Device>(p);
+            if (gpu31_selfcheck(*state, *dev, p.B < 2 ? p.B : 2)) {
+                state->gpu31_dev = std::move(dev);
+                state->gpu31_ok = true;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "polymul: gpu31 setup failed: %s\n", e.what());
+        }
+    }
+#endif
 #endif
 
     return state.release();
@@ -513,7 +592,16 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
                                  s->stream) == cudaSuccess &&
                  cudaMemcpyAsync(s->d_b, in.b.data.data(), bytes, cudaMemcpyHostToDevice,
                                  s->stream) == cudaSuccess;
-        if (ok && gpu_multiply(*s, static_cast<u32>(B))) {
+        if (ok) {
+#if !defined(PGPU_HOST_CHECK)
+            if (s->gpu31_ok)
+                ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c,
+                                       static_cast<u32>(B), s->stream) == cudaSuccess;
+            else
+#endif
+                ok = gpu_multiply(*s, static_cast<u32>(B));
+        }
+        if (ok) {
             if (!s->out_pool.empty()) {
                 out.c.data = std::move(s->out_pool.back());
                 s->out_pool.pop_back();
