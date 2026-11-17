@@ -518,30 +518,24 @@ __global__ void encode_tiled(const u32* ar, const u32* br, u32* ra, u32* rb,
                              const Prime* primes, const Weight* weights,
                              const u32* reversed_twist,
                              unsigned n, unsigned l, unsigned count) {
-    extern __shared__ u32 stage[];
-    const unsigned stride = l | 1u;
-    u32* sa = stage;
-    u32* sb = stage + warp_size * stride;
+    // Direct-from-global variant: each thread owns one (coefficient, prime)
+    // and reduces all L limbs straight from the input. The old shared-memory
+    // staging used an odd stride (l|1) that caused heavy bank conflicts and
+    // cost ~38 ms; here the coefficient bytes are re-read per prime but stay
+    // resident in L2 (the whole input is only 14 MB).
     const unsigned x = threadIdx.x, y = threadIdx.y;
     const unsigned start = blockIdx.x * warp_size;
-    const unsigned valid = (n - start < warp_size) ? (n - start) : warp_size;
-    const u64 base = u64(blockIdx.z) * n * l;
-    const u64 rbase = u64(blockIdx.z) * count * n;
-
-    for (unsigned t = y * warp_size + x; t < valid * l; t += warp_size * group_primes) {
-        const unsigned row = t / l, col = t - row * l;
-        const u64 off = base + u64(start) * l + t;
-        sa[row * stride + col] = ar[off];
-        sb[row * stride + col] = br[off];
-    }
-    __syncthreads();
+    const unsigned coef = start + x;
     const unsigned m = blockIdx.y * group_primes + y;
-    if (m >= count || x >= valid) return;
+    if (m >= count || coef >= n) return;
+    const u64 base = u64(blockIdx.z) * n * l;
+    const u64 ab = base + u64(coef) * l;
     const Prime p = primes[m];
-    const u64 off = rbase + u64(m) * n + start + x;
+    const u64 rbase = u64(blockIdx.z) * count * n;
+    const u64 off = rbase + u64(m) * n + coef;
     u32 a, b;
-    convert_both(sa + x * stride, sb + x * stride, weights + u64(m) * l, l, p.p, a, b);
-    const u32 twist = reversed_twist[u64(m) * n + start + x];
+    convert_both(ar + ab, br + ab, weights + u64(m) * l, l, p.p, a, b);
+    const u32 twist = reversed_twist[u64(m) * n + coef];
     ra[off] = mont(a, twist, p);
     rb[off] = mont(b, twist, p);
 }
@@ -793,10 +787,9 @@ struct Device {
         if (profiling_) cudaEventRecord(ev_[1], stream);
 
         // 2. Shoup-reduce limbs, apply bit-reversed twist -> ra / rb
-        const std::size_t enc_shared = 2 * warp_size * (l | 1u) * sizeof(u32);
         encode_tiled<<<dim3((n + warp_size - 1) / warp_size,
                             (k + group_primes - 1) / group_primes, B),
-                       dim3(warp_size, group_primes), enc_shared, stream>>>(
+                       dim3(warp_size, group_primes), 0, stream>>>(
             d_a, d_b, d_ra, d_rb, d_primes, d_weights, d_reversed_twist, n, l, k);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[2], stream);
