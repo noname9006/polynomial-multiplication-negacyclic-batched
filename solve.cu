@@ -31,8 +31,6 @@
 #include "polymul_gpu.cuh"
 #if !defined(PGPU_HOST_CHECK)
 #include "gpu31.cuh"
-#define CRT_CUPQC_REDUCE_MODE 1   // simple warp-capable mod (lighter device link)
-#include "crt_cupqc.cuh"
 #include "crt_mma.cuh"
 #endif
 #endif
@@ -108,11 +106,9 @@ struct State {
     // the older 62-bit pgpu path stays compiled as a fallback but is untouched.
 #if !defined(PGPU_HOST_CHECK)
     std::unique_ptr<gpu31::Device> gpu31_dev;
-    std::unique_ptr<crt_cupqc::Plan> crt_cupqc_plan;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
     bool gpu31_ok = false;
     bool crt_mma_ok = false;  // fixed CRT proved identical to the reference CRT
-    bool crt_cupqc_ok = false;
 #endif
 
     bool gpu_ok = false;           // the device path is trusted for this point
@@ -634,38 +630,18 @@ void* fherma_init(const fherma::Point& p) {
                 state->gpu31_ok = true;
 
                 const auto& pl = state->gpu31_dev->plan();
-                std::vector<u32> q_limbs(p.q.data.begin(), p.q.data.end());
-                // Try cuPQC CRT (mod mode) first — warp-cooperative, potentially fast.
                 try {
-                    state->crt_cupqc_plan = std::make_unique<crt_cupqc::Plan>(
-                        pl.crt_weights, pl.L, pl.K + 1, q_limbs, pl.K);
-                    if (state->crt_cupqc_plan->cupqc_ok) {
-                        crt_cupqc::Plan* cp = state->crt_cupqc_plan.get();
-                        state->crt_cupqc_ok = crt_vs_reference(
-                            *state,
-                            [cp](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
-                                return cp->run(r, o, a, b, s);
-                            },
-                            2, "cuPQC");
-                    }
+                    state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
+                        pl.crt_weights, pl.L, pl.K + 1);
+                    crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
+                    state->crt_mma_ok = crt_vs_reference(
+                        *state,
+                        [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                            return p_plan->run(r, o, a, b, s);
+                        },
+                        2, "CRT");
                 } catch (const std::exception& e) {
-                    std::fprintf(stderr, "polymul: cuPQC setup failed: %s\n", e.what());
-                }
-                // Fallback: conflict-free CUDA-core CRT.
-                if (!state->crt_cupqc_ok) {
-                    try {
-                        state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
-                            pl.crt_weights, pl.L, pl.K + 1);
-                        crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
-                        state->crt_mma_ok = crt_vs_reference(
-                            *state,
-                            [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
-                                return p_plan->run(r, o, a, b, s);
-                            },
-                            2, "CRT");
-                    } catch (const std::exception& e) {
-                        std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
-                    }
+                    std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
                 }
             }
         } catch (const std::exception& e) {
