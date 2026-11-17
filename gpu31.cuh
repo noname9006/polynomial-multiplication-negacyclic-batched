@@ -534,7 +534,9 @@ __global__ void encode_tiled(const u32* ar, const u32* br, u32* ra, u32* rb,
     // variant re-read ~430 GB from L2 and was 1.4x slower; the earlier odd
     // stride (l|1) caused bank conflicts. Stride MAXL_C=56 is conflict-free.
     extern __shared__ u32 stage[];
-    const unsigned stride = GPU31_MAXL_C;
+    // Odd stride coprime with 32 avoids shared-memory bank conflicts: with an
+    // even stride, 32 consecutive coefficient rows hit only 4 distinct banks.
+    const unsigned stride = GPU31_MAXL_C + 1;
     u32* sa = stage;
     u32* sb = stage + warp_size * stride;
     const unsigned x = threadIdx.x, y = threadIdx.y;
@@ -829,7 +831,7 @@ struct Device {
 
         // 2. Shoup-reduce limbs, apply bit-reversed twist -> ra / rb
         const std::size_t enc_shared =
-            2 * warp_size * GPU31_MAXL_C * sizeof(u32);
+            2 * warp_size * (GPU31_MAXL_C + 1) * sizeof(u32);
         encode_tiled<<<dim3((n + warp_size - 1) / warp_size,
                             (k + group_primes - 1) / group_primes, B),
                        dim3(warp_size, group_primes), enc_shared, stream>>>(
