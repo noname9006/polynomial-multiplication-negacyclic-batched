@@ -18,3 +18,6 @@ CUDA_ANY(cudaDeviceGetAttribute) CUDA_ANY(cudaOccupancyMaxActiveBlocksPerMultipr
 inline cudaError_t cudaGetLastError() { return 0; }
 inline const char* cudaGetErrorString(cudaError_t) { return ""; }
 struct dim3 { unsigned x, y, z; dim3(unsigned a=1,unsigned b=1,unsigned c=1):x(a),y(b),z(c){} };
+
+const unsigned cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2;
+CUDA_ANY(cudaStreamCreateWithFlags)

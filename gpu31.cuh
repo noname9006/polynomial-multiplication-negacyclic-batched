@@ -786,6 +786,9 @@ struct Device {
         *d_untw_slot = nullptr;
     bool tc_ntt_ready = false, tc_ntt = false;
     bool tc_efl = false;   // TC5: encode fused with fwd low stages
+    bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
+    cudaStream_t cs_[2] = {nullptr, nullptr};
+    cudaEvent_t evf_ = nullptr, evj_[2] = {nullptr, nullptr};
     unsigned enc_KS = 0, enc_NT = 0;
     tc::CrtTc crt_cfg{};
     std::size_t crt_tc_shared = 0;
@@ -852,6 +855,14 @@ struct Device {
             if (crt_shared_ > prop.sharedMemPerBlock)
                 throw std::runtime_error("gpu31: CRT tile exceeds shared memory capacity");
             build_tc(prop);
+            if (cudaStreamCreateWithFlags(&cs_[0], cudaStreamNonBlocking) != cudaSuccess ||
+                cudaStreamCreateWithFlags(&cs_[1], cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&evf_, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&evj_[0], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&evj_[1], cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                cs_[0] = cs_[1] = nullptr;
+            }
             for (int i = 0; i <= kStages; ++i)
                 if (cudaEventCreate(&ev_[i]) != cudaSuccess) break;
             profiling_ = (ev_[kStages] != nullptr);
@@ -887,40 +898,30 @@ struct Device {
         if (profiling_) cudaEventRecord(ev_[0], stream);
 
         if (tc_ntt && tc_enc && tc_crt && !skip_crt) {
-            const unsigned logH = logN - 9;
-            if (tc_efl) {
-                tc::encode_fwdlow<<<dim3(n / tc::EF_ROWS, 2, B), 512, 0, stream>>>(
-                    d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
-                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
-                if ((st = cudaGetLastError()) != cudaSuccess) return st;
-                if (profiling_) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
-                                  cudaEventRecord(ev_[3], stream); }
-            } else {
-            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 256, 0, stream>>>(
-                d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
-                n, l, k, logN, enc_KS, enc_NT);
-            if ((st = cudaGetLastError()) != cudaSuccess) return st;
-            if (profiling_) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream); }
-            tc::fwd_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
-                d_ra, d_rb, d_primes, d_pk_fwd, n, k);
-            if ((st = cudaGetLastError()) != cudaSuccess) return st;
-            if (profiling_) cudaEventRecord(ev_[3], stream);
+            if (tc_chunk && cs_[0] && cs_[1]) {
+                // TC8: pairs one at a time on two streams; one pair's residues
+                // (3 x K x N x 4 B ~ 93 MB) stay in L2 between the stages.
+                cudaEventRecord(evf_, stream);
+                cudaStreamWaitEvent(cs_[0], evf_, 0);
+                cudaStreamWaitEvent(cs_[1], evf_, 0);
+                const std::size_t in_stride = std::size_t(n) * l;
+                const std::size_t res_stride = std::size_t(k) * n;
+                for (u32 j = 0; j < B; ++j) {
+                    const unsigned sl = j & 1u;
+                    st = tc_pipeline(d_a + j * in_stride, d_b + j * in_stride, d_c + j * in_stride,
+                                     d_ra + sl * res_stride, d_rb + sl * res_stride,
+                                     d_rc + sl * res_stride, 1, cs_[sl], false);
+                    if (st != cudaSuccess) return st;
+                }
+                cudaEventRecord(evj_[0], cs_[0]);
+                cudaEventRecord(evj_[1], cs_[1]);
+                cudaStreamWaitEvent(stream, evj_[0], 0);
+                cudaStreamWaitEvent(stream, evj_[1], 0);
+                if (profiling_)
+                    for (int e = 1; e <= kStages; ++e) cudaEventRecord(ev_[e], stream);
+                return cudaGetLastError();
             }
-            tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
-                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
-                d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH);
-            if ((st = cudaGetLastError()) != cudaSuccess) return st;
-            if (profiling_) cudaEventRecord(ev_[4], stream);
-            tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
-                d_rc, d_primes, d_pk_inv, n, k);
-            if ((st = cudaGetLastError()) != cudaSuccess) return st;
-            if (profiling_) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
-            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
-                          crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
-                                                   d_primes, d_untw_slot, logN, d_corr_m);
-            st = cudaGetLastError();
-            if (profiling_) cudaEventRecord(ev_[7], stream);
-            return st;
+            return tc_pipeline(d_a, d_b, d_c, d_ra, d_rb, d_rc, B, stream, profiling_);
         }
 
         if (tc_enc) {
@@ -1033,6 +1034,46 @@ struct Device {
             std::fprintf(stderr, " %s %.3f", names[i], t);
         }
         std::fprintf(stderr, " | total %.3f\n", sum);
+    }
+
+    cudaError_t tc_pipeline(const u32* pa, const u32* pb, u32* pc, u32* pra, u32* prb, u32* prc,
+                            u32 B, cudaStream_t stream, bool prof) {
+        const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
+        cudaError_t st = cudaSuccess;
+            const unsigned logH = logN - 9;
+            if (tc_efl) {
+                tc::encode_fwdlow<<<dim3(n / tc::EF_ROWS, 2, B), 512, 0, stream>>>(
+                    pa, pb, pra, prb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
+                if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
+                                  cudaEventRecord(ev_[3], stream); }
+            } else {
+            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 256, 0, stream>>>(
+                pa, pb, pra, prb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                n, l, k, logN, enc_KS, enc_NT);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream); }
+            tc::fwd_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
+                pra, prb, d_primes, d_pk_fwd, n, k);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (prof) cudaEventRecord(ev_[3], stream);
+            }
+            tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
+                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
+                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (prof) cudaEventRecord(ev_[4], stream);
+            tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
+                prc, d_primes, d_pk_inv, n, k);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (prof) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
+            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
+                          crt_tc_shared, stream>>>(crt_args_, prc, pc, d_fcrt, crt_cfg,
+                                                   d_primes, d_untw_slot, logN, d_corr_m);
+            st = cudaGetLastError();
+            if (prof) cudaEventRecord(ev_[7], stream);
+            return st;
     }
 
 private:
@@ -1182,6 +1223,14 @@ private:
         if (d_fenc) cudaFree(d_fenc);
         if (d_fcrt) cudaFree(d_fcrt);
         if (d_untw_inv) cudaFree(d_untw_inv);
+        for (int q = 0; q < 2; ++q) {
+            if (cs_[q]) cudaStreamDestroy(cs_[q]);
+            if (evj_[q]) cudaEventDestroy(evj_[q]);
+            cs_[q] = nullptr;
+            evj_[q] = nullptr;
+        }
+        if (evf_) cudaEventDestroy(evf_);
+        evf_ = nullptr;
         if (d_corr_m) cudaFree(d_corr_m);
         d_corr_m = nullptr;
         d_untw_inv = nullptr;
