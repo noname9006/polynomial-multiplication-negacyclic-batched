@@ -1040,8 +1040,7 @@ private:
                 else { if (pt) cudaFree(pt); cudaGetLastError(); }
             }
         }
-        std::fprintf(stderr, "[TC] enc ready=%d KS=%u NT=%u | crt ready=%d KS=%u NT=%u SA=%u smem=%zu
-",
+        std::fprintf(stderr, "[TC] enc ready=%d KS=%u NT=%u | crt ready=%d KS=%u NT=%u SA=%u smem=%zu\n",
                      int(tc_enc_ready), enc_KS, enc_NT, int(tc_crt_ready), crt_cfg.KS, crt_cfg.NT,
                      crt_cfg.SA, crt_tc_shared);
     }
