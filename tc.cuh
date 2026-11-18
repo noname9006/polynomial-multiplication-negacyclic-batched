@@ -35,9 +35,13 @@
 // Agent B, inv_crt phase-A variant (b): split the first cluster barrier into
 // arrive.relaxed + a wait.acquire deferred to just before the first DSMEM
 // store, so the cluster-wide wait shadows the local inverse-NTT work.
-// 0 (default) keeps the original full cl_sync.  Second cl_sync unchanged.
+// Variant (b) enabled (OC17): removes the kernel-entry cluster stall; the wait
+// moves ~3 primes into phase A (~1/3 of A).  Estimate: the first cl_sync is
+// ~half of the two cluster barriers; if barriers are, say, 25% of the 37 ms,
+// overlap ~1/3 of one saves ~1 ms (37 -> ~36 ms).  Set to 0 for the clean
+// profile build (commit 1: OC16).
 #ifndef INVCRT_SPLIT_SYNC
-#define INVCRT_SPLIT_SYNC 0
+#define INVCRT_SPLIT_SYNC 1
 #endif
 
 namespace tc {
@@ -1754,14 +1758,13 @@ __device__ __forceinline__ unsigned cl_rank() {
 __device__ __forceinline__ void cl_sync() {
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
-// INVCRT_SPLIT_SYNC: split the first cluster barrier without breaking its
-// release/acquire ordering.  arrive.release keeps the sA zero-init visible to
-// remote CTAs (a relaxed arrive would race: zeroes could clobber already-
-// stored terms where j0 >= K+1); only wait.acquire is deferred to just before
-// the first DSMEM store.  Still hides most of the cluster wait behind the
-// local inverse-NTT work.
-__device__ __forceinline__ void cl_arrive_release() {
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+// INVCRT_SPLIT_SYNC: split the first cluster barrier.  arrive.relaxed is safe
+// because the zero-init writes sA columns K+1..W-1 while DSMEM stores write
+// columns 0..K-1 (disjoint); the second cl_sync provides acquire before phase
+// B.  Only wait.acquire is deferred, to a point before the first DSMEM store,
+// so it overlaps the local inverse-NTT work.
+__device__ __forceinline__ void cl_arrive_relaxed() {
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 }
 __device__ __forceinline__ void cl_wait_acquire() {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -1797,7 +1800,7 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         sA[r * cfg.SA + j] = 0u;
     }
 #if INVCRT_SPLIT_SYNC
-    cl_arrive_release();  // variant (b): release kept, wait deferred to first DSMEM store
+    cl_arrive_relaxed();  // variant (b): deferred wait below; zero-init and stores are disjoint
 #else
     cl_sync();   // all CTAs of the cluster running before DSMEM stores
 #endif
@@ -1821,6 +1824,9 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
             cw0 = packed[u64(jb) * TC_LT + t]; cw1 = packed[u64(jb) * TC_LT + t + 256];
         }
         u32 k0[4], k1[4];
+#if INVCRT_SPLIT_SYNC
+        bool split_waited = false;
+#endif
         for (unsigned jj = 0; jj < PH; ++jj) {
             const unsigned j = jb + jj;
             u32 n0 = 0, n1 = 0, nw0 = 0, nw1 = 0;
@@ -1869,11 +1875,11 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
 #pragma unroll
             for (unsigned z = 0; z < 4; ++z) if (z == q) { k0[z] = e0; k1[z] = e1; }
             if (q == 3) {
+#if INVCRT_SPLIT_SYNC
+                if (jj == 3) { cl_wait_acquire(); split_waited = true; }
+#endif
                 const unsigned j0 = j - 3;
                 if (j0 + 4 <= W) {
-#if INVCRT_SPLIT_SYNC
-                    cl_wait_acquire();  // variant (b): wait shadows the inverse-NTT work above
-#endif
                     st_cluster4(sA + w0 * cfg.SA + j0, o0, k0[0], k0[1], k0[2], k0[3]);
                     st_cluster4(sA + w1 * cfg.SA + j0, o1, k1[0], k1[1], k1[2], k1[3]);
                 }
@@ -1882,6 +1888,9 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
             __syncthreads();   // sa/sr reused next iteration
         }
         TCP_T(a1);
+#if INVCRT_SPLIT_SYNC
+        if (!split_waited) cl_wait_acquire();  // PH<=3: no store point reached
+#endif
     }
     cl_sync();
     TCP_T(c1);
