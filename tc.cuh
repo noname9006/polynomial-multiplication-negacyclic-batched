@@ -137,6 +137,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC19_PF
 #define TC19_PF 1
 #endif
+#ifndef TC21_SHOUP
+#define TC21_SHOUP 1   // packed low-stage twiddles = [plain w x256 | floor(w*2^32/p) x256]
+#endif
+#define TC_PKS (TC21_SHOUP ? 512u : 256u)
 #ifndef TC20_R8
 #define TC20_R8 1
 #endif
@@ -163,6 +167,14 @@ __constant__ u32 c_crt_corr[CRT_KMAX_C];
 #define TCP_T(v) const long long v = (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) ? (long long)clock64() : 0
 #define TCP_ADD(slot, a, b) do { if (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) \
     atomicAdd(&g_tcprof[slot], (unsigned long long)((b) - (a))); } while (0)
+
+// Shoup product b*w mod p for a fixed w < p with wq = floor(w*2^32/p);
+// exact and canonical (same value as gpu31::mont(b, w*R mod p)).
+__device__ __forceinline__ u32 mulsh(u32 b, u32 w, u32 wq, u32 p) {
+    const u32 q = __umulhi(b, wq);
+    const u32 r = b * w - q * p;
+    return r >= p ? r - p : r;
+}
 
 __device__ __forceinline__ void mma_u8(int (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3,
                                        u32 b0, u32 b1) {
@@ -656,7 +668,11 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
     const unsigned t = threadIdx.x;
     const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
     const gpu31::Prime p = primes[blockIdx.y];
+#if TC21_SHOUP
+    sr[t] = gpu31::mont(packed[u64(blockIdx.y) * TC_PKS + t], p.r2, p);   // plain -> Montgomery
+#else
     sr[t] = packed[u64(blockIdx.y) * (NT_TILE / 2) + t];
+#endif
     sa[padw(t)] = a[base + t];
     sa[padw(t + 256)] = a[base + t + 256];
     sb[padw(t)] = b[base + t];
@@ -961,11 +977,12 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 __global__ void __launch_bounds__(256)
 inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K) {
-    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[NT_TILE / 2];
+    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[NT_TILE / 2], srq[NT_TILE / 2];
     const unsigned t = threadIdx.x;
     const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
     const gpu31::Prime p = primes[blockIdx.y];
-    sr[t] = packed[u64(blockIdx.y) * (NT_TILE / 2) + t];
+    sr[t] = packed[u64(blockIdx.y) * TC_PKS + t];
+    srq[t] = TC21_SHOUP ? packed[u64(blockIdx.y) * TC_PKS + 256 + t] : 0u;
     sa[padw(t)] = c[base + t];
     sa[padw(t + 256)] = c[base + t + 256];
     __syncthreads();
@@ -977,10 +994,14 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
     for (int m = 8; m >= 5; --m) {
         const unsigned half = 1u << m, j = t & (half - 1);
         const unsigned first = 2 * (t - j) + j, second = first + half;
-        const u32 w = sr[j << (8 - m)];
+        const unsigned wi = j << (8 - m);
         const u32 u = sa[padw(first)], v = sa[padw(second)];
         sa[padw(first)] = gpu31::add(u, v, p.p);
-        sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+#if TC21_SHOUP
+        sa[padw(second)] = mulsh(gpu31::sub(u, v, p.p), sr[wi], srq[wi], p.p);
+#else
+        sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), sr[wi], p);
+#endif
         __syncthreads();
     }
     u32 a0 = sa[padw(t)], a1 = sa[padw(t + 256)];
@@ -988,12 +1009,20 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
     for (int m = 4; m >= 0; --m) {
         const unsigned half = 1u << m;
         const unsigned j = t & (half - 1);
-        const u32 w = sr[j << (8 - m)];
+        const unsigned wi = j << (8 - m);
+        const u32 w = sr[wi];
+        const u32 wq = srq[wi];
         const u32 v0 = __shfl_xor_sync(0xffffffffu, a0, half);
         const u32 v1 = __shfl_xor_sync(0xffffffffu, a1, half);
         if (t & half) {
+#if TC21_SHOUP
+            a0 = mulsh(gpu31::sub(v0, a0, p.p), w, wq, p.p);
+            a1 = mulsh(gpu31::sub(v1, a1, p.p), w, wq, p.p);
+#else
+            (void)wq;
             a0 = gpu31::mont(gpu31::sub(v0, a0, p.p), w, p);
             a1 = gpu31::mont(gpu31::sub(v1, a1, p.p), w, p);
+#endif
         } else {
             a0 = gpu31::add(a0, v0, p.p);
             a1 = gpu31::add(a1, v1, p.p);
@@ -1025,6 +1054,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
               unsigned logN, unsigned KS, unsigned NT) {
     __shared__ u32 sT[EF_PR][EF_PT];
     __shared__ u32 sR[EF_PR][NT_TILE / 2];
+    __shared__ u32 sRq[EF_PR][NT_TILE / 2];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
     const u32* src = blockIdx.y ? src_b : src_a;
     u32* dst = blockIdx.y ? rb : ra;
@@ -1067,7 +1097,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     // registers while the current group runs its DIT; setup is then only
     // shared stores.  sR: 2048 words = 4 per thread; sB: <= 1024 uint2 = 2.
     constexpr unsigned PF_R = EF_PR * (NT_TILE / 2) / 512, PF_B = 2;
-    u32 pfR[PF_R];
+    u32 pfR[PF_R], pfQ[PF_R];
     uint2 pfB[PF_B];
     auto prefetch = [&](unsigned g0n) {
 #pragma unroll
@@ -1075,7 +1105,8 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned idx = tid + u * 512;
             const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
             const unsigned kk = g0n * 2 + q;
-            pfR[u] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+            pfR[u] = kk < K ? packed[u64(kk) * TC_PKS + r] : 0u;
+            pfQ[u] = (TC21_SHOUP && kk < K) ? packed[u64(kk) * TC_PKS + 256 + r] : 0u;
         }
 #pragma unroll
         for (unsigned u = 0; u < PF_B; ++u) {
@@ -1098,6 +1129,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         for (unsigned u = 0; u < PF_R; ++u) {
             const unsigned idx = tid + u * 512;
             sR[idx / (NT_TILE / 2)][idx % (NT_TILE / 2)] = pfR[u];
+            sRq[idx / (NT_TILE / 2)][idx % (NT_TILE / 2)] = pfQ[u];
         }
 #pragma unroll
         for (unsigned u = 0; u < PF_B; ++u) {
@@ -1109,7 +1141,8 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
             const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
             const unsigned kk = nt0 * 2 + q;
-            sR[q][r] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+            sR[q][r] = kk < K ? packed[u64(kk) * TC_PKS + r] : 0u;
+            sRq[q][r] = (TC21_SHOUP && kk < K) ? packed[u64(kk) * TC_PKS + 256 + r] : 0u;
         }
         // this group's B fragments, shared by all 16 warps
         for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
@@ -1249,6 +1282,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
             u32* row = sT[q];
             const u32* tw8 = sR[q];
+            const u32* tw8q = sRq[q];
 #pragma unroll
             for (unsigned m = 0; m < 9; m += 3) {
                 const unsigned H = 1u << m;
@@ -1264,8 +1298,14 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                     for (unsigned e = 0; e < 8; ++e) {
                         if (e & span) continue;
                         const unsigned j = w + (e & (span - 1)) * H;
-                        const u32 tw = tw8[j << (8 - (m + st))];
-                        gpu31::butterfly(v[e], v[e + span], tw, pr8);
+                        const unsigned ti = j << (8 - (m + st));
+#if TC21_SHOUP
+                        const u32 u0 = v[e], v0 = mulsh(v[e + span], tw8[ti], tw8q[ti], pr8.p);
+                        v[e] = gpu31::add(u0, v0, pr8.p);
+                        v[e + span] = gpu31::sub(u0, v0, pr8.p);
+#else
+                        gpu31::butterfly(v[e], v[e + span], tw8[ti], pr8);
+#endif
                     }
                 }
 #pragma unroll
