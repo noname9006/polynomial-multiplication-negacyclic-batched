@@ -708,6 +708,11 @@ void* fherma_init(const fherma::Point& p) {
                         d.tc_efl = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_efl = false;
                     }
+                    if (d.tc_ntt && d.tc_crt) {
+                        d.tc_crt2 = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_crt2 = false;
+                        std::fprintf(stderr, "[TC] crt2=%d SA=%u smem=%zu\n", int(d.tc_crt2), d.crt2_SA, d.crt2_shared);
+                    }
                     if (false && d.tc_ntt && d.cs_[0]) {   // TC8 chunk: measured slower (60.4 vs ~55.7 ms)
                         d.tc_chunk = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_chunk = false;

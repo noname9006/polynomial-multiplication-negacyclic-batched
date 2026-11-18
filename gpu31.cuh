@@ -786,6 +786,9 @@ struct Device {
         *d_untw_slot = nullptr;
     bool tc_ntt_ready = false, tc_ntt = false;
     bool tc_efl = false;   // TC5: encode fused with fwd low stages
+    bool tc_crt2 = false;  // TC15 CRT variant
+    unsigned crt2_SA = 0;
+    std::size_t crt2_shared = 0;
     bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
     cudaStream_t cs_[2] = {nullptr, nullptr};
     cudaEvent_t evf_ = nullptr, evj_[2] = {nullptr, nullptr};
@@ -1097,6 +1100,13 @@ struct Device {
                 prc, d_primes, d_pk_inv, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
+            if (tc_crt2) {
+                tc::CrtTc c2 = crt_cfg;
+                c2.SA = crt2_SA;
+                tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
+                              crt2_shared, stream>>>(crt_args_, prc, pc, d_fcrt, c2,
+                                                     d_primes, d_untw_slot, logN, d_corr_m);
+            } else
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, prc, pc, d_fcrt, crt_cfg,
                                                    d_primes, d_untw_slot, logN, d_corr_m);
@@ -1139,6 +1149,12 @@ private:
                 if (!d_corr_m) return;
             }
             crt_tc_shared = tc::crt_tc_smem(crt_cfg);
+            {
+                unsigned s2 = ks * 8 + 8;
+                while (s2 % 32 != 4 && s2 % 32 != 28) ++s2;
+                crt2_SA = s2;
+                crt2_shared = tc::crt_tc2_smem(crt2_SA, crt_cfg.SX);
+            }
             if (crt_tc_shared > 48 * 1024) {
                 if (cudaFuncSetAttribute(tc::crt_tc, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          int(crt_tc_shared)) != cudaSuccess) {
