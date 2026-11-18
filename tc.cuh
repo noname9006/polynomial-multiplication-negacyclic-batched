@@ -26,6 +26,12 @@
 #include <cstdint>
 #include <vector>
 
+// TC10 (parallel branch): warp-shuffle for the first 5 DIT stages of
+// encode_fwdlow.  Set to 0 for A/B against the original shared-only path.
+#ifndef TC10_SHUF
+#define TC10_SHUF 1
+#endif
+
 namespace tc {
 
 using u32 = std::uint32_t;
@@ -703,6 +709,57 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned kk = nt0 * 2 + q;
             pq[rep] = primes[kk < K ? kk : 0];
         }
+#if TC10_SHUF
+        // TC10: DIT stages m=0..4 pair positions bt/bt+half inside one warp.
+        // Keep the 4 primes x 2 positions in registers and exchange with shfl;
+        // stages m=5..8 stay in shared (cross-warp).  Bit-exact CPU-checked.
+        const unsigned bt = tid & 255, jg = tid >> 8;
+        u32 v0[4], v1[4];
+#pragma unroll
+        for (unsigned rep = 0; rep < 4; ++rep) {
+            const unsigned q = jg + rep * 2;
+            v0[rep] = sT[q][padw(bt)];
+            v1[rep] = sT[q][padw(bt + 256)];
+        }
+#pragma unroll
+        for (unsigned m = 0; m < 5; ++m) {
+            const unsigned half = 1u << m;
+            const unsigned j = bt & (half - 1);
+#pragma unroll
+            for (unsigned rep = 0; rep < 4; ++rep) {
+                const unsigned q = jg + rep * 2;
+                const u32 w = sR[q][j << (8 - m)];
+                const u32 x0 = __shfl_xor_sync(0xffffffffu, v0[rep], half);
+                const u32 x1 = __shfl_xor_sync(0xffffffffu, v1[rep], half);
+                if (bt & half) {
+                    v0[rep] = gpu31::sub(x0, gpu31::mont(v0[rep], w, pq[rep]), pq[rep].p);
+                    v1[rep] = gpu31::sub(x1, gpu31::mont(v1[rep], w, pq[rep]), pq[rep].p);
+                } else {
+                    v0[rep] = gpu31::add(v0[rep], gpu31::mont(x0, w, pq[rep]), pq[rep].p);
+                    v1[rep] = gpu31::add(v1[rep], gpu31::mont(x1, w, pq[rep]), pq[rep].p);
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned rep = 0; rep < 4; ++rep) {
+            const unsigned q = jg + rep * 2;
+            sT[q][padw(bt)] = v0[rep];
+            sT[q][padw(bt + 256)] = v1[rep];
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned m = 5; m < 9; ++m) {
+            const unsigned half = 1u << m;
+#pragma unroll
+            for (unsigned rep = 0; rep < 4; ++rep) {
+                const unsigned q = jg + rep * 2, bt = tid & 255;
+                const unsigned j = bt & (half - 1);
+                const unsigned first = 2 * (bt - j) + j, second = first + half;
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+            }
+            __syncthreads();
+        }
+#else
 #pragma unroll
         for (unsigned m = 0; m < 9; ++m) {
             const unsigned half = 1u << m;
@@ -715,6 +772,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             }
             __syncthreads();
         }
+#endif
         for (unsigned idx = tid; idx < EF_PR * NT_TILE; idx += blockDim.x) {
             const unsigned q = idx / NT_TILE, pos = idx % NT_TILE;
             const unsigned kk = nt0 * 2 + q;
