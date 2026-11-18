@@ -815,7 +815,6 @@ struct Device {
     unsigned crt2_SA = 0;
     std::size_t crt2_shared = 0;
     bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
-    u32 tc_chunk_C = 4;    // TC25: pairs per chunk (2*C <= capacity)
     cudaStream_t cs_[2] = {nullptr, nullptr};
     cudaEvent_t evf_ = nullptr, evj_[2] = {nullptr, nullptr};
     unsigned enc_KS = 0, enc_NT = 0;
@@ -935,14 +934,11 @@ struct Device {
                 cudaStreamWaitEvent(cs_[1], evf_, 0);
                 const std::size_t in_stride = std::size_t(n) * l;
                 const std::size_t res_stride = std::size_t(k) * n;
-                // TC25: chunks of tc_chunk_C pairs, two buffer slots / two streams
-                const u32 C = tc_chunk_C ? tc_chunk_C : 1u;
-                for (u32 j = 0, it = 0; j < B; j += C, ++it) {
-                    const unsigned sl = it & 1u;
-                    const u32 cb = (B - j < C) ? (B - j) : C;
+                for (u32 j = 0; j < B; ++j) {
+                    const unsigned sl = j & 1u;
                     st = tc_pipeline(d_a + j * in_stride, d_b + j * in_stride, d_c + j * in_stride,
-                                     d_ra + std::size_t(sl) * C * res_stride, d_rb + std::size_t(sl) * C * res_stride,
-                                     d_rc + std::size_t(sl) * C * res_stride, cb, cs_[sl], false);
+                                     d_ra + sl * res_stride, d_rb + sl * res_stride,
+                                     d_rc + sl * res_stride, 1, cs_[sl], false);
                     if (st != cudaSuccess) return st;
                 }
                 cudaEventRecord(evj_[0], cs_[0]);
