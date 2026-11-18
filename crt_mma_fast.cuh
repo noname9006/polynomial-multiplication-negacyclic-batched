@@ -209,7 +209,11 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
     // step 1: Shoup terms, written BOTH as u32 (for FP64 correction) and as
     // four A byte planes in MMA-fragment order.  One thread per (jgroup, m)
     // handles all four j = jgroup*4+bb, so the byte-plane write is race-free.
-    for (unsigned jg = threadIdx.x / MF_M_COEF; jg < jgroups; jg += MF_THREADS / MF_M_COEF) {
+    // IMPORTANT: iterate over all MF_JG groups, not just ceil(pitch/4)=30 —
+    // the last k-chunk reads jg up to 31 (cb=3, t=3, +4).  Groups with j>=pitch
+    // are zero-filled by the guard below; leaving them uninitialised poisons
+    // the accumulator for every coefficient.
+    for (unsigned jg = threadIdx.x / MF_M_COEF; jg < MF_JG; jg += MF_THREADS / MF_M_COEF) {
         const unsigned m = threadIdx.x % MF_M_COEF;
         const unsigned coef = coef_tile + m;
         u32 plane[4] = {0, 0, 0, 0};
@@ -219,7 +223,7 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
             const u32 r = (coef < plan.n && j < k)
                         ? residues[u64(pair) * k * plan.n + u64(j) * plan.n + coef] : 0u;
             const u32 val = (j < pitch) ? weight_residue(r, plan.primes[j]) : 0u;
-            terms[std::size_t(j) * MF_TS + m] = val;
+            if (j < pitch) terms[std::size_t(j) * MF_TS + m] = val;
             #pragma unroll
             for (unsigned c = 0; c < 4; ++c)
                 plane[c] |= ((val >> (8u * c)) & 0xFFu) << (8u * bb);
@@ -433,11 +437,12 @@ inline bool tile_selftest(unsigned iterations = 64, u64 seed = 0xfeed1234ull) {
             for (unsigned j = 0; j < pitch; ++j) wflat[i * pitch + j] = weights[i][j];
         const auto wb = bake_wb(wflat, L, pitch);
         u32 ap[4][MF_JG][CO] = {};
-        for (unsigned jg = 0; jg < jgroups; ++jg)
+        for (unsigned jg = 0; jg < MF_JG; ++jg)
             for (unsigned m = 0; m < CO; ++m) {
                 u32 plane[4] = {0, 0, 0, 0};
                 for (unsigned bb = 0; bb < 4; ++bb) {
-                    const u32 v = terms[jg * 4 + bb][m];
+                    const unsigned jj = jg * 4 + bb;
+                    const u32 v = (jj < pitch) ? terms[jj][m] : 0u;
                     for (unsigned c = 0; c < 4; ++c)
                         plane[c] |= ((v >> (8u * c)) & 0xFFu) << (8u * bb);
                 }
