@@ -182,6 +182,19 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef OC10_R16
 #define OC10_R16 1
 #endif
+
+// OC11 (parallel branch): fuse the pointwise product into the last radix-8
+// DIT pass and the first radix-8 DIF pass of fused_high.  After the final DIT
+// butterfly the 8 group values of both operands are already in registers, so
+// the product and the whole inverse radix-8 group can be done there too.  This
+// removes two shared round trips and two barriers (7 -> 5 for logH=7 with
+// OC10_R16).  Enabled only when the stage partition has a radix-8 group at
+// the top (n8>0) and no radix-2 tail (s8==logH), i.e. the combat config
+// logH=7; other configs use the unchanged path.  Flag OC11_FUSE=0 restores it.
+// CPU-validated bit-exact by tools/tc_emul/fused_pw_emul.cpp.
+#ifndef OC11_FUSE
+#define OC11_FUSE 1
+#endif
 #ifndef TC_PROF
 #define TC_PROF 1
 #endif
@@ -795,6 +808,9 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     // (3 stages) and n2 radix-2 stages, all covering [0, logH).
     const unsigned n16 = logH >> 2, rs = n16 << 2;
     const unsigned n8 = (logH - rs) / 3, s8 = rs + n8 * 3;
+#if OC11_FUSE
+    const bool oc11_fuse = (n8 > 0 && s8 == logH);
+#endif
 #endif
     u32* sa = sm;
     u32* sb = sm + HC * S;
@@ -915,8 +931,50 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                 gpu31::butterfly(av[i], av[i+4], t4[i], p);
                 gpu31::butterfly(bv[i], bv[i+4], t4[i], p);
             }
+#if OC10_R16 && OC11_FUSE
+            if (oc11_fuse && q + 1 == n8) {
+                // OC11: 8 final DIT values of a and b are in registers.  Do the
+                // pointwise product here and the whole inverse radix-8 group
+                // (stages s+2,s+1,s) before the single shared write.  This is
+                // the exact inverse of the three DIT butterflies above, so the
+                // group's data never needs the separate pointwise/DIF passes.
 #pragma unroll
-            for (unsigned i = 0; i < 8; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
+                for (unsigned i = 0; i < 8; ++i) av[i] = gpu31::mont(av[i], bv[i], p);
+                u32 q4[4];
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i)
+                    q4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
+                const u32 q2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
+                const u32 q2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
+                const u32 q1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    const u32 u = av[i], v = av[i+4];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), q4[i], p);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < 4; ++j) {
+                    const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
+                    const u32 tw = (i & 1) ? q2b : q2a;
+                    const u32 u = av[i], v = av[i+2];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+                }
+#pragma unroll
+                for (unsigned i = 0; i < 8; i += 2) {
+                    const u32 u = av[i], v = av[i+1];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), q1, p);
+                }
+#pragma unroll
+                for (unsigned i = 0; i < 8; ++i) sa[ix[i]] = av[i];
+            } else
+#endif
+            {
+#pragma unroll
+                for (unsigned i = 0; i < 8; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
+            }
         }
         __syncthreads();
     }
@@ -1048,9 +1106,14 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 #endif
     TCP_T(f2);
-    for (unsigned h = rw; h < HC; h += 8)
-        sa[h * S + lane] = gpu31::mont(sa[h * S + lane], sb[h * S + lane], p);
-    __syncthreads();
+#if OC10_R16 && OC11_FUSE
+    if (!oc11_fuse)
+#endif
+    {
+        for (unsigned h = rw; h < HC; h += 8)
+            sa[h * S + lane] = gpu31::mont(sa[h * S + lane], sb[h * S + lane], p);
+        __syncthreads();
+    }
     TCP_T(f3);
 #if OC10_R16
     // OC10 inverse: radix-2 tail (highest stages) first, then radix-8 and
@@ -1071,6 +1134,9 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 #pragma unroll
     for (unsigned q = 0; q < 2; ++q) {
+#if OC10_R16 && OC11_FUSE
+        if (oc11_fuse && q == 0) continue;   // already done in the fused DIT pass
+#endif
         if (q >= n8) break;
         const unsigned s = s8 - 3 * (q + 1), H = 1u << s;
         for (unsigned g = rw; g < HC / 8; g += 8) {
