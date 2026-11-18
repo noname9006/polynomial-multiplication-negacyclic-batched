@@ -103,7 +103,7 @@ static constexpr unsigned NF_MAX_TILE     = 512;   // gpu31::max_tile
 static constexpr unsigned NF_LOW_COLUMNS  = 16;    // gpu31::low_columns
 static constexpr unsigned NF_HIGH_WORKERS = 16;    // gpu31::high_workers
 
-static constexpr unsigned nf_log2_c(unsigned x) { return x <= 1 ? 0u : 1u + nf_log2_c(x >> 1); }
+NTTFAST_FHD constexpr unsigned nf_log2_c(unsigned x) { return x <= 1 ? 0u : 1u + nf_log2_c(x >> 1); }
 
 NTTFAST_FHD inline unsigned nf_pad(unsigned x) { return x + (x >> 5); }  // one guard word / 32 lanes
 
