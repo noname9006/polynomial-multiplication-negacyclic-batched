@@ -515,7 +515,15 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
 }
 
 // TC15 CRT variant: 32 rows/CTA, warps split n-tiles, B reused by 2 m-tiles.
+// OC21 (agent B): (128,4) for more CTAs/SM; 0 restores (128,3).
+#ifndef OC21_LB4
+#define OC21_LB4 1
+#endif
+#if OC21_LB4
+__global__ void __launch_bounds__(128, 4)
+#else
 __global__ void __launch_bounds__(128, 3)
+#endif
 crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
