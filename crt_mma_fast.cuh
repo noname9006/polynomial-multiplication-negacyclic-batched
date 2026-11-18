@@ -205,6 +205,7 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
     u64* low = reinterpret_cast<u64*>(ap + 4ull * MF_JG * MF_M_COEF + 1u);
     u64* high = low + std::size_t(l) * MF_TS;
     int* acc = reinterpret_cast<int*>(high + std::size_t(l) * MF_TS);
+    u32* dg = reinterpret_cast<u32*>(acc + MF_ACC_WORDS);   // contiguous digits, no local memory
 
     // step 1: Shoup terms, written BOTH as u32 (for FP64 correction) and as
     // four A byte planes in MMA-fragment order.  One thread per (jgroup, m)
@@ -313,7 +314,7 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
     // step 4: reference carry + reduce (verbatim, contiguous digits)
     if (threadIdx.x < MF_M_COEF && coef_tile + threadIdx.x < plan.n) {
         const unsigned m = threadIdx.x;
-        u32 digits[MF_MAXL + 2];
+        u32* digits = dg + std::size_t(m) * (l + 2);
         carry_and_reduce(digits, low + m, high + m, l, plan.bits, plan.gap, plan.q, MF_TS);
         const unsigned coef = coef_tile + m;
         const u64 dst = u64(pair) * plan.n * l + u64(coef) * l;
@@ -328,7 +329,8 @@ inline std::size_t shared_bytes(unsigned l, unsigned pitch) {
     return std::size_t(pitch) * MF_TS * sizeof(u32)
          + (4ull * MF_JG * MF_M_COEF + 1u) * sizeof(u32)   // +1 u32 alignment pad
          + 2ull * std::size_t(l) * MF_TS * sizeof(u64)
-         + MF_ACC_WORDS * sizeof(int);
+         + MF_ACC_WORDS * sizeof(int)
+         + MF_M_COEF * (std::size_t(l) + 2) * sizeof(u32);
 }
 
 // ---- host plan + launchers -------------------------------------------------
