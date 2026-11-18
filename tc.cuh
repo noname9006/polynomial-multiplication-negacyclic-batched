@@ -510,8 +510,12 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
     sa[padw(t)] = c[base + t];
     sa[padw(t + 256)] = c[base + t + 256];
     __syncthreads();
+    // TC9: stages m=8..5 are cross-warp -> shared.  Stages m=4..0 pair
+    // positions t and t^half inside one warp, so keep both of a thread's
+    // positions (t and t+256) in registers and exchange with shfl.  This
+    // removes 5 barriers and 10 shared round-trips per block.
 #pragma unroll
-    for (int m = 8; m >= 0; --m) {
+    for (int m = 8; m >= 5; --m) {
         const unsigned half = 1u << m, j = t & (half - 1);
         const unsigned first = 2 * (t - j) + j, second = first + half;
         const u32 w = sr[j << (8 - m)];
@@ -520,8 +524,24 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
         sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
         __syncthreads();
     }
-    c[base + t] = sa[padw(t)];
-    c[base + t + 256] = sa[padw(t + 256)];
+    u32 a0 = sa[padw(t)], a1 = sa[padw(t + 256)];
+#pragma unroll
+    for (int m = 4; m >= 0; --m) {
+        const unsigned half = 1u << m;
+        const unsigned j = t & (half - 1);
+        const u32 w = sr[j << (8 - m)];
+        const u32 v0 = __shfl_xor_sync(0xffffffffu, a0, half);
+        const u32 v1 = __shfl_xor_sync(0xffffffffu, a1, half);
+        if (t & half) {
+            a0 = gpu31::mont(gpu31::sub(v0, a0, p.p), w, p);
+            a1 = gpu31::mont(gpu31::sub(v1, a1, p.p), w, p);
+        } else {
+            a0 = gpu31::add(a0, v0, p.p);
+            a1 = gpu31::add(a1, v1, p.p);
+        }
+    }
+    c[base + t] = a0;
+    c[base + t + 256] = a1;
 }
 
 
