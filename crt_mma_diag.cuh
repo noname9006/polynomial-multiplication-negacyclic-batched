@@ -435,7 +435,13 @@ __global__ void crt_mma_diag_kernel(CrtArgs plan, const u32* residues,
             const unsigned i = 2u * ip + lb;
             if (i < l) {
                 const unsigned mslot = 4u * warp + co;
-                low[i * MD_TS + mslot]  = X.lo;                       // X mod 2^64
+                // CRITICAL: carry_and_reduce() consumes `low` as the LOW chunk
+                // (its low 32 bits become digit[i]; upper bits are carried via
+                // `carry >>= 32`) and `high` as the NEXT 32-bit chunk (added at
+                // limb i+1 through prior_high).  Therefore `low` must be exactly
+                // u32(X) -- storing the full 64-bit X.lo here double-counts bits
+                // 32..63 (they also live in `high`), making every limb wrong.
+                low[i * MD_TS + mslot]  = u64(u32(X.lo));              // X mod 2^32
                 high[i * MD_TS + mslot] = (X.lo >> 32) | (X.hi << 32); // X bits 32..95
             }
         }
@@ -498,6 +504,144 @@ inline bool crt_mma_diag_selftest(unsigned iterations = 4096,
             const u32 ub = (b >> (8u * c)) & 0xFFu;
             if ((ua & 0x7Fu) + 128u * (ua >> 7) != ua) return false;
             if ((ub & 0x7Fu) + 128u * (ub >> 7) != ub) return false;
+        }
+    }
+    return true;
+}
+
+// ===========================================================================
+// 4b. Host simulation of the FULL MMA tile (fragment packing -> MMA -> stash
+// -> reassembly -> carry_and_reduce), checked byte-for-byte against the
+// reference sum_column/carry_and_reduce.  This exercises the lane mappings and
+// the low/high split that the byte-math selftest above cannot see.  It caught
+// the "low = X.lo (64-bit)" bug that made all 7.2M limbs differ on device.
+// Pure C++, no CUDA; small dims (K=8, L=8, one warp / 4 coefficients).
+// ===========================================================================
+inline bool crt_mma_diag_tile_selftest(unsigned iterations = 16,
+                                       u64 seed = 0xa5a5f00d12345678ull) {
+    auto next = [&seed]() -> u64 {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        return seed * 0x2545F4914F6CDD1Dull;
+    };
+    auto byte_of = [](u32 v, unsigned c) -> u32 { return (v >> (8u * c)) & 0xFFu; };
+
+    const unsigned K = 8, pitch = K + 1, L = 8, CO = 4;
+    u32 gap = 0, q[L] = {0};
+    const unsigned bits = 256;
+
+    for (unsigned it = 0; it < iterations; ++it) {
+        u32 terms[pitch][CO], w[L][pitch];
+        for (unsigned j = 0; j < pitch; ++j)
+            for (unsigned co = 0; co < CO; ++co) terms[j][co] = u32(next());
+        for (unsigned i = 0; i < L; ++i)
+            for (unsigned j = 0; j < pitch; ++j) w[i][j] = u32(next());
+
+        // ---- simulated kernel step 3: per-lane fragments, MMA, stash -------
+        u64 low[L * MD_TS], high[L * MD_TS];
+        for (unsigned z = 0; z < L * MD_TS; ++z) { low[z] = 0; high[z] = 0; }
+
+        for (unsigned ip = 0; ip < (L + 1u) / 2u; ++ip) {
+            long long C[32][4];
+            for (unsigned z = 0; z < 32; ++z)
+                for (unsigned r = 0; r < 4; ++r) C[z][r] = 0;
+
+            // K=8 < 32 -> a single k-chunk (k = kb + 4t + {0..3}).
+            unsigned A[16][32], B[32][8];
+            for (unsigned m = 0; m < 16; ++m)
+                for (unsigned k = 0; k < 32; ++k) A[m][k] = 0;
+            for (unsigned k = 0; k < 32; ++k)
+                for (unsigned n = 0; n < 8; ++n) B[k][n] = 0;
+
+            for (unsigned lane = 0; lane < 32; ++lane) {
+                const unsigned g = lane >> 2, t = lane & 3u;
+                const unsigned sh = g & 3u;              // byte ct/cw within u32
+                const unsigned m_base = g >> 2, m_hi = m_base + 2u;
+                const unsigned i = 2u * ip + (g >> 2);   // limb (FIX: g>>2)
+
+                u32 a0 = 0, a1 = 0, b0 = 0;
+                for (unsigned bb = 0; bb < 4u; ++bb) {
+                    const unsigned j0 = 4u * t + bb;
+                    if (j0 < pitch) {
+                        a0 |= byte_of(terms[j0][m_base], sh) << (8u * bb);
+                        a1 |= byte_of(terms[j0][m_hi],   sh) << (8u * bb);
+                    }
+                }
+                if (i < L) {
+                    for (unsigned bb = 0; bb < 4u; ++bb) {
+                        const unsigned j0 = 4u * t + bb;
+                        if (j0 < pitch) b0 |= byte_of(w[i][j0], sh) << (8u * bb);
+                    }
+                }
+                for (unsigned bb = 0; bb < 4u; ++bb) {
+                    A[g][4u * t + bb]     = byte_of(a0, bb);
+                    A[g + 8][4u * t + bb] = byte_of(a1, bb);
+                    B[4u * t + bb][g]     = byte_of(b0, bb);
+                }
+            }
+            // D[m][n] = sum_k A[m][k]*B[k][n]; then lane accumulators.
+            long long D[16][8];
+            for (unsigned m = 0; m < 16; ++m)
+                for (unsigned n = 0; n < 8; ++n) {
+                    long long s = 0;
+                    for (unsigned k = 0; k < 32; ++k) s += (long long)A[m][k] * B[k][n];
+                    D[m][n] = s;
+                }
+            for (unsigned lane = 0; lane < 32; ++lane) {
+                const unsigned g = lane >> 2, t = lane & 3u;
+                C[lane][0] += D[g][2u * t];
+                C[lane][1] += D[g][2u * t + 1u];
+                C[lane][2] += D[g + 8][2u * t];
+                C[lane][3] += D[g + 8][2u * t + 1u];
+            }
+
+            // stash: accw[limb_in_pair][coef_half][ct][cw]
+            long long accw[2][4][4][4];
+            for (unsigned z = 0; z < 2; ++z)
+                for (unsigned a = 0; a < 4; ++a)
+                    for (unsigned b = 0; b < 4; ++b)
+                        for (unsigned c = 0; c < 4; ++c) accw[z][a][b][c] = 0;
+            for (unsigned lane = 0; lane < 32; ++lane) {
+                const unsigned g = lane >> 2, t = lane & 3u;
+                const unsigned ab = t >> 1, cw0 = (t & 1u) << 1u;
+                const unsigned cg = g >> 2, ct = g & 3u;
+                accw[ab][cg][ct][cw0]     = C[lane][0];
+                accw[ab][cg][ct][cw0 + 1] = C[lane][1];
+                accw[ab][cg + 2][ct][cw0]     = C[lane][2];
+                accw[ab][cg + 2][ct][cw0 + 1] = C[lane][3];
+            }
+
+            // reassemble X once per (coef, limb) and split into low/high.
+            for (unsigned co = 0; co < CO; ++co) {
+                for (unsigned lb = 0; lb < 2u; ++lb) {
+                    CrtMmaU128 X{0ull, 0ull};
+                    for (unsigned ct = 0; ct < 4u; ++ct)
+                        for (unsigned cw = 0; cw < 4u; ++cw)
+                            u128_add_shift(X, u64(u32(accw[lb][co][ct][cw])), 8u * (ct + cw));
+                    const unsigned i = 2u * ip + lb;
+                    if (i < L) {
+                        low[i * MD_TS + co]  = u64(u32(X.lo));                 // FIX
+                        high[i * MD_TS + co] = (X.lo >> 32) | (X.hi << 32);
+                    }
+                }
+            }
+        }
+
+        // ---- kernel step 4 vs reference sum_column/carry_and_reduce -------
+        for (unsigned co = 0; co < CO; ++co) {
+            u32 dg[MD_MAXL + 2], dr[MD_MAXL + 2];
+            carry_and_reduce_mma(dg, low + co, high + co, L, bits, gap, q, MD_TS);
+
+            u64 lo[L], hi[L];
+            u32 col[pitch];
+            for (unsigned j = 0; j < pitch; ++j) col[j] = terms[j][co];
+            for (unsigned i = 0; i < L; ++i)
+                sum_column<1>(col, w[i], pitch, lo[i], hi[i]);
+            carry_and_reduce<1>(dr, lo, hi, L, bits, gap, q);
+
+            for (unsigned i = 0; i < L; ++i)
+                if (dg[i] != dr[i]) return false;
         }
     }
     return true;
