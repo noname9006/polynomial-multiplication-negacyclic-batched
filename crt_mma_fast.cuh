@@ -258,7 +258,8 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
         int c0 = 0, c1v = 0, c2v = 0, c3v = 0;
         for (unsigned kb = 0; kb < pitch; kb += 32u) {
             const unsigned cb = kb >> 5;
-            const unsigned jg0 = cb * 4 + t, jg1 = jg0 + 4;
+            // jg = j/4 where j = kb + 4*t + bb; kb = cb*32 -> jg = cb*8 + t.
+            const unsigned jg0 = cb * 8 + t, jg1 = jg0 + 4;
             const u32 a0 = ap[(std::size_t(cw) * MF_JG + jg0) * MF_M_COEF + m_base];
             const u32 a1 = ap[(std::size_t(cw) * MF_JG + jg0) * MF_M_COEF + m_hi];
             const u32 a2 = ap[(std::size_t(cw) * MF_JG + jg1) * MF_M_COEF + m_base];
@@ -447,7 +448,9 @@ inline bool tile_selftest(unsigned iterations = 64, u64 seed = 0xfeed1234ull) {
             for (unsigned i = 0; i < L; ++i) {
                 u64 S[4][4] = {};
                 for (unsigned j = 0; j < pitch; ++j) {
-                    const unsigned jg = j >> 2, bb = j & 3u;
+                    // exact kernel mapping: jg = cb*8 + t (see step 3)
+                    const unsigned cb = j >> 5, tg = (j & 31u) >> 2;
+                    const unsigned jg = cb * 8 + tg, bb = j & 3u;
                     const u32 t = terms[j][m];
                     for (unsigned ct = 0; ct < 4; ++ct) {
                         const u32 ab = (ap[ct][jg][m] >> (8u * bb)) & 0xFFu;
