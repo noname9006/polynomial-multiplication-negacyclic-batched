@@ -134,6 +134,9 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // Slots: CRT 0 staging, 1 A-load, 2 mma+epilogue, 3 carry/reduce, 4 store;
 //        fused_high 5 load, 6 fwd, 7 pointwise, 8 inverse, 9 store;
 //        encode_fwdlow 10 setup, 11 mma, 12 epilogue, 13 DIT, 14 store, 15 A-load.
+#ifndef TC16_R4
+#define TC16_R4 1
+#endif
 #ifndef TC12_R4
 #define TC12_R4 1
 #endif
@@ -1050,6 +1053,50 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #pragma unroll
             for (unsigned rep = 0; rep < 4; ++rep) {
                 const unsigned q = jg + rep * 2, bt = tid & 255;
+                const unsigned j = bt & (half - 1);
+                const unsigned first = 2 * (bt - j) + j, second = first + half;
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+            }
+            __syncthreads();
+        }
+#elif TC16_R4
+        // TC16: radix-4 DIT - stage pairs (0,1),(2,3),(4,5),(6,7) then 8.
+        // Group = positions x, x+H, x+2H, x+3H (x = blk*4H + w): stage m on
+        // (0,1),(2,3) with j=w, stage m+1 on (0,2) j=w and (1,3) j=w+H.
+        // 8 primes x 128 groups = 1024 groups, 2 per thread.
+        gpu31::Prime pr4[2];
+#pragma unroll
+        for (unsigned rep = 0; rep < 2; ++rep) {
+            const unsigned kk = nt0 * 2 + (tid >> 7) + rep * 4;
+            pr4[rep] = primes[kk < K ? kk : 0];
+        }
+#pragma unroll
+        for (unsigned m = 0; m < 8; m += 2) {
+            const unsigned H = 1u << m;
+#pragma unroll
+            for (unsigned rep = 0; rep < 2; ++rep) {
+                const unsigned q = (tid >> 7) + rep * 4, gi = tid & 127;
+                const unsigned w = gi & (H - 1);
+                const unsigned x0 = (gi - w) * 4 + w;
+                u32* row = sT[q];
+                const unsigned i0 = padw(x0), i1 = padw(x0 + H), i2 = padw(x0 + 2 * H), i3 = padw(x0 + 3 * H);
+                u32 v0 = row[i0], v1 = row[i1], v2 = row[i2], v3 = row[i3];
+                const u32 t1 = sR[q][w << (8 - m)];
+                const u32 t2 = sR[q][w << (7 - m)];
+                const u32 t3 = sR[q][(w + H) << (7 - m)];
+                gpu31::butterfly(v0, v1, t1, pr4[rep]);
+                gpu31::butterfly(v2, v3, t1, pr4[rep]);
+                gpu31::butterfly(v0, v2, t2, pr4[rep]);
+                gpu31::butterfly(v1, v3, t3, pr4[rep]);
+                row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
+            }
+            __syncthreads();
+        }
+        {
+            const unsigned m = 8, half = 256;
+#pragma unroll
+            for (unsigned rep = 0; rep < 4; ++rep) {
+                const unsigned q = (tid >> 8) + rep * 2, bt = tid & 255;
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
                 gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);

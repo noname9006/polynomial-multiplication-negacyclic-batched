@@ -37,6 +37,9 @@ int main(int argc, char** argv) {
   for (unsigned i = 0; i < N; i++) { u32 xa = u32((u64(A[rev(i, logN)]) << 32) % pp), xb = u32((u64(B[rev(i, logN)]) << 32) % pp); ra[i] = mont(xa, rtwist[i], pr); rb[i] = mont(xb, rtwist[i], pr); }
   // fwd_low
   for (unsigned bx = 0; bx < N / T; bx++) { u32* a = &ra[bx * T]; u32* b = &rb[bx * T];
+    if (R4) { for (unsigned m = 0; m < 8; m += 2) { unsigned H = 1u << m; for (unsigned gi = 0; gi < 128; gi++) { unsigned w = gi & (H - 1), x0 = (gi - w) * 4 + w; u32 t1 = pf[w << (8 - m)], t2 = pf[w << (7 - m)], t3 = pf[(w + H) << (7 - m)];
+        for (u32* X : {a, b}) { butterfly(X[x0], X[x0 + H], t1, pr); butterfly(X[x0 + 2 * H], X[x0 + 3 * H], t1, pr); butterfly(X[x0], X[x0 + 2 * H], t2, pr); butterfly(X[x0 + H], X[x0 + 3 * H], t3, pr); } } }
+      for (unsigned t = 0; t < 256; t++) { unsigned m = 8, half = 256, j = t & (half - 1), first = 2 * (t - j) + j, second = first + half; u32 w = pf[j << (8 - m)]; butterfly(a[first], a[second], w, pr); butterfly(b[first], b[second], w, pr); } } else
     for (unsigned m = 0; m < 9; m++) for (unsigned t = 0; t < 256; t++) { unsigned half = 1u << m, j = t & (half - 1), first = 2 * (t - j) + j, second = first + half; u32 w = pf[j << (8 - m)]; butterfly(a[first], a[second], w, pr); butterfly(b[first], b[second], w, pr); } }
   // fused_high (per column low)
   for (unsigned low = 0; low < T; low++) {
