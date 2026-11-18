@@ -99,7 +99,7 @@ using Prime = gpu31::Prime;
 #endif
 
 // gpu31 constants, kept local so this file stays drop-in.
-static constexpr unsigned NF_MAX_TILE     = 512;   // gpu31::max_tile
+static constexpr unsigned NF_MAX_TILE     = 2048;  // was 512: fewer high-stage HBM passes
 static constexpr unsigned NF_LOW_COLUMNS  = 16;    // gpu31::low_columns
 static constexpr unsigned NF_HIGH_WORKERS = 16;    // gpu31::high_workers
 
@@ -560,7 +560,7 @@ inline bool ntt_fast_selftest(u64 seed = 0x9e3779b97f4a7c15ull) {
     // (a) Exhaustive index identity: gpu31's runtime-division exponents equal
     //     this file's shift exponents, for every stage/lane of small AND the
     //     ranked (N=65536, tile=512) shape.
-    for (unsigned n : {16u, 64u, 512u, 1024u, 65536u}) {
+    for (unsigned n : {16u, 64u, 512u, 1024u, 2048u, 65536u}) {
         const unsigned logn = detail::nf_log2(n);
         const unsigned tile = n < NF_MAX_TILE ? n : NF_MAX_TILE;
         const unsigned LT = detail::nf_log2(tile);
@@ -595,6 +595,7 @@ inline bool ntt_fast_selftest(u64 seed = 0x9e3779b97f4a7c15ull) {
     // (c) The ranked-point decomposition shape, at a CPU-affordable size.
     if (!detail::check_one(1024, 512, seed)) return false;       // 9 low + 1 high
     if (!detail::check_one(1024, 128, seed)) return false;       // 7 low + 3 high
+    if (!detail::check_one(4096, 2048, seed)) return false;      // 11 low + 1 high (new tile)
     return true;
 }
 
