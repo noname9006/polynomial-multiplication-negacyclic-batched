@@ -745,12 +745,26 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
             if (s->gpu31_ok) {
                 const u32 Bc = static_cast<u32>(B);
                 const bool use_mma = s->crt_mma_ok && s->crt_mma_plan != nullptr;
-                ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c, Bc, s->stream,
-                                       /*skip_crt=*/use_mma) == cudaSuccess;
-                if (ok && use_mma)
-                    ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), s->d_c,
-                                              s->gpu31_dev->crt_args(), Bc, s->stream)
-                         == cudaSuccess;
+                // Process the batch in small chunks.  A chunk's residue arrays
+                // (cb*K*N*4 bytes each) then stay in L2 instead of being streamed
+                // through HBM between every stage: at cb=2 the whole working set
+                // is ~124 MB, close to the runner's L2.  The kernels themselves
+                // are unchanged — they index pairs from blockIdx.z with a base
+                // pointer, so passing an offset pointer selects the chunk.
+                constexpr u32 kPairsPerChunk = 2;
+                for (u32 b0 = 0; ok && b0 < Bc; b0 += kPairsPerChunk) {
+                    const u32 cb = (Bc - b0 < kPairsPerChunk) ? (Bc - b0) : kPairsPerChunk;
+                    const std::size_t off = static_cast<std::size_t>(b0) * plan.N * plan.L;
+                    u32* pa = s->d_a + off;
+                    u32* pb = s->d_b + off;
+                    u32* pc = s->d_c + off;
+                    ok = s->gpu31_dev->run(pa, pb, pc, cb, s->stream,
+                                           /*skip_crt=*/use_mma) == cudaSuccess;
+                    if (ok && use_mma)
+                        ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), pc,
+                                                  s->gpu31_dev->crt_args(), cb, s->stream)
+                             == cudaSuccess;
+                }
                 // The rules require fherma_run to return only after its device
                 // work has finished. Without this, the kernels would run during
                 // fherma_d2h, outside the ranked window - a violation.
