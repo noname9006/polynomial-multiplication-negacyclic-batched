@@ -32,17 +32,6 @@
 #define TC10_SHUF 0   // OC2 measured slower: encode 24.4 -> 26.2 ms
 #endif
 
-// OC15 (agent B, resubmitted on clean master): 64-bit coalesced staging loads
-// in crt_tc2.  Each thread loads two adjacent coefficients (i = c2, c2+1) with
-// one u64 LDG and keeps only its own half, halving the number of load
-// instructions while preserving the exact per-row term/fsum semantics.
-// Original OC15 (ba2469f) had a bug: both threads of a pair wrote row c2's
-// fsum slot (row c2+1's was never written, row c2's got both terms added).
-// Set 0 for the original one-u32-per-load staging path (fallback).
-#ifndef OC15_COALESCED_STAGING
-#define OC15_COALESCED_STAGING 1
-#endif
-
 namespace tc {
 
 using u32 = std::uint32_t;
@@ -548,71 +537,6 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
     u64 fsum = 0;
     if (untw_inv && K <= CRT_KMAX_C) {
-#if OC15_COALESCED_STAGING
-        // OC15: a pair of adjacent rows (c2, c2+1) is staged by a single even
-        // thread with one u64 LDG per prime for residues (and one for untwist
-        // in the non-merged path).  Each row's correction accumulates into
-        // ITS OWN fsum slot -- unlike the original OC15 (ba2469f), which
-        // doubled row c2's correction and never wrote row c2+1's.
-        const bool is_lo = (c & 1u) == 0;
-        const unsigned c2 = c & ~1u;
-        const bool in_range = (start + c2) < n;
-        const bool hi_valid = (start + c2 + 1) < n;
-        u64 fsum_hi = 0;                    // correction of row c2+1
-#pragma unroll 1
-        for (unsigned j0 = jg; j0 < K; j0 += 8 * NG) {
-            u32 r0[8], r1[8], u0[8], u1[8];
-#pragma unroll
-            for (unsigned q = 0; q < 8; ++q) {
-                const unsigned j = j0 + NG * q;
-                u32 w0 = 0, w1 = 0, v0 = 0, v1 = 0;
-                if (is_lo && j < K && in_range) {
-                    if (hi_valid) {
-                        // Full pair: one coalesced 64-bit load.
-                        const u64 rp = *reinterpret_cast<const u64*>(
-                            &residues[rbase + u64(j) * n + start + c2]);
-                        w0 = u32(rp); w1 = u32(rp >> 32);
-                        if (!(TC22_MERGED && slot_logN)) {
-                            const u64 up = *reinterpret_cast<const u64*>(
-                                &untw_inv[u64(j) * n + start + c2]);
-                            v0 = u32(up); v1 = u32(up >> 32);
-                        }
-                    } else {
-                        // Tail row with no partner: scalar load, no OOB read.
-                        w0 = residues[rbase + u64(j) * n + start + c2];
-                        if (!(TC22_MERGED && slot_logN))
-                            v0 = untw_inv[u64(j) * n + start + c2];
-                    }
-                }
-                r0[q] = w0; r1[q] = hi_valid ? w1 : 0u;
-                u0[q] = v0; u1[q] = hi_valid ? v1 : 0u;
-            }
-#pragma unroll
-            for (unsigned q = 0; q < 8; ++q) {
-                const unsigned j = j0 + NG * q;
-                if (j < K && is_lo) {
-                    const u32 cc0 = (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u0[q];
-                    const u32 term0 = gpu31::mont(r0[q], cc0, c_crt_prime[j]);
-                    sA[c2 * cfg.SA + j] = term0;
-                    fsum += (u64(term0) * c_crt_corr[j]) >> 30;
-                    if (hi_valid) {
-                        const u32 cc1 = (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u1[q];
-                        const u32 term1 = gpu31::mont(r1[q], cc1, c_crt_prime[j]);
-                        sA[(c2 + 1) * cfg.SA + j] = term1;
-                        fsum_hi += (u64(term1) * c_crt_corr[j]) >> 30;
-                    }
-                }
-            }
-        }
-        // Only even threads wrote this pair's terms, so only they write its
-        // fsum slots; an odd thread must not clobber them with its (zero) sum.
-        if (is_lo) {
-            sA[c2 * cfg.SA + W + 2 * jg] = u32(fsum);
-            sA[c2 * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
-            sA[(c2 + 1) * cfg.SA + W + 2 * jg] = u32(fsum_hi);
-            sA[(c2 + 1) * cfg.SA + W + 2 * jg + 1] = u32(fsum_hi >> 32);
-        }
-#else
         // TC11: batched loads (8 independent residue+untwist pairs in flight),
         // prime and correction constants from __constant__ (warp-uniform j).
 #pragma unroll 1
@@ -634,9 +558,6 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                 }
             }
         }
-        sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
-        sA[c * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
-#endif
     } else {
 #pragma unroll 4
     for (unsigned j = jg; j < K; j += NG) {
@@ -652,13 +573,10 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         fsum += (u64(term) * corr_m[j]) >> 30;
     }
     }
-#if !OC15_COALESCED_STAGING
-    // spare words W..W+3 of the row hold the two partial sums.  With OC15 the
-    // merged path already wrote both rows of each pair above; only odd threads
-    // (fallback branch) reach here with fsum==0 and must NOT clobber those.
+    for (unsigned j = K + 1 + jg; j < W; j += NG) sA[c * cfg.SA + j] = 0;
+    // spare words W..W+3 of the row hold the two partial sums
     sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
     sA[c * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
-#endif
     __syncthreads();
     if (jg == 0) {
         const u32* rw = sA + c * cfg.SA + W;
