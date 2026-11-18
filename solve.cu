@@ -32,7 +32,6 @@
 #if !defined(PGPU_HOST_CHECK)
 #include "gpu31.cuh"
 #include "ntt_fast.cuh"
-#include "crt_mma_diag.cuh"
 #include "crt_mma.cuh"
 #endif
 #endif
@@ -114,8 +113,6 @@ struct State {
     std::unique_ptr<gpu31::Device> gpu31_dev;
     std::unique_ptr<ntt_fast::NttFastPlan> ntt_fast_plan;
     NttHookCtx ntt_hook_ctx;
-    std::unique_ptr<crt_mma_diag::CrtMmaPlan> crt_mma_diag_plan;
-    bool crt_mma_diag_ok = false;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
     bool gpu31_ok = false;
     bool crt_mma_ok = false;  // fixed CRT proved identical to the reference CRT
@@ -680,24 +677,9 @@ void* fherma_init(const fherma::Point& p) {
                 state->d_resa = nullptr;
                 state->d_resb = nullptr;
 
-                // Try tensor-core CRT (with built-in [CRTMMA] diagnostics) first,
-                // then the conflict-free CUDA-core CRT as fallback.
+                // Try the conflict-free CRT, keeping it only if bit-identical to
+                // the reference CRT on deterministic residue data.
                 const auto& pl = state->gpu31_dev->plan();
-                try {
-                    state->crt_mma_diag_plan = std::make_unique<crt_mma_diag::CrtMmaPlan>(
-                        pl.crt_weights, pl.L, pl.K + 1);
-                    crt_mma_diag::CrtMmaPlan* pd = state->crt_mma_diag_plan.get();
-                    state->crt_mma_diag_ok = crt_vs_reference(
-                        *state,
-                        [pd](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
-                            return pd->run(r, o, a, b, s);
-                        },
-                        2, "MMAdiag");
-                } catch (const std::exception& e) {
-                    std::fprintf(stderr, "polymul: MMAdiag setup failed: %s\n", e.what());
-                }
-                // Fallback: conflict-free CUDA-core CRT.
-                if (!state->crt_mma_diag_ok) {
                 try {
                     state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
                         pl.crt_weights, pl.L, pl.K + 1);
@@ -711,7 +693,6 @@ void* fherma_init(const fherma::Point& p) {
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
                 }
-                }  // if (!crt_mma_diag_ok)
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "polymul: gpu31 setup failed: %s\n", e.what());
@@ -763,15 +744,10 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 #if !defined(PGPU_HOST_CHECK)
             if (s->gpu31_ok) {
                 const u32 Bc = static_cast<u32>(B);
-                const bool use_diag = s->crt_mma_diag_ok && s->crt_mma_diag_plan != nullptr;
                 const bool use_mma = s->crt_mma_ok && s->crt_mma_plan != nullptr;
                 ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c, Bc, s->stream,
-                                       /*skip_crt=*/(use_diag || use_mma)) == cudaSuccess;
-                if (ok && use_diag)
-                    ok = s->crt_mma_diag_plan->run(s->gpu31_dev->residues_device(), s->d_c,
-                                                   s->gpu31_dev->crt_args(), Bc, s->stream)
-                         == cudaSuccess;
-                else if (ok && use_mma)
+                                       /*skip_crt=*/use_mma) == cudaSuccess;
+                if (ok && use_mma)
                     ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), s->d_c,
                                               s->gpu31_dev->crt_args(), Bc, s->stream)
                          == cudaSuccess;
