@@ -147,6 +147,13 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC20_R8
 #define TC20_R8 1
 #endif
+// TC28: encode_fwdlow runs 1 CTA/SM (register-bound), so the bit-reversed A
+// gather (~24% of the kernel) is never overlapped.  Each CTA prefetches into
+// L2 the A rows of the CTA one wave ahead (linear id + #SMs); its own gather
+// then hits L2 instead of DRAM.  No registers or shared used.
+#ifndef TC28_PFA
+#define TC28_PFA 1
+#endif
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -1435,6 +1442,27 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 
     TCP_T(e1);
     TCP_ADD(15, e0, e1);
+#if TC28_PFA
+    if (t == 0) {
+        unsigned nsm;
+        asm volatile("mov.u32 %0, %%nsmid;" : "=r"(nsm));
+        const unsigned lin = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+        const unsigned nxt = lin + nsm;
+        if (nxt < gridDim.x * gridDim.y * gridDim.z) {
+            const unsigned bx = nxt % gridDim.x, rest = nxt / gridDim.x;
+            const unsigned by = rest % gridDim.y, bz = rest / gridDim.y;
+            const u32* psrc = (by ? src_b : src_a) + u64(bz) * n * l;
+#pragma unroll
+            for (unsigned r = 0; r < 4; ++r) {
+                const unsigned i = bx * EF_ROWS + rowbase + (r >> 1) * 16 + g + (r & 1) * 8;
+                const char* rp = reinterpret_cast<const char*>(psrc + u64(__brev(i) >> (32 - logN)) * l);
+                for (unsigned off = 0; off < l * 4u; off += 128u)
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(rp + off));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(rp + l * 4u - 1u));
+            }
+        }
+    }
+#endif
 #if TC19_PF
     // TC19: the next group's twiddles and B fragments are fetched into
     // registers while the current group runs its DIT; setup is then only
