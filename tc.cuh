@@ -147,6 +147,18 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC20_R8
 #define TC20_R8 1
 #endif
+
+// OC20 (agent A, task 2): radix-32 + radix-16 DIT in encode_fwdlow.  The 9
+// low stages are split 5+4 instead of 3+3+3, so the DIT makes 2 shared round
+// trips / barriers instead of 3 (~-1/3 of the DIT phase, target -2 ms on
+// encode_fwdlow).  One thread owns one 32-position group (8 primes x 16 groups
+// = 128 threads) in pass 1 and one 16-position group (8 x 32 = 256) in pass 2;
+// v[32] is 32 registers, well under the 128/thread budget of
+// __launch_bounds__(512,1), so no spill.  Flag OC20_R32=0 -> TC20 radix-8.
+// CPU-validated bit-exact by tools/tc_emul/r32_emul.cpp.
+#ifndef OC20_R32
+#define OC20_R32 1
+#endif
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -1609,6 +1621,61 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
                 gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][TWI(m, j)], pq[rep]);
+            }
+            __syncthreads();
+        }
+#elif OC20_R32
+        // OC20: 9 low stages in two shared round trips.  Pass 1 is radix-32
+        // (m=0..4, H=1): 8 primes x 16 groups of 32 consecutive positions.
+        // Pass 2 is radix-16 (m=5..8, H=32): 8 primes x 32 groups of 16
+        // positions spaced by 32.  Butterfly order and twiddle indices are
+        // identical to the radix-8 reference (TWI(m, w+(e mod 2^st)*H)).
+        {
+            if (tid < 128) {
+                const unsigned q = tid >> 4, gi = tid & 15;
+                const unsigned kk = nt0 * 2 + q;
+                const gpu31::Prime pr = primes[kk < K ? kk : 0];
+                u32* row = sT[q];
+                const u32* tw = sR[q];
+                u32 v[32];
+#pragma unroll
+                for (unsigned e = 0; e < 32; ++e) v[e] = row[padw(gi * 32 + e)];
+#pragma unroll
+                for (unsigned st = 0; st < 5; ++st) {
+                    const unsigned span = 1u << st;
+#pragma unroll
+                    for (unsigned e = 0; e < 32; ++e) {
+                        if (e & span) continue;
+                        const unsigned j = e & (span - 1);   // w=0, H=1
+                        gpu31::butterfly(v[e], v[e + span], tw[TWI(st, j)], pr);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 32; ++e) row[padw(gi * 32 + e)] = v[e];
+            }
+            __syncthreads();
+            if (tid < 256) {
+                const unsigned q = tid >> 5, gi = tid & 31;
+                const unsigned kk = nt0 * 2 + q;
+                const gpu31::Prime pr = primes[kk < K ? kk : 0];
+                u32* row = sT[q];
+                const u32* tw = sR[q];
+                const unsigned w = gi;              // H=32, w = gi & 31
+                u32 v[16];
+#pragma unroll
+                for (unsigned e = 0; e < 16; ++e) v[e] = row[padw(gi + e * 32)];
+#pragma unroll
+                for (unsigned st = 0; st < 4; ++st) {
+                    const unsigned span = 1u << st;
+#pragma unroll
+                    for (unsigned e = 0; e < 16; ++e) {
+                        if (e & span) continue;
+                        const unsigned j = w + (e & (span - 1)) * 32;
+                        gpu31::butterfly(v[e], v[e + span], tw[TWI(5 + st, j)], pr);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 16; ++e) row[padw(gi + e * 32)] = v[e];
             }
             __syncthreads();
         }
