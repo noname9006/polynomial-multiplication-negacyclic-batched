@@ -26,3 +26,5 @@ inline int __popc(unsigned x){return __builtin_popcount(x);}
 inline uint2 make_uint2(unsigned a,unsigned b){return {a,b};}
 inline long long clock64(){return 0;}
 inline unsigned long long atomicAdd(unsigned long long* a, unsigned long long v){unsigned long long o=*a;*a+=v;return o;}
+#define __cluster_dims__(...)
+inline unsigned __cvta_generic_to_shared(const void*){return 0;}
