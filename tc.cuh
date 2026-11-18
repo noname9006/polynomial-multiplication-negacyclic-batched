@@ -32,6 +32,13 @@
 #define TC10_SHUF 0   // OC2 measured slower: encode 24.4 -> 26.2 ms
 #endif
 
+// OC5 (parallel branch): prefetch the next prime group's twiddles (double
+// buffered sR) and B fragments (sB, safe after MMA) while the current group
+// runs its DIT stages.  Static smem stays below 48 KB.
+#ifndef OC5_DBUF
+#define OC5_DBUF 1
+#endif
+
 namespace tc {
 
 using u32 = std::uint32_t;
@@ -890,7 +897,14 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
               const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
               unsigned logN, unsigned KS, unsigned NT) {
     __shared__ u32 sT[EF_PR][EF_PT];
+#if OC5_DBUF
+    static_assert(EF_PR * EF_PT * 4 + 2 * EF_PR * (NT_TILE / 2) * 4 +
+                      EF_NTB * ENC_KS_MAX * 32 * 8 < 48 * 1024,
+                  "OC5 static shared memory exceeds 48 KB");
+    __shared__ u32 sR[2][EF_PR][NT_TILE / 2];   // 16 KB: prefetch next group
+#else
     __shared__ u32 sR[EF_PR][NT_TILE / 2];
+#endif
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
     const u32* src = blockIdx.y ? src_b : src_a;
     u32* dst = blockIdx.y ? rb : ra;
@@ -930,6 +944,26 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     TCP_ADD(15, e0, e1);
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
         TCP_T(g0);
+#if OC5_DBUF
+        const unsigned cur = (nt0 / EF_NTB) & 1u;
+        u32 (*sr)[NT_TILE / 2] = sR[cur];
+        // Only the first group loads here; every other group was prefetched
+        // during the previous group's DIT into the other sR bank + sB.
+        if (nt0 == 0) {
+            for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
+                const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
+                const unsigned kk = nt0 * 2 + q;
+                sR[0][q][r] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+            }
+            for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
+                const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+                const unsigned nt = nt0 + j;
+                sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
+            }
+            __syncthreads();
+        }
+#else
+        u32 (*sr)[NT_TILE / 2] = sR;
         // twiddles of this group's primes
         for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
             const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
@@ -943,6 +977,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
         }
         __syncthreads();
+#endif
         TCP_T(g1);
         int acc[2][EF_NTB][4];
         u32 tw[2][EF_NTB];
@@ -1000,6 +1035,24 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
         __syncthreads();
         TCP_T(g3);
+#if OC5_DBUF
+        // Prefetch group nt0+4 while this group's DIT runs.  sB is free after
+        // the MMA above; sR uses the opposite bank, so no DIT data is touched.
+        const unsigned nnt0 = nt0 + EF_NTB;
+        if (nnt0 < NT) {
+            const unsigned nxt = cur ^ 1u;
+            for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
+                const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
+                const unsigned kk = nnt0 * 2 + q;
+                sR[nxt][q][r] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+            }
+            for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
+                const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+                const unsigned nt = nnt0 + j;
+                sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
+            }
+        }
+#endif
 
         // 9 DIT stages on 8 primes: 8*256 butterflies, 4 per thread per stage
         gpu31::Prime pq[4];
@@ -1028,7 +1081,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #pragma unroll
             for (unsigned rep = 0; rep < 4; ++rep) {
                 const unsigned q = jg + rep * 2;
-                const u32 w = sR[q][j << (8 - m)];
+                const u32 w = sr[q][j << (8 - m)];
                 const u32 x0 = __shfl_xor_sync(0xffffffffu, v0[rep], half);
                 const u32 x1 = __shfl_xor_sync(0xffffffffu, v1[rep], half);
                 if (bt & half) {
@@ -1055,7 +1108,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned q = jg + rep * 2, bt = tid & 255;
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
-                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sr[q][j << (8 - m)], pq[rep]);
             }
             __syncthreads();
         }
@@ -1112,7 +1165,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned q = (tid >> 8) + rep * 2, bt = tid & 255;
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
-                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sr[q][j << (8 - m)], pq[rep]);
             }
             __syncthreads();
         }
