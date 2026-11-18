@@ -847,6 +847,15 @@ struct Device {
     // All buffers (d_a/d_b/d_c) are owned by the caller.  Only the persistent
     // tables and the scratch above belong to this object.  Asynchronous: all
     // launches go to `stream`; the caller checks completion when consuming out.
+    // Optional external NTT hook: when set, replaces transform<true/false>
+    // in stages 3 and 5 (e.g. an optimized NTT implementation).
+    cudaError_t (*ntt_hook_)(u32*, u32*, unsigned /*B*/, cudaStream_t, bool /*fwd*/, void*) = nullptr;
+    void* ntt_hook_ctx_ = nullptr;
+    void set_ntt_hook(cudaError_t (*h)(u32*, u32*, unsigned, cudaStream_t, bool, void*), void* ctx) {
+        ntt_hook_ = h;
+        ntt_hook_ctx_ = ctx;
+    }
+
     cudaError_t run(const u32* d_a, const u32* d_b, u32* d_c, u32 B,
                     cudaStream_t stream = nullptr, bool skip_crt = false) {
         if (B == 0) return cudaSuccess;
@@ -873,7 +882,11 @@ struct Device {
         if (profiling_) cudaEventRecord(ev_[2], stream);
 
         // 3. forward NTT of both operands
-        if ((st = transform<true>(d_ra, d_rb, d_roots, n, k, B, stream)) != cudaSuccess) return st;
+        if (ntt_hook_)
+            st = ntt_hook_(d_ra, d_rb, B, stream, true, ntt_hook_ctx_);
+        else
+            st = transform<true>(d_ra, d_rb, d_roots, n, k, B, stream);
+        if (st != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[3], stream);
 
         // 4. pointwise product, written in bit-reversed order for the inverse
@@ -883,7 +896,11 @@ struct Device {
         if (profiling_) cudaEventRecord(ev_[4], stream);
 
         // 5. inverse NTT of the product
-        if ((st = transform<false>(d_rc, nullptr, d_inv_roots, n, k, B, stream)) != cudaSuccess) return st;
+        if (ntt_hook_)
+            st = ntt_hook_(d_rc, nullptr, B, stream, false, ntt_hook_ctx_);
+        else
+            st = transform<false>(d_rc, nullptr, d_inv_roots, n, k, B, stream);
+        if (st != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[5], stream);
 
         // 6. untwist / normalize
@@ -909,6 +926,9 @@ struct Device {
     const Plan& plan() const { return plan_; }
     const CrtArgs& crt_args() const { return crt_args_; }
     const u32* residues_device() const { return d_rc; }
+    const Prime* primes_device() const { return d_primes; }
+    const u32* roots_device() const { return d_roots; }
+    const u32* inv_roots_device() const { return d_inv_roots; }
 
     // Run the reference (CUDA-core) CRT into `out` for `pairs` pairs.
     cudaError_t crt_reference(const u32* residues, u32* out, u32 pairs,

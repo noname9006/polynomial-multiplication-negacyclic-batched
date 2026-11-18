@@ -31,6 +31,7 @@
 #include "polymul_gpu.cuh"
 #if !defined(PGPU_HOST_CHECK)
 #include "gpu31.cuh"
+#include "ntt_fast.cuh"
 #include "crt_mma.cuh"
 #endif
 #endif
@@ -97,6 +98,10 @@ struct Rng {
 };
 #endif
 
+#if !defined(PGPU_HOST_CHECK)
+struct NttHookCtx { ntt_fast::NttFastPlan* plan = nullptr; gpu31::Device* dev = nullptr; };
+#endif
+
 struct State {
     polymul::Plan plan;
     std::unique_ptr<polymul::Engine> engine;
@@ -106,6 +111,8 @@ struct State {
     // the older 62-bit pgpu path stays compiled as a fallback but is untouched.
 #if !defined(PGPU_HOST_CHECK)
     std::unique_ptr<gpu31::Device> gpu31_dev;
+    std::unique_ptr<ntt_fast::NttFastPlan> ntt_fast_plan;
+    NttHookCtx ntt_hook_ctx;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
     bool gpu31_ok = false;
     bool crt_mma_ok = false;  // fixed CRT proved identical to the reference CRT
@@ -471,6 +478,18 @@ bool gpu31_selfcheck(State& s, gpu31::Device& dev, u32 pairs) {
     return true;
 }
 
+// NTT hook: dispatched from gpu31::Device::run for stages 3/5. The context is
+// the NttFastPlan held in State; the bool selects forward vs inverse.
+#if !defined(PGPU_HOST_CHECK)
+static cudaError_t ntt_hook_fn(u32* a, u32* b, unsigned B, cudaStream_t stream,
+                               bool fwd, void* ctx) {
+    auto* h = static_cast<NttHookCtx*>(ctx);
+    if (!h || !h->plan || !h->dev) return cudaErrorInvalidValue;
+    return fwd ? h->plan->forward(a, b, *h->dev, B, stream)
+               : h->plan->inverse(a, b, *h->dev, B, stream);
+}
+#endif
+
 // Generic CRT-vs-reference check: runs `runner` on random residues and compares
 // its output byte-for-byte against gpu31's reference CRT. Used for both the
 // cuPQC and MMA candidates.
@@ -628,6 +647,25 @@ void* fherma_init(const fherma::Point& p) {
             if (gpu31_selfcheck(*state, *dev, p.B < 2 ? p.B : 2)) {
                 state->gpu31_dev = std::move(dev);
                 state->gpu31_ok = true;
+
+                // Install the optimized NTT if it proves byte-identical via the
+                // gpu31 self-check (we re-run it with the hook below).
+                try {
+                    state->ntt_fast_plan = std::make_unique<ntt_fast::NttFastPlan>(*state->gpu31_dev);
+                    state->ntt_hook_ctx.plan = state->ntt_fast_plan.get();
+                    state->ntt_hook_ctx.dev = state->gpu31_dev.get();
+                    state->gpu31_dev->set_ntt_hook(ntt_hook_fn, &state->ntt_hook_ctx);
+                    // Re-verify the whole pipeline with the optimized NTT. On any
+                    // mismatch, drop the hook and keep the proven built-in NTT.
+                    if (!gpu31_selfcheck(*state, *state->gpu31_dev, p.B < 2 ? p.B : 2)) {
+                        state->gpu31_dev->set_ntt_hook(nullptr, nullptr);
+                        state->ntt_fast_plan.reset();
+                    }
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "polymul: NTT fast setup failed: %s\n", e.what());
+                    state->gpu31_dev->set_ntt_hook(nullptr, nullptr);
+                    state->ntt_fast_plan.reset();
+                }
 
                 // The 62-bit path's scratch buffers are now dead weight: gpu_multiply()
                 // is their only consumer, and fherma_run reaches it only when gpu31_ok

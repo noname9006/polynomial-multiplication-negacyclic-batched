@@ -305,13 +305,13 @@ struct NttFastPlan {
     template <class Dev>
     cudaError_t forward(u32* a, u32* b, const Dev& dev, u32 B,
                         cudaStream_t stream = nullptr) const {
-        return transform<true>(a, b, dev.d_primes, dev.d_roots,
+        return transform<true>(a, b, dev.primes_device(), dev.roots_device(),
                                d_packed_fwd, dev.plan().N, dev.plan().K, B, stream);
     }
     template <class Dev>
     cudaError_t inverse(u32* a, u32* b, const Dev& dev, u32 B,
                         cudaStream_t stream = nullptr) const {
-        return transform<false>(a, b, dev.d_primes, dev.d_inv_roots,
+        return transform<false>(a, b, dev.primes_device(), dev.inv_roots_device(),
                                 d_packed_inv, dev.plan().N, dev.plan().K, B, stream);
     }
     template <class Dev>
