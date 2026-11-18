@@ -915,7 +915,7 @@ struct Device {
                 d_rc, d_primes, d_pk_inv, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (profiling_) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
-            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
+            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 256,
                           crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
                                                    d_primes, d_untw_slot, logN, d_corr_m);
             st = cudaGetLastError();
@@ -983,7 +983,7 @@ struct Device {
         // When skip_crt is set, the caller runs an external CRT (e.g. tensor-core
         // MMA) on d_rc after this pipeline returns.
         if (!skip_crt && tc_crt) {
-            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
+            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 256,
                           crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
                                                    d_primes, tc_fuse_decode ? d_untw_inv : nullptr, 0u, d_corr_m);
             st = cudaGetLastError();
