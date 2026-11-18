@@ -35,7 +35,7 @@ constexpr unsigned ENC_KS_MAX = 7;    // L <= 56
 constexpr unsigned CRT_KS_MAX = 15;   // K+1 <= 120
 constexpr unsigned ENC_ROWS = 128;    // 4 warps x 32 rows
 constexpr unsigned ENC_S = 68;        // smem words per row: >= 56, == 4 (mod 32)
-constexpr unsigned CRT_ROWS = 128;    // 8 warps x 16 rows
+constexpr unsigned CRT_ROWS = 64;     // 4 warps x 16 rows
 
 // ---------------------------------------------------------------------------
 // host baking
@@ -240,13 +240,11 @@ struct CrtTc {
 inline std::size_t crt_tc_smem(const CrtTc& c) {
     std::size_t a = std::size_t(CRT_ROWS) * c.SA * 4;
     const std::size_t x = std::size_t(CRT_ROWS) * c.SX * 8;
-    std::size_t m = a > x ? a : x;
-    m = (m + 15) & ~std::size_t(15);
-    return m + std::size_t(4) * c.KS * 32 * 8;   // + sB (CRT_NTB n-tiles of B fragments)
+    return a > x ? a : x;
 }
 
-constexpr unsigned CRT_NTB = 4;   // independent accumulator chains per warp
-__global__ void __launch_bounds__(256, 1)
+constexpr unsigned CRT_NTB = 7;   // independent accumulator chains per warp
+__global__ void __launch_bounds__(128, 3)
 crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
@@ -262,15 +260,11 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     const unsigned n = pl.n, l = pl.limbs, K = pl.count;
     const unsigned pair = blockIdx.z, start = blockIdx.x * CRT_ROWS;
     const unsigned tid = threadIdx.x;
-    const unsigned c = tid & (CRT_ROWS - 1), jg = tid / CRT_ROWS;
+    const unsigned c = tid & 63, jg = tid >> 6;
     const unsigned i = start + c;
     const bool active = i < n;
     const u64 rbase = u64(pair) * K * n;
     const unsigned W = cfg.KS * 8;
-    std::size_t abytes = std::size_t(CRT_ROWS) * cfg.SA * 4;
-    if (std::size_t(CRT_ROWS) * cfg.SX * 8 > abytes) abytes = std::size_t(CRT_ROWS) * cfg.SX * 8;
-    abytes = (abytes + 15) & ~std::size_t(15);
-    uint2* sB = reinterpret_cast<uint2*>(smem_raw + abytes);
 
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
     u64 fsum = 0;
@@ -321,13 +315,6 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     const unsigned sh = (t & 1) * 16;
     const unsigned row = rowbase + g + (odd ? 8 : 0);
     for (unsigned nt0 = 0; nt0 < cfg.NT; nt0 += CRT_NTB) {
-        __syncthreads();   // previous group done with sB
-        for (unsigned idx = tid; idx < CRT_NTB * cfg.KS * 32; idx += blockDim.x) {
-            const unsigned j = idx / (cfg.KS * 32), rem = idx - j * (cfg.KS * 32);
-            const unsigned nt = nt0 + j;
-            sB[idx] = nt < cfg.NT ? frag[std::size_t(nt) * cfg.KS * 32 + rem] : make_uint2(0u, 0u);
-        }
-        __syncthreads();
         int acc[CRT_NTB][4];
 #pragma unroll
         for (unsigned j = 0; j < CRT_NTB; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
@@ -338,8 +325,8 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
 #pragma unroll
                 for (unsigned j = 0; j < CRT_NTB; ++j) {
                     const unsigned nt = nt0 + j;
-                    b[j] = sB[(j * cfg.KS + ks) * 32 + lane];
-                    (void)nt;
+                    if (nt < cfg.NT) b[j] = frag[(std::size_t(nt) * cfg.KS + ks) * 32 + lane];
+                    else b[j] = make_uint2(0u, 0u);
                 }
 #pragma unroll
                 for (unsigned j = 0; j < CRT_NTB; ++j)
