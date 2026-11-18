@@ -99,7 +99,7 @@ using Prime = gpu31::Prime;
 #endif
 
 // gpu31 constants, kept local so this file stays drop-in.
-static constexpr unsigned NF_MAX_TILE     = 2048;  // was 512: fewer high-stage HBM passes
+static constexpr unsigned NF_MAX_TILE     = 512;   // gpu31::max_tile; 2048 was slower (H14)
 static constexpr unsigned NF_LOW_COLUMNS  = 16;    // gpu31::low_columns
 static constexpr unsigned NF_HIGH_WORKERS = 16;    // gpu31::high_workers
 

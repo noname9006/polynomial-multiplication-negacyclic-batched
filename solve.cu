@@ -33,6 +33,7 @@
 #include "gpu31.cuh"
 #include "ntt_fast.cuh"
 #include "crt_mma.cuh"
+#include "crt_mma_fast.cuh"
 #endif
 #endif
 
@@ -114,8 +115,10 @@ struct State {
     std::unique_ptr<ntt_fast::NttFastPlan> ntt_fast_plan;
     NttHookCtx ntt_hook_ctx;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
+    std::unique_ptr<crt_mma_fast::CrtMmaFastPlan> crt_fast_plan;
     bool gpu31_ok = false;
     bool crt_mma_ok = false;  // fixed CRT proved identical to the reference CRT
+    bool crt_fast_ok = false; // pre-baked tensor CRT proved identical to the reference
 #endif
 
     bool gpu_ok = false;           // the device path is trusted for this point
@@ -693,6 +696,27 @@ void* fherma_init(const fherma::Point& p) {
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
                 }
+
+                // H15: try the pre-baked tensor-core CRT.  It replaces the
+                // ~121 scalar packing instructions per MMA of crt_mma_diag
+                // with 6 loads, by baking the B operand on the host and the
+                // A byte-planes in shared.  Keep it only if byte-identical.
+                try {
+                    state->crt_fast_plan = std::make_unique<crt_mma_fast::CrtMmaFastPlan>(
+                        pl.crt_weights, pl.L, pl.K + 1);
+                    auto* pf = state->crt_fast_plan.get();
+                    std::fprintf(stderr, "[CRTF] plan L=%u pitch=%u smem=%zu\n",
+                                 pf->L, pf->pitch, crt_mma_fast::shared_bytes(pf->L, pf->pitch));
+                    state->crt_fast_ok = crt_vs_reference(
+                        *state,
+                        [pf](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                            return pf->run(r, o, a, b, s);
+                        },
+                        2, "CRT-fast");
+                    std::fprintf(stderr, "[CRTF] selfcheck=%d\n", (int)state->crt_fast_ok);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "polymul: CRT-fast setup failed: %s\n", e.what());
+                }
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "polymul: gpu31 setup failed: %s\n", e.what());
@@ -744,10 +768,15 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 #if !defined(PGPU_HOST_CHECK)
             if (s->gpu31_ok) {
                 const u32 Bc = static_cast<u32>(B);
-                const bool use_mma = s->crt_mma_ok && s->crt_mma_plan != nullptr;
+                const bool use_fast = s->crt_fast_ok && s->crt_fast_plan != nullptr;
+                const bool use_mma = use_fast || (s->crt_mma_ok && s->crt_mma_plan != nullptr);
                 ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c, Bc, s->stream,
                                        /*skip_crt=*/use_mma) == cudaSuccess;
-                if (ok && use_mma)
+                if (ok && use_fast)
+                    ok = s->crt_fast_plan->run(s->gpu31_dev->residues_device(), s->d_c,
+                                               s->gpu31_dev->crt_args(), Bc, s->stream)
+                         == cudaSuccess;
+                else if (ok && use_mma)
                     ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), s->d_c,
                                               s->gpu31_dev->crt_args(), Bc, s->stream)
                          == cudaSuccess;
