@@ -137,6 +137,13 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC19_PF
 #define TC19_PF 1
 #endif
+#ifndef TC22_MERGED
+#define TC22_MERGED 1   // merged-psi negacyclic NTT: no twist / untwist tables
+#endif
+// low-stage twiddle table: TC22 stores per stage (half-1)+j (511 values);
+// the classic table stores omega^(j*N/(2half)) at j<<(8-m) (256 values).
+#define TC_LT (TC22_MERGED ? 512u : 256u)
+#define TWI(m, j) (TC22_MERGED ? ((1u << (m)) - 1u + (j)) : ((j) << (8 - (m))))
 #ifndef TC20_R8
 #define TC20_R8 1
 #endif
@@ -233,7 +240,7 @@ encode_tc(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         for (unsigned j = 0; j < ENC_NTB; ++j) {
             acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
             const unsigned k = (nt0 + j) * 2 + (t >> 1);
-            tw[j] = (k < K && rowok) ? rtwist[u64(k) * n + i] : 0u;
+            tw[j] = (rtwist && k < K && rowok) ? rtwist[u64(k) * n + i] : 0u;
         }
 #pragma unroll
         for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
@@ -266,7 +273,7 @@ encode_tc(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
                 if (hi >= p.p) hi -= p.p;
                 const u32 v = gpu31::add(lo, hi, p.p);
-                dst[rbase + u64(k) * n + i] = gpu31::mont(v, tw[j], p);
+                dst[rbase + u64(k) * n + i] = rtwist ? gpu31::mont(v, tw[j], p) : v;
             }
         }
     }
@@ -652,11 +659,11 @@ __device__ __forceinline__ unsigned padw(unsigned x) { return x + (x >> 5); }
 __global__ void __launch_bounds__(256)
 fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K) {
-    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sb[NT_TILE + NT_TILE / 32], sr[NT_TILE / 2];
+    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sb[NT_TILE + NT_TILE / 32], sr[TC_LT];
     const unsigned t = threadIdx.x;
     const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
     const gpu31::Prime p = primes[blockIdx.y];
-    sr[t] = packed[u64(blockIdx.y) * (NT_TILE / 2) + t];
+    for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(blockIdx.y) * TC_LT + x];
     sa[padw(t)] = a[base + t];
     sa[padw(t + 256)] = a[base + t + 256];
     sb[padw(t)] = b[base + t];
@@ -666,7 +673,7 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
     for (unsigned m = 0; m < 9; ++m) {
         const unsigned half = 1u << m, j = t & (half - 1);
         const unsigned first = 2 * (t - j) + j, second = first + half;
-        const u32 w = sr[j << (8 - m)];
+        const u32 w = sr[TWI(m, j)];
         gpu31::butterfly(sa[padw(first)], sa[padw(second)], w, p);
         gpu31::butterfly(sb[padw(first)], sb[padw(second)], w, p);
         __syncthreads();
@@ -961,11 +968,11 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 __global__ void __launch_bounds__(256)
 inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K) {
-    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[NT_TILE / 2];
+    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[TC_LT];
     const unsigned t = threadIdx.x;
     const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
     const gpu31::Prime p = primes[blockIdx.y];
-    sr[t] = packed[u64(blockIdx.y) * (NT_TILE / 2) + t];
+    for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(blockIdx.y) * TC_LT + x];
     sa[padw(t)] = c[base + t];
     sa[padw(t + 256)] = c[base + t + 256];
     __syncthreads();
@@ -977,7 +984,7 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
     for (int m = 8; m >= 5; --m) {
         const unsigned half = 1u << m, j = t & (half - 1);
         const unsigned first = 2 * (t - j) + j, second = first + half;
-        const u32 w = sr[j << (8 - m)];
+        const u32 w = sr[TWI(m, j)];
         const u32 u = sa[padw(first)], v = sa[padw(second)];
         sa[padw(first)] = gpu31::add(u, v, p.p);
         sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
@@ -988,7 +995,7 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
     for (int m = 4; m >= 0; --m) {
         const unsigned half = 1u << m;
         const unsigned j = t & (half - 1);
-        const u32 w = sr[j << (8 - m)];
+        const u32 w = sr[TWI(m, j)];
         const u32 v0 = __shfl_xor_sync(0xffffffffu, a0, half);
         const u32 v1 = __shfl_xor_sync(0xffffffffu, a1, half);
         if (t & half) {
@@ -1024,7 +1031,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
               const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
               unsigned logN, unsigned KS, unsigned NT) {
     __shared__ u32 sT[EF_PR][EF_PT];
-    __shared__ u32 sR[EF_PR][NT_TILE / 2];
+    __shared__ u32 sR[EF_PR][TC_LT];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
     const u32* src = blockIdx.y ? src_b : src_a;
     u32* dst = blockIdx.y ? rb : ra;
@@ -1066,16 +1073,16 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     // TC19: the next group's twiddles and B fragments are fetched into
     // registers while the current group runs its DIT; setup is then only
     // shared stores.  sR: 2048 words = 4 per thread; sB: <= 1024 uint2 = 2.
-    constexpr unsigned PF_R = EF_PR * (NT_TILE / 2) / 512, PF_B = 2;
+    constexpr unsigned PF_R = EF_PR * TC_LT / 512, PF_B = 2;
     u32 pfR[PF_R];
     uint2 pfB[PF_B];
     auto prefetch = [&](unsigned g0n) {
 #pragma unroll
         for (unsigned u = 0; u < PF_R; ++u) {
             const unsigned idx = tid + u * 512;
-            const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
+            const unsigned q = idx / TC_LT, r = idx % TC_LT;
             const unsigned kk = g0n * 2 + q;
-            pfR[u] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+            pfR[u] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
         }
 #pragma unroll
         for (unsigned u = 0; u < PF_B; ++u) {
@@ -1097,7 +1104,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #pragma unroll
         for (unsigned u = 0; u < PF_R; ++u) {
             const unsigned idx = tid + u * 512;
-            sR[idx / (NT_TILE / 2)][idx % (NT_TILE / 2)] = pfR[u];
+            sR[idx / TC_LT][idx % TC_LT] = pfR[u];
         }
 #pragma unroll
         for (unsigned u = 0; u < PF_B; ++u) {
@@ -1106,10 +1113,10 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
 #else
         // twiddles of this group's primes
-        for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
-            const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
+        for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
+            const unsigned q = idx / TC_LT, r = idx % TC_LT;
             const unsigned kk = nt0 * 2 + q;
-            sR[q][r] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+            sR[q][r] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
         }
         // this group's B fragments, shared by all 16 warps
         for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
@@ -1129,7 +1136,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0;
                 const unsigned k = (nt0 + j) * 2 + (t >> 1);
                 const unsigned i = start + rowbase + mt * 16 + g + (odd ? 8 : 0);
-                tw[mt][j] = k < K ? rtwist[u64(k) * n + i] : 0u;
+                tw[mt][j] = (rtwist && k < K) ? rtwist[u64(k) * n + i] : 0u;
             }
 #pragma unroll
         for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
@@ -1168,7 +1175,8 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                     const u32 lo = gpu31::canonical_word(u32(tot), p.p);
                     u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
                     if (hi >= p.p) hi -= p.p;
-                    val = gpu31::mont(gpu31::add(lo, hi, p.p), tw[mt][j], p);
+                    val = rtwist ? gpu31::mont(gpu31::add(lo, hi, p.p), tw[mt][j], p)
+                                 : gpu31::add(lo, hi, p.p);
                 }
                 const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);
                 sT[j * 2 + (t >> 1)][padw(rl)] = val;
@@ -1207,7 +1215,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #pragma unroll
             for (unsigned rep = 0; rep < 4; ++rep) {
                 const unsigned q = jg + rep * 2;
-                const u32 w = sR[q][j << (8 - m)];
+                const u32 w = sR[q][TWI(m, j)];
                 const u32 x0 = __shfl_xor_sync(0xffffffffu, v0[rep], half);
                 const u32 x1 = __shfl_xor_sync(0xffffffffu, v1[rep], half);
                 if (bt & half) {
@@ -1234,7 +1242,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned q = jg + rep * 2, bt = tid & 255;
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
-                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][TWI(m, j)], pq[rep]);
             }
             __syncthreads();
         }
@@ -1264,7 +1272,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                     for (unsigned e = 0; e < 8; ++e) {
                         if (e & span) continue;
                         const unsigned j = w + (e & (span - 1)) * H;
-                        const u32 tw = tw8[j << (8 - (m + st))];
+                        const u32 tw = tw8[TWI(m + st, j)];
                         gpu31::butterfly(v[e], v[e + span], tw, pr8);
                     }
                 }
@@ -1313,7 +1321,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned q = (tid >> 8) + rep * 2, bt = tid & 255;
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
-                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][TWI(m, j)], pq[rep]);
             }
             __syncthreads();
         }
@@ -1326,7 +1334,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned q = (tid >> 8) + rep * 2, bt = tid & 255;
                 const unsigned j = bt & (half - 1);
                 const unsigned first = 2 * (bt - j) + j, second = first + half;
-                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][TWI(m, j)], pq[rep]);
             }
             __syncthreads();
         }

@@ -1104,14 +1104,14 @@ struct Device {
             if (part != 2) {
             if (tc_efl) {
                 tc::encode_fwdlow<<<dim3(n / tc::EF_ROWS, 2, B), 512, 0, stream>>>(
-                    pa, pb, pra, prb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                    pa, pb, pra, prb, d_fenc, d_primes, d_weights, TC22_MERGED ? nullptr : d_reversed_twist,
                     d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
                 if ((st = cudaGetLastError()) != cudaSuccess) return st;
                 if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
                                   cudaEventRecord(ev_[3], stream); }
             } else {
             tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 256, 0, stream>>>(
-                pa, pb, pra, prb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                pa, pb, pra, prb, d_fenc, d_primes, d_weights, TC22_MERGED ? nullptr : d_reversed_twist,
                 n, l, k, logN, enc_KS, enc_NT);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream); }
@@ -1206,9 +1206,16 @@ private:
                     for (unsigned i = 0; i < N; ++i)
                         t[std::size_t(kk) * N + i] =
                             mont(plan_.untwist[std::size_t(kk) * N + i], inv_m, pr);
+#if TC22_MERGED
+                    // merged NTT leaves n * x * R in slot order: term = mont(r, n^-1 * inv)
+                    const u32 ninv = host_powmod(N % pr.p, pr.p - 2, pr.p);
+                    const u32 cst = u32(u64(ninv) * inv_m % pr.p);
+                    for (unsigned i = 0; i < N; ++i) ts[std::size_t(kk) * N + i] = cst;
+#else
                     for (unsigned i = 0; i < N; ++i)
                         ts[std::size_t(kk) * N + i] =
                             t[std::size_t(kk) * N + reverse_bits(i, logN)];
+#endif
                 }
                 upload_u32(d_untw_inv, t);
                 if (N >= 1024 && N % tc::NT_TILE == 0 && N / tc::NT_TILE <= 128 && N / tc::NT_TILE >= 2) {
@@ -1236,6 +1243,43 @@ private:
         const unsigned HC = N / T;
         unsigned logH = 0;
         while ((1u << logH) < HC) ++logH;
+#if TC22_MERGED
+        // merged-psi twiddles (tools/tc_emul/merged_emul.cpp):
+        //   low  (half=2^m, j<half):  psi^(2^(n-1-m)(1+2j))           at (half-1)+j
+        //   high (stage s):  A_s[low] = psi^(2^(n-10-s)(1+2low)),  B_s[w] = psi^(w 2^(n-s))
+        // inverse = the same exponents of psi^-1.  psi^e (Montgomery) = twist[k][e].
+        const unsigned logN_ = plan_.logN;
+        std::vector<u32> pf(std::size_t(K) * TC_LT, 0u), pi(pf.size(), 0u);
+        const std::size_t TWS = 7 * T + 127;
+        std::vector<u32> tf(std::size_t(K) * TWS, 0u), ti(tf.size(), 0u);
+        for (unsigned kk = 0; kk < K; ++kk) {
+            const u32* tw = plan_.twist.data() + std::size_t(kk) * N;
+            const u32 pp = plan_.primes[kk].p;
+            auto fpsi = [&](std::size_t e) { return tw[e]; };
+            auto ipsi = [&](std::size_t e) { return e == 0 ? tw[0] : u32(pp - tw[N - e]); };
+            for (unsigned m = 0; m < 9; ++m) {
+                const unsigned half = 1u << m;
+                for (unsigned j = 0; j < half; ++j) {
+                    const std::size_t e = (std::size_t(1) << (logN_ - 1 - m)) * (1 + 2 * j);
+                    pf[std::size_t(kk) * TC_LT + (half - 1) + j] = fpsi(e);
+                    pi[std::size_t(kk) * TC_LT + (half - 1) + j] = ipsi(e);
+                }
+            }
+            for (unsigned st = 0; st < logH; ++st) {
+                const unsigned H = 1u << st;
+                for (unsigned low = 0; low < T; ++low) {
+                    const std::size_t e = (std::size_t(1) << (logN_ - 10 - st)) * (1 + 2 * low);
+                    tf[std::size_t(kk) * TWS + st * T + low] = fpsi(e);
+                    ti[std::size_t(kk) * TWS + st * T + low] = ipsi(e);
+                }
+                for (unsigned w = 0; w < H; ++w) {
+                    const std::size_t e = std::size_t(w) << (logN_ - st);
+                    tf[std::size_t(kk) * TWS + 7 * T + (H - 1) + w] = fpsi(e);
+                    ti[std::size_t(kk) * TWS + 7 * T + (H - 1) + w] = ipsi(e);
+                }
+            }
+        }
+#else
         std::vector<u32> pf(std::size_t(K) * (T / 2)), pi(pf.size());
         const std::size_t TWS = 7 * T + 127;
         std::vector<u32> tf(std::size_t(K) * TWS, 0u), ti(tf.size(), 0u);
@@ -1258,6 +1302,7 @@ private:
                 }
             }
         }
+#endif
         upload_u32(d_pk_fwd, pf);
         upload_u32(d_pk_inv, pi);
         upload_u32(d_twf, tf);
