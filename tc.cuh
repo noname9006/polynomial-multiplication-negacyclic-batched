@@ -32,6 +32,15 @@
 #define TC10_SHUF 0   // OC2 measured slower: encode 24.4 -> 26.2 ms
 #endif
 
+// Agent B, OC23: load crt_tc2's A fragments with ldmatrix.m8n8.x4.b16.
+// One b16 word = 2 b16 = 4 u8 = one mma.u8 A register; the 16x8 (K) A tile
+// maps to the four 8x8 quadrants (a0..a3) exactly as mma.m16n8k32 expects.
+// Row starts sA[row*SA + ks*8] are 16B-aligned since crt_sa_stride keeps
+// SA%32 in {4,28} => SA*4 multiple of 16.  0 = original 4 scalar LDGs.
+#ifndef OC23_LDMATRIX
+#define OC23_LDMATRIX 1   // 0 = original four scalar LDG.shared per A fragment
+#endif
+
 namespace tc {
 
 using u32 = std::uint32_t;
@@ -221,6 +230,28 @@ __device__ __forceinline__ void mma_u8(int (&c)[4], u32 a0, u32 a1, u32 a2, u32 
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// OC23: load the 4 A words of one mma.m16n8k32.u8 from shared with one
+// ldmatrix.m8n8.x4.b16.  Each u32 word packs 4 u8 bytes = 2 b16 elements,
+// so the 16x8 (K) A tile is four 8x8 b16 quadrants.  Address lane m*8+r
+// supplies row r of quadrant m at byte-aligned word column (m>>1)*4:
+//   m=0/1 -> rows 0..7 / 8..15, k=0..7   (x0,x1)
+//   m=2/3 -> rows 0..7 / 8..15, k=8..15  (x2,x3)
+// Destination lane l (g=l>>2, t=l&3) gets word t of each quadrant, i.e.
+// exactly x0..x3 of the scalar path.  Verified against a CPU model.
+__device__ __forceinline__ void ldmatrix_a4(u32& a0, u32& a1, u32& a2, u32& a3,
+                                           const u32* sA, unsigned SA, unsigned ks,
+                                           unsigned mt) {
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned r = lane & 7, m = lane >> 3;
+    const u32* addr = sA + (mt * 16 + r + (m & 1) * 8) * SA + ks * 8 + (m >> 1) * 4;
+    u32 a0v, a1v, a2v, a3v;
+    asm volatile("{ .reg .u32 sh; cvta.to.shared.u32 sh, %4; "
+                 "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [sh]; }\n"
+        : "=r"(a0v), "=r"(a1v), "=r"(a2v), "=r"(a3v)
+        : "l"(addr));
+    a0 = a0v; a1 = a1v; a2 = a2v; a3 = a3v;
 }
 
 // ---------------------------------------------------------------------------
@@ -616,9 +647,14 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
             const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
 #pragma unroll
             for (unsigned mt = 0; mt < 2; ++mt) {
+#if OC23_LDMATRIX
+                u32 x0, x1, x2, x3;
+                ldmatrix_a4(x0, x1, x2, x3, sA, cfg.SA, ks, mt);
+#else
                 const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
                 const u32* r1 = r0 + 8 * cfg.SA;
                 const u32 x0 = r0[0], x1 = r1[0], x2 = r0[4], x3 = r1[4];
+#endif
                 mma_u8(acc[mt][0], x0, x1, x2, x3, b0.x, b0.y);
                 if (hasB) mma_u8(acc[mt][1], x0, x1, x2, x3, b1.x, b1.y);
             }
