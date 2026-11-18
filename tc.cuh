@@ -195,6 +195,17 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef OC11_FUSE
 #define OC11_FUSE 1
 #endif
+
+// OC12 (parallel branch): keep the boundary data in registers.  The first
+// radix-16 DIT group reads ra/rb straight from global (no shared write + read
+// + barrier), and the last radix-16 DIF group writes rc straight to global
+// (no shared write + read).  With OC10+OC11 this leaves only two shared round
+// trips in fused_high instead of seven in the original OC8 version.  Active
+// only when n16>0; flag OC12_IO=0 restores the original load/store loops.
+// CPU-validated bit-exact by tools/tc_emul/io_fused_emul.cpp.
+#ifndef OC12_IO
+#define OC12_IO 1
+#endif
 #ifndef TC_PROF
 #define TC_PROF 1
 #endif
@@ -830,11 +841,19 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 
     TCP_T(f0);
-    for (unsigned h = rw; h < HC; h += 8) {
-        sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
-        sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
+#if OC10_R16 && OC12_IO
+    if (n16 == 0) {
+#endif
+        for (unsigned h = rw; h < HC; h += 8) {
+            sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
+            sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
+        }
+        __syncthreads();
+#if OC10_R16 && OC12_IO
     }
-    __syncthreads();
+    // OC12: with n16>0 the first radix-16 DIT group loads ra/rb directly
+    // into its register arrays, so no shared write/read/barrier is needed.
+#endif
     TCP_T(f1);
 #if OC10_R16
     // OC10: four DIT stages per shared round trip.  A group is rows
@@ -860,8 +879,20 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #pragma unroll
             for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
             u32 av[16], bv[16];
+#if OC10_R16 && OC12_IO
+            if (q == 0) {
 #pragma unroll
-            for (unsigned i = 0; i < 16; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
+                for (unsigned i = 0; i < 16; ++i) {
+                    const unsigned row = r0 + i * H;
+                    av[i] = ra[plane + u64(row) * NT_TILE + low];
+                    bv[i] = rb[plane + u64(row) * NT_TILE + low];
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
+            }
 #pragma unroll
             for (unsigned i = 0; i < 16; i += 2) {
                 gpu31::butterfly(av[i], av[i+1], t1, p);
@@ -1235,8 +1266,19 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                 av[i] = gpu31::add(u, v, p.p);
                 av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
             }
+#if OC10_R16 && OC12_IO
+            if (q + 1 == n16) {
+                // OC12: last inverse group writes the finished coefficients
+                // straight to global, skipping the shared write + store read.
 #pragma unroll
-            for (unsigned i = 0; i < 16; ++i) sa[ix[i]] = av[i];
+                for (unsigned i = 0; i < 16; ++i)
+                    rc[plane + u64(r0 + i * H) * NT_TILE + low] = av[i];
+            } else
+#endif
+            {
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) sa[ix[i]] = av[i];
+            }
         }
         __syncthreads();
     }
@@ -1358,8 +1400,13 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 #endif
     TCP_T(f4);
-    for (unsigned h = rw; h < HC; h += 8)
-        rc[plane + u64(h) * NT_TILE + low] = sa[h * S + lane];
+#if OC10_R16 && OC12_IO
+    if (n16 == 0)
+#endif
+    {
+        for (unsigned h = rw; h < HC; h += 8)
+            rc[plane + u64(h) * NT_TILE + low] = sa[h * S + lane];
+    }
     TCP_T(f5);
     TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
     TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
