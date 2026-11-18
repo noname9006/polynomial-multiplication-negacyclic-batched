@@ -153,6 +153,15 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef OC8_R8
 #define OC8_R8 1
 #endif
+
+// OC9 (parallel branch): Shoup multiply with a hoisted twiddle constant in
+// fused_high butterflies.  mu[p] = floor((2^32-p)*2^32/p) is uploaded per
+// prime; w_shoup = w + umulhi(w,mu) is computed once per twiddle and reused
+// by every butterfly that consumes it.  CPU-validated bit-exact (verified by
+// verify_shoup_mul.py, 8 primes x 20000 trials + edge cases).
+#ifndef OC9_SHOUP
+#define OC9_SHOUP 1
+#endif
 #ifndef TC_PROF
 #define TC_PROF 1
 #endif
@@ -163,6 +172,23 @@ __constant__ u32 c_crt_corr[CRT_KMAX_C];
 #define TCP_T(v) const long long v = (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) ? (long long)clock64() : 0
 #define TCP_ADD(slot, a, b) do { if (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) \
     atomicAdd(&g_tcprof[slot], (unsigned long long)((b) - (a))); } while (0)
+
+#if OC9_SHOUP
+// One Shoup reduction with a pre-hoisted constant for twiddle w.
+__device__ __forceinline__ u32 shoup_mul(u32 x, u32 w, u32 mu, const gpu31::Prime& p) {
+    const u32 ws = w + __umulhi(w, mu);
+    const u32 q = __umulhi(x, ws);
+    const u64 r = u64(x) * w - u64(q) * p.p;   // 0 <= r < 2p (mu is floored)
+    const u32 v = u32(r);
+    return v >= p.p ? v - p.p : v;
+}
+__device__ __forceinline__ void shoup_butterfly(u32& a, u32& b, u32 w, u32 mu,
+                                                const gpu31::Prime& p) {
+    const u32 u = a, v = shoup_mul(b, w, mu, p);
+    a = gpu31::add(u, v, p.p);
+    b = gpu31::sub(u, v, p.p);
+}
+#endif
 
 __device__ __forceinline__ void mma_u8(int (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3,
                                        u32 b0, u32 b1) {
@@ -683,7 +709,7 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
 __global__ void __launch_bounds__(256)
 fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
-           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH) {
+           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH, const u32* __restrict__ d_mu) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
@@ -696,6 +722,14 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     const unsigned k = blockIdx.y;
     const u64 plane = (u64(blockIdx.z) * K + k) * n;
     const gpu31::Prime p = primes[k];
+#if OC9_SHOUP
+    const u32 mu = d_mu[k];          // Shoup constant for this prime
+#define OC9_BF(a, b, w) shoup_butterfly((a), (b), (w), mu, p)
+#define OC9_MUL(x, w) shoup_mul((x), (w), mu, p)
+#else
+#define OC9_BF(a, b, w) gpu31::butterfly((a), (b), (w), p)
+#define OC9_MUL(x, w) gpu31::mont((x), (w), p)
+#endif
     constexpr unsigned TWS = 7 * NT_TILE + 127;
     const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
     const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
@@ -739,20 +773,20 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             for (unsigned i = 0; i < 8; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
 #pragma unroll
             for (unsigned i = 0; i < 8; i += 2) {
-                gpu31::butterfly(av[i], av[i + 1], t1, p);
-                gpu31::butterfly(bv[i], bv[i + 1], t1, p);
+                OC9_BF(av[i], av[i + 1], t1);
+                OC9_BF(bv[i], bv[i + 1], t1);
             }
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
                 const u32 tw = (i & 1) ? t2b : t2a;
-                gpu31::butterfly(av[i], av[i + 2], tw, p);
-                gpu31::butterfly(bv[i], bv[i + 2], tw, p);
+                OC9_BF(av[i], av[i + 2], tw);
+                OC9_BF(bv[i], bv[i + 2], tw);
             }
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
-                gpu31::butterfly(av[i], av[i + 4], t4[i], p);
-                gpu31::butterfly(bv[i], bv[i + 4], t4[i], p);
+                OC9_BF(av[i], av[i + 4], t4[i]);
+                OC9_BF(bv[i], bv[i + 4], t4[i]);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
@@ -768,8 +802,8 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
             const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            OC9_BF(sa[first * S + lane], sa[second * S + lane], w);
+            OC9_BF(sb[first * S + lane], sb[second * S + lane], w);
         }
         __syncthreads();
     }
@@ -791,10 +825,10 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const u32 t3 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
             u32 a0 = sa[i0], a1 = sa[i1], a2 = sa[i2], a3 = sa[i3];
             u32 b0 = sb[i0], b1 = sb[i1], b2 = sb[i2], b3 = sb[i3];
-            gpu31::butterfly(a0, a1, t1, p); gpu31::butterfly(a2, a3, t1, p);
-            gpu31::butterfly(b0, b1, t1, p); gpu31::butterfly(b2, b3, t1, p);
-            gpu31::butterfly(a0, a2, t2, p); gpu31::butterfly(a1, a3, t3, p);
-            gpu31::butterfly(b0, b2, t2, p); gpu31::butterfly(b1, b3, t3, p);
+            OC9_BF(a0, a1, t1); OC9_BF(a2, a3, t1);
+            OC9_BF(b0, b1, t1); OC9_BF(b2, b3, t1);
+            OC9_BF(a0, a2, t2); OC9_BF(a1, a3, t3);
+            OC9_BF(b0, b2, t2); OC9_BF(b1, b3, t3);
             sa[i0] = a0; sa[i1] = a1; sa[i2] = a2; sa[i3] = a3;
             sb[i0] = b0; sb[i1] = b1; sb[i2] = b2; sb[i3] = b3;
         }
@@ -807,8 +841,8 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const unsigned first = 2 * (h - within) + within, second = first + H;
             const u32 wa = (s == 6 ? waf[6] : (s == 4 ? waf[4] : (s == 2 ? waf[2] : waf[0])));
             const u32 w = gpu31::mont(wa, tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            OC9_BF(sa[first * S + lane], sa[second * S + lane], w);
+            OC9_BF(sb[first * S + lane], sb[second * S + lane], w);
         }
         __syncthreads();
     }
@@ -821,8 +855,8 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
             const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            OC9_BF(sa[first * S + lane], sa[second * S + lane], w);
+            OC9_BF(sb[first * S + lane], sb[second * S + lane], w);
         }
         __syncthreads();
     }
@@ -844,7 +878,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[second * S + lane] = OC9_MUL(gpu31::sub(u, v, p.p), w);
         }
         __syncthreads();
     }
@@ -872,7 +906,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             for (unsigned i = 0; i < 4; ++i) {
                 const u32 u = av[i], v = av[i + 4];
                 av[i] = gpu31::add(u, v, p.p);
-                av[i + 4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[i], p);
+                av[i + 4] = OC9_MUL(gpu31::sub(u, v, p.p), t4[i]);
             }
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
@@ -880,13 +914,13 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                 const u32 tw = (i & 1) ? t2b : t2a;
                 const u32 u = av[i], v = av[i + 2];
                 av[i] = gpu31::add(u, v, p.p);
-                av[i + 2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+                av[i + 2] = OC9_MUL(gpu31::sub(u, v, p.p), tw);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; i += 2) {
                 const u32 u = av[i], v = av[i + 1];
                 av[i] = gpu31::add(u, v, p.p);
-                av[i + 1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+                av[i + 1] = OC9_MUL(gpu31::sub(u, v, p.p), t1);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) sa[ix[i]] = av[i];
@@ -903,7 +937,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const u32 w = gpu31::mont(wa, tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[second * S + lane] = OC9_MUL(gpu31::sub(u, v, p.p), w);
         }
         __syncthreads();
     }
@@ -922,13 +956,13 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
             u32 x0 = sa[i0], x1 = sa[i1], x2 = sa[i2], x3 = sa[i3];
             u32 u = x0, v = x2;
-            x0 = gpu31::add(u, v, p.p); x2 = gpu31::mont(gpu31::sub(u, v, p.p), t2, p);
+            x0 = gpu31::add(u, v, p.p); x2 = OC9_MUL(gpu31::sub(u, v, p.p), t2);
             u = x1; v = x3;
-            x1 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t3, p);
+            x1 = gpu31::add(u, v, p.p); x3 = OC9_MUL(gpu31::sub(u, v, p.p), t3);
             u = x0; v = x1;
-            x0 = gpu31::add(u, v, p.p); x1 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            x0 = gpu31::add(u, v, p.p); x1 = OC9_MUL(gpu31::sub(u, v, p.p), t1);
             u = x2; v = x3;
-            x2 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            x2 = gpu31::add(u, v, p.p); x3 = OC9_MUL(gpu31::sub(u, v, p.p), t1);
             sa[i0] = x0; sa[i1] = x1; sa[i2] = x2; sa[i3] = x3;
         }
         __syncthreads();
@@ -944,7 +978,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[second * S + lane] = OC9_MUL(gpu31::sub(u, v, p.p), w);
         }
         __syncthreads();
     }
@@ -956,6 +990,9 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
     TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
 }
+
+#undef OC9_BF
+#undef OC9_MUL
 
 // inverse DIF low stages in 512-tiles (output: bit-reversed slot order).
 __global__ void __launch_bounds__(256)

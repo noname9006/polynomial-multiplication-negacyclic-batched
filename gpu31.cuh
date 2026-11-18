@@ -783,7 +783,7 @@ struct Device {
     bool tc_fuse_decode = false;
     // TC3 fused NTT pipeline tables
     u32 *d_pk_fwd = nullptr, *d_pk_inv = nullptr, *d_twf = nullptr, *d_twi = nullptr,
-        *d_untw_slot = nullptr;
+        *d_untw_slot = nullptr, *d_shoup_mu = nullptr;   // OC9 Shoup constants
     bool tc_ntt_ready = false, tc_ntt = false;
     bool tc_efl = false;   // TC5: encode fused with fwd low stages
     bool tc_crt2 = false;  // TC15 CRT variant
@@ -1124,7 +1124,7 @@ struct Device {
             if (part == 1) return cudaGetLastError();
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
-                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH);
+                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_shoup_mu);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) cudaEventRecord(ev_[4], stream);
             tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
@@ -1262,6 +1262,14 @@ private:
         upload_u32(d_pk_inv, pi);
         upload_u32(d_twf, tf);
         upload_u32(d_twi, ti);
+        {
+            std::vector<u32> mu(plan_.K);
+            for (unsigned kk = 0; kk < plan_.K; ++kk) {
+                const u64 p = plan_.primes[kk].p;
+                mu[kk] = u32((((u64(1) << 32) - p) << 32) / p);
+            }
+            upload_u32(d_shoup_mu, mu);
+        }
         tc_ntt_ready = d_pk_fwd && d_pk_inv && d_twf && d_twi && d_untw_slot;
     }
     static void upload_words(uint2*& dst, const std::vector<u32>& src) {
@@ -1317,7 +1325,7 @@ private:
         if (d_corr_m) cudaFree(d_corr_m);
         d_corr_m = nullptr;
         d_untw_inv = nullptr;
-        for (u32** pp : {&d_pk_fwd, &d_pk_inv, &d_twf, &d_twi, &d_untw_slot}) {
+        for (u32** pp : {&d_pk_fwd, &d_pk_inv, &d_twf, &d_twi, &d_untw_slot, &d_shoup_mu}) {
             if (*pp) cudaFree(*pp);
             *pp = nullptr;
         }
