@@ -553,59 +553,50 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     __syncthreads();
 
     TCP_T(t1);
-        // 2-3. warps split the n-tiles (nt = warp + 4u); each warp covers all
-        // 32 rows (2 m-tiles) so one B fragment feeds two mma; A from shared.
-        // OC14: each warp processes 4 n-tiles (ntA,ntB,ntC,ntD) instead of 2
-        const unsigned warp = tid >> 5, lane = tid & 31;
-        const unsigned g = lane >> 2, t = lane & 3;
-        const bool odd = t & 1;
-        const unsigned sh = (t & 1) * 16;
-        TCP_T(t2);
-        for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 8) {
-            const unsigned ntA = nt0, ntB = nt0 + 4, ntC = nt0 + 8, ntD = nt0 + 12;
-            const bool hasB = ntB < cfg.NT;
-            const bool hasC = ntC < cfg.NT;
-            const bool hasD = ntD < cfg.NT;
-                        int acc[2][4][4][4];  // [mt][n_tile][frag][4]
-    #pragma unroll
-            for (unsigned mt = 0; mt < 2; ++mt)
-    #pragma unroll
-                for (unsigned ni = 0; ni < 4; ++ni)
-    #pragma unroll
-                    for (unsigned q = 0; q < 4; ++q) acc[mt][ni][q][0] = acc[mt][ni][q][1] = acc[mt][ni][q][2] = acc[mt][ni][q][3] = 0;
-    #pragma unroll 3
-            for (unsigned ks = 0; ks < cfg.KS; ++ks) {
-                const uint2 b0 = frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane];
-                const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
-                const uint2 b2 = hasC ? frag[(std::size_t(ntC) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
-                const uint2 b3 = hasD ? frag[(std::size_t(ntD) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
-    #pragma unroll
-                for (unsigned mt = 0; mt < 2; ++mt) {
-                    const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
-                    const u32* r1 = r0 + 8 * cfg.SA;
-                    const u32 x0 = r0[0], x1 = r1[0], x2 = r0[4], x3 = r1[4];
-                    mma_u8(acc[mt][0][0], x0, x1, x2, x3, b0.x, b0.y);
-                                        if (hasB) mma_u8(acc[mt][1][0], x0, x1, x2, x3, b1.x, b1.y);
-                                        if (hasC) mma_u8(acc[mt][2][0], x0, x1, x2, x3, b2.x, b2.y);
-                                        if (hasD) mma_u8(acc[mt][3][0], x0, x1, x2, x3, b3.x, b3.y);
-                }
+    // 2-3. warps split the n-tiles (nt = warp + 4u); each warp covers all
+    // 32 rows (2 m-tiles) so one B fragment feeds two mma; A from shared.
+    const unsigned warp = tid >> 5, lane = tid & 31;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const bool odd = t & 1;
+    const unsigned sh = (t & 1) * 16;
+    TCP_T(t2);
+    for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 8) {
+        const unsigned ntA = nt0, ntB = nt0 + 4;
+        const bool hasB = ntB < cfg.NT;
+        int acc[2][2][4];
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (unsigned q = 0; q < 2; ++q) acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
+#pragma unroll 3
+        for (unsigned ks = 0; ks < cfg.KS; ++ks) {
+            const uint2 b0 = frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane];
+            const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
+                const u32* r1 = r0 + 8 * cfg.SA;
+                const u32 x0 = r0[0], x1 = r1[0], x2 = r0[4], x3 = r1[4];
+                mma_u8(acc[mt][0], x0, x1, x2, x3, b0.x, b0.y);
+                if (hasB) mma_u8(acc[mt][1], x0, x1, x2, x3, b1.x, b1.y);
             }
-    #pragma unroll
-            for (unsigned mt = 0; mt < 2; ++mt)
-    #pragma unroll
-                for (unsigned ni = 0; ni < 4; ++ni) {
-                    const unsigned nt = (ni == 0) ? ntA : (ni == 1) ? ntB : (ni == 2) ? ntC : ntD;
-                    if (nt >= cfg.NT) continue;
-                    const u64 pg = (u64(u32(acc[mt][ni][0][0])) << sh) + (u64(u32(acc[mt][ni][0][1])) << (sh + 8));
-                                    const u64 pg8 = (u64(u32(acc[mt][ni][0][2])) << sh) + (u64(u32(acc[mt][ni][0][3])) << (sh + 8));
-                    const u64 send = odd ? pg : pg8;
-                    const u64 mine = odd ? pg8 : pg;
-                    const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
-                    const unsigned row = mt * 16 + g + (odd ? 8 : 0);
-                    sX[row * cfg.SX + nt * 2 + (t >> 1)] = tot;
-                }
         }
-        __syncthreads();
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (unsigned q = 0; q < 2; ++q) {
+                if (q == 1 && !hasB) continue;
+                const unsigned nt = q ? ntB : ntA;
+                const u64 pg = (u64(u32(acc[mt][q][0])) << sh) + (u64(u32(acc[mt][q][1])) << (sh + 8));
+                const u64 pg8 = (u64(u32(acc[mt][q][2])) << sh) + (u64(u32(acc[mt][q][3])) << (sh + 8));
+                const u64 send = odd ? pg : pg8;
+                const u64 mine = odd ? pg8 : pg;
+                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                const unsigned row = mt * 16 + g + (odd ? 8 : 0);
+                sX[row * cfg.SX + nt * 2 + (t >> 1)] = tot;
+            }
+    }
+    __syncthreads();
 
     TCP_T(t3);
     // 4. carry + reduce, one thread per coefficient, digits in place over sX
