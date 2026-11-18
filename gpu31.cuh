@@ -1048,6 +1048,14 @@ struct Device {
                 std::fprintf(stderr, " | fh Gcyc=%.2f:", fsum / 1e9);
                 for (int i = 5; i < 10; ++i)
                     std::fprintf(stderr, " %s %.1f%%", nm[i], fsum > 0 ? 100.0 * double(h[i]) / fsum : 0.0);
+                {
+                    const char* en[6] = {"setup", "mma", "epi", "dit", "store", "aload"};
+                    double es = 0;
+                    for (int i = 10; i < 16; ++i) es += double(h[i]);
+                    std::fprintf(stderr, " | efl Gcyc=%.2f:", es / 1e9);
+                    for (int i = 10; i < 16; ++i)
+                        std::fprintf(stderr, " %s %.1f%%", en[i - 10], es > 0 ? 100.0 * double(h[i]) / es : 0.0);
+                }
                 std::fprintf(stderr, "\n");
                 unsigned long long z[16] = {};
                 cudaMemcpyToSymbol(tc::g_tcprof, z, sizeof(z));

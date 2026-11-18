@@ -127,7 +127,8 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 
 // Phase profiling: thread (0,0) of every CTA adds clock64 deltas per phase.
 // Slots: CRT 0 staging, 1 A-load, 2 mma+epilogue, 3 carry/reduce, 4 store;
-//        fused_high 5 load, 6 fwd, 7 pointwise, 8 inverse, 9 store.
+//        fused_high 5 load, 6 fwd, 7 pointwise, 8 inverse, 9 store;
+//        encode_fwdlow 10 setup, 11 mma, 12 epilogue, 13 DIT, 14 store, 15 A-load.
 #ifndef TC12_R4
 #define TC12_R4 1
 #endif
@@ -723,6 +724,8 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     const unsigned g = lane >> 2, t = lane & 3;
     const unsigned rowbase = warp * 32;
 
+    TCP_T(e0);
+    long long pe[5] = {0, 0, 0, 0, 0};
     // A fragments straight from global (rows are bit-reversed coefficients)
     u32 a[2][ENC_KS_MAX][4];
 #pragma unroll
@@ -745,7 +748,10 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     const unsigned sh = (t & 1) * 16;
     const u64 rbase = u64(pair) * K * n;
 
+    TCP_T(e1);
+    TCP_ADD(15, e0, e1);
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
+        TCP_T(g0);
         // twiddles of this group's primes
         for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
             const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
@@ -759,6 +765,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
         }
         __syncthreads();
+        TCP_T(g1);
         int acc[2][EF_NTB][4];
         u32 tw[2][EF_NTB];
 #pragma unroll
@@ -788,6 +795,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                     }
             }
         }
+        TCP_T(g2);
 #pragma unroll
         for (unsigned j = 0; j < EF_NTB; ++j) {
             const unsigned k = (nt0 + j) * 2 + (t >> 1);
@@ -813,6 +821,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             }
         }
         __syncthreads();
+        TCP_T(g3);
 
         // 9 DIT stages on 8 primes: 8*256 butterflies, 4 per thread per stage
         gpu31::Prime pq[4];
@@ -886,13 +895,18 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             __syncthreads();
         }
 #endif
+        TCP_T(g4);
         for (unsigned idx = tid; idx < EF_PR * NT_TILE; idx += blockDim.x) {
             const unsigned q = idx / NT_TILE, pos = idx % NT_TILE;
             const unsigned kk = nt0 * 2 + q;
             if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
         }
         __syncthreads();
+        TCP_T(g5);
+        pe[0] += g1 - g0; pe[1] += g2 - g1; pe[2] += g3 - g2; pe[3] += g4 - g3; pe[4] += g5 - g4;
     }
+    TCP_ADD(10, 0, pe[0]); TCP_ADD(11, 0, pe[1]); TCP_ADD(12, 0, pe[2]);
+    TCP_ADD(13, 0, pe[3]); TCP_ADD(14, 0, pe[4]);
 }
 
 #endif  // __CUDACC__
