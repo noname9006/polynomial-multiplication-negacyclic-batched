@@ -778,6 +778,8 @@ struct Device {
     // Tensor-core encode / CRT (tc.cuh).  Built in the constructor when the
     // point fits; enabled by the caller only after a self-check passes.
     uint2 *d_fenc = nullptr, *d_fcrt = nullptr;
+    u32* d_untw_inv = nullptr;   // mont-form untwist * (P/p)^-1, for fused decode
+    bool tc_fuse_decode = false;
     unsigned enc_KS = 0, enc_NT = 0;
     tc::CrtTc crt_cfg{};
     std::size_t crt_tc_shared = 0;
@@ -926,10 +928,12 @@ struct Device {
         if (st != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[5], stream);
 
-        // 6. untwist / normalize
-        decode<<<dim3((n + 255) / 256, k, B), 256, 0, stream>>>(
-            d_rc, d_primes, d_untwist, n, k);
-        if ((st = cudaGetLastError()) != cudaSuccess) return st;
+        // 6. untwist / normalize (fused into the tensor-core CRT when enabled)
+        if (!(tc_crt && tc_fuse_decode && !skip_crt)) {
+            decode<<<dim3((n + 255) / 256, k, B), 256, 0, stream>>>(
+                d_rc, d_primes, d_untwist, n, k);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+        }
         if (profiling_) cudaEventRecord(ev_[6], stream);
 
         // 7. centered CRT -> canonical [pair][coefficient][limb] output in d_c.
@@ -937,7 +941,8 @@ struct Device {
         // MMA) on d_rc after this pipeline returns.
         if (!skip_crt && tc_crt) {
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
-                          crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg);
+                          crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
+                                                   d_primes, tc_fuse_decode ? d_untw_inv : nullptr);
             st = cudaGetLastError();
         } else if (!skip_crt) {
             reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
@@ -1016,6 +1021,24 @@ private:
             }
             upload_words(d_fcrt, f);
             tc_crt_ready = d_fcrt != nullptr;
+            // fused decode table: decode(r) = r*u*R^-2, term = decode(r)*inv
+            // -> c = mont(u, inv) = u*inv*R^-1, and mont(r, c) = r*u*inv*R^-2.
+            {
+                const unsigned K = plan_.K, N = plan_.N;
+                std::vector<u32> t(std::size_t(K) * N);
+                for (unsigned kk = 0; kk < K; ++kk) {
+                    const Prime& pr = plan_.primes[kk];
+                    const u32 inv_m = plan_.crt_primes[kk].inv;
+                    for (unsigned i = 0; i < N; ++i)
+                        t[std::size_t(kk) * N + i] =
+                            mont(plan_.untwist[std::size_t(kk) * N + i], inv_m, pr);
+                }
+                void* pt = nullptr;
+                if (cudaMalloc(&pt, t.size() * 4) == cudaSuccess &&
+                    cudaMemcpy(pt, t.data(), t.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess)
+                    d_untw_inv = static_cast<u32*>(pt);
+                else { if (pt) cudaFree(pt); cudaGetLastError(); }
+            }
         }
         std::fprintf(stderr, "[TC] enc ready=%d KS=%u NT=%u | crt ready=%d KS=%u NT=%u SA=%u smem=%zu
 ",
@@ -1063,6 +1086,8 @@ private:
         if (d_rc) cudaFree(d_rc);
         if (d_fenc) cudaFree(d_fenc);
         if (d_fcrt) cudaFree(d_fcrt);
+        if (d_untw_inv) cudaFree(d_untw_inv);
+        d_untw_inv = nullptr;
         d_fenc = d_fcrt = nullptr;
         for (int i = 0; i <= kStages; ++i)
             if (ev_[i]) cudaEventDestroy(ev_[i]);

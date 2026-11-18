@@ -696,8 +696,13 @@ void* fherma_init(const fherma::Point& p) {
                         d.tc_crt = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_crt = false;
                     }
-                    std::fprintf(stderr, "[TC] selfcheck enc=%d crt=%d
-", int(d.tc_enc), int(d.tc_crt));
+                    if (d.tc_crt && d.d_untw_inv) {
+                        d.tc_fuse_decode = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_fuse_decode = false;
+                    }
+                    std::fprintf(stderr, "[TC] selfcheck enc=%d crt=%d fuse_decode=%d
+",
+                                 int(d.tc_enc), int(d.tc_crt), int(d.tc_fuse_decode));
                 }
 
                 // Try the conflict-free CRT, keeping it only if bit-identical to

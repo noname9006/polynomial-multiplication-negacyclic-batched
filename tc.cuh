@@ -233,7 +233,8 @@ inline std::size_t crt_tc_smem(const CrtTc& c) {
 
 __global__ void __launch_bounds__(128)
 crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
-       const uint2* __restrict__ frag, CrtTc cfg) {
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::size_t abytes = std::size_t(CRT_ROWS) * cfg.SA * 4;
     {
@@ -259,9 +260,15 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     // 1. terms, correction sum
     double dsum = 0;
     for (unsigned j = jg; j < K; j += 2) {
-        const u32 r = active ? residues[rbase + u64(j) * n + i] : 0;
         const gpu31::PrimeInfo pi = pl.primes[j];
-        const u32 term = gpu31::weight_residue(r, pi);
+        u32 term = 0;
+        if (active) {
+            const u32 r = residues[rbase + u64(j) * n + i];
+            if (untw_inv)   // fused decode: one Montgomery product by untwist*inv
+                term = gpu31::mont(r, untw_inv[u64(j) * n + i], primes[j]);
+            else
+                term = gpu31::weight_residue(r, pi);
+        }
         sA[c * cfg.SA + j] = term;
         dsum += double(term) * pi.reciprocal;
     }
