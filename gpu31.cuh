@@ -400,7 +400,31 @@ struct Plan {
 
         // Every prime > 2^30, so P > 2^(30K) >= 16*N*2^(2W): the centered CRT is
         // unambiguous with a wide margin.  K from the reference verbatim.
+#ifndef TC24_TIGHT_K
+#define TC24_TIGHT_K 1
+#endif
+#if TC24_TIGHT_K
+        // TC24: primes sit just below 2^31 (~30.99 bits each), so pick primes
+        // until their product has 2W + logN + 5 bits (build_crt demands
+        // 2W + logN + 3); the 30-bit formula below over-provisions ~4 primes.
+        K = 0;
+        {
+            const double need = 2.0 * W + logN + 5.0;
+            double have = 0;
+            u32 q = ((u32(1) << 31) - 2) / (2 * N) * (2 * N) + 1;
+            while (have < need) {
+                while (q > (1u << 30) && !host_is_prime(q)) q -= 2 * N;
+                if (q <= (1u << 30)) break;
+                have += std::log2(double(q));
+                ++K;
+                q -= 2 * N;
+            }
+            const unsigned classic = (2 * W + logN + 4 + 29) / 30;
+            if (have < need || K > classic) K = classic;
+        }
+#else
         K = (2 * W + logN + 4 + 29) / 30;
+#endif
         u32 p = ((u32(1) << 31) - 2) / (2 * N) * (2 * N) + 1;
         for (unsigned k = 0; k < K; ++k) {
             while (p > (1u << 30) && !host_is_prime(p)) p -= 2 * N;
