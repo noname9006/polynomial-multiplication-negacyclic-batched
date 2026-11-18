@@ -708,7 +708,7 @@ void* fherma_init(const fherma::Point& p) {
                         d.tc_efl = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_efl = false;
                     }
-                    if (d.tc_ntt && d.cs_[0]) {
+                    if (false && d.tc_ntt && d.cs_[0]) {   // TC8 chunk: measured slower (60.4 vs ~55.7 ms)
                         d.tc_chunk = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_chunk = false;
                     }
