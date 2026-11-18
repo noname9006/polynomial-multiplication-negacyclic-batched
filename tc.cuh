@@ -147,6 +147,33 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC20_R8
 #define TC20_R8 1
 #endif
+
+// OC24 (agent A, task 3): pipeline the input-A load with the tensor-core MMA.
+// A's bytes are fetched with cp.async into a 2-buffer shared staging area one
+// (mt,ks) chunk at a time; cp.async.wait_group gates each chunk before it is
+// copied into the same a[2][ENC_KS_MAX][4] registers (no extra registers, no
+// change to __launch_bounds__(512,1) or the number of active threads).
+// Flag OC24_ALOAD=0 restores the exact original eager-load path.
+#ifndef OC24_ALOAD
+#define OC24_ALOAD 1
+#endif
+#if OC24_ALOAD
+// cp.async 4-byte copy: generic pointer -> shared via PTX cvta (no intrinsic
+// dependency, so the nvsyntax shim needs no changes).
+__device__ __forceinline__ void cp_async4(u32* dst, const u32* src) {
+    asm volatile("{\n\t"
+                 ".reg .u32 smem_ptr;\n\t"
+                 "cvta.to.shared.u32 smem_ptr, %0;\n\t"
+                 "cp.async.ca.shared.global [smem_ptr], [%1], 4;\n\t"
+                 "}\n" :: "l"(dst), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+template<unsigned N> __device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+#endif
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -1399,6 +1426,12 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     __shared__ u32 sT[EF_PR][EF_PT];
     __shared__ u32 sR[EF_PR][TC_LT];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
+#if OC24_ALOAD
+    // Two staging buffers for one (mt,ks) chunk of A bytes: 2*2*512*4 words
+    // = 32 KB.  Total static shared = 40.4 + 32 = 72.4 KB, fits the 1 CTA/SM
+    // occupancy of __launch_bounds__(512,1) on sm_80+ (Ada: 100 KB/SM).
+    __shared__ u32 sA[2][2][512][4];
+#endif
     const u32* src = blockIdx.y ? src_b : src_a;
     u32* dst = blockIdx.y ? rb : ra;
     const unsigned pair = blockIdx.z;
@@ -1413,6 +1446,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     long long pe[5] = {0, 0, 0, 0, 0};
     // A fragments straight from global (rows are bit-reversed coefficients)
     u32 a[2][ENC_KS_MAX][4];
+#if !OC24_ALOAD
 #pragma unroll
     for (unsigned mt = 0; mt < 2; ++mt) {
         const unsigned i0 = start + rowbase + mt * 16 + g, i1 = i0 + 8;
@@ -1428,6 +1462,37 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             a[mt][ks][3] = (on && w1 < l) ? r1[w1] : 0u;
         }
     }
+#else
+    // OC24: the chunks are fetched with cp.async inside the first group's
+    // ks loop (below), so each next chunk is loaded while the current one
+    // is consumed by the MMA.  No eager load here.
+    auto aload_chunk = [&](unsigned ks, unsigned buf) {
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt) {
+            const unsigned i0 = start + rowbase + mt * 16 + g, i1 = i0 + 8;
+            const u32* r0 = src + base + u64(__brev(i0) >> (32 - logN)) * l;
+            const u32* r1 = src + base + u64(__brev(i1) >> (32 - logN)) * l;
+            const unsigned w0 = ks * 8 + t, w1 = w0 + 4;
+            const bool on0 = ks < KS && w0 < l, on1 = ks < KS && w1 < l;
+            cp_async4(&sA[buf][mt][tid][0], on0 ? r0 + w0 : src);
+            cp_async4(&sA[buf][mt][tid][1], on0 ? r1 + w0 : src);
+            cp_async4(&sA[buf][mt][tid][2], on1 ? r0 + w1 : src);
+            cp_async4(&sA[buf][mt][tid][3], on1 ? r1 + w1 : src);
+        }
+        cp_async_commit();
+    };
+    auto astore_chunk = [&](unsigned ks, unsigned buf) {
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt) {
+            const unsigned w0 = ks * 8 + t, w1 = w0 + 4;
+            const bool on0 = ks < KS && w0 < l, on1 = ks < KS && w1 < l;
+            a[mt][ks][0] = on0 ? sA[buf][mt][tid][0] : 0u;
+            a[mt][ks][1] = on0 ? sA[buf][mt][tid][1] : 0u;
+            a[mt][ks][2] = on1 ? sA[buf][mt][tid][2] : 0u;
+            a[mt][ks][3] = on1 ? sA[buf][mt][tid][3] : 0u;
+        }
+    };
+#endif
 
     const bool odd = t & 1;
     const unsigned sh = (t & 1) * 16;
@@ -1504,8 +1569,20 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned i = start + rowbase + mt * 16 + g + (odd ? 8 : 0);
                 tw[mt][j] = (rtwist && k < K) ? rtwist[u64(k) * n + i] : 0u;
             }
+#if OC24_ALOAD
+        // Only the first group needs to fetch A: its 7 chunks are pipelined
+        // while its own MMA runs; later groups reuse the registers.
+        if (nt0 == 0) aload_chunk(0, 0);
+#endif
 #pragma unroll
         for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
+#if OC24_ALOAD
+            if (nt0 == 0) {
+                if (ks + 1 < ENC_KS_MAX) aload_chunk(ks + 1, (ks + 1) & 1);
+                if (ks + 1 < ENC_KS_MAX) cp_async_wait<1>(); else cp_async_wait<0>();
+                astore_chunk(ks, ks & 1);
+            }
+#endif
             if (ks < KS) {
                 uint2 b[EF_NTB];
 #pragma unroll
