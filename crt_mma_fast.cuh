@@ -44,10 +44,10 @@ using u64 = std::uint64_t;
 
 static constexpr unsigned MF_MAXL      = 128;
 static constexpr unsigned MF_MAXPITCH  = 128;   // pitch=119 at the ranked point
-static constexpr unsigned MF_M_COEF    = 32;                // coefs / CTA
-static constexpr unsigned MF_WARPS     = MF_M_COEF / 4;     // 8
-static constexpr unsigned MF_THREADS   = MF_WARPS * 32;     // 256
-static constexpr unsigned MF_TS        = MF_M_COEF + 1;     // 33, ODD
+static constexpr unsigned MF_M_COEF    = 16;                // coefs / CTA
+static constexpr unsigned MF_WARPS     = MF_M_COEF / 4;     // 4
+static constexpr unsigned MF_THREADS   = MF_WARPS * 32;     // 128
+static constexpr unsigned MF_TS        = MF_M_COEF + 1;     // 17, ODD
 static constexpr unsigned MF_ACC_WORDS = MF_WARPS * 2u * 4u * 4u * 4u;
 static constexpr unsigned MF_JG        = (MF_MAXPITCH + 3) / 4;  // 128 j-groups
 
@@ -199,8 +199,10 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
 
     extern __shared__ unsigned char smem[];
     u32* terms = reinterpret_cast<u32*>(smem);                       // pitch * 33
-    u32* ap = reinterpret_cast<u32*>(terms + std::size_t(pitch) * MF_TS);  // 4 * jgroups * 32
-    u64* low = reinterpret_cast<u64*>(ap + 4ull * MF_JG * MF_M_COEF);
+    u32* ap = reinterpret_cast<u32*>(terms + std::size_t(pitch) * MF_TS);  // 4 * jgroups * 16
+    // one u32 of padding: 8092 + 8192 = 16284 is only 4-byte aligned, low[]
+    // must be 8-byte aligned for u64 shared accesses.
+    u64* low = reinterpret_cast<u64*>(ap + 4ull * MF_JG * MF_M_COEF + 1u);
     u64* high = low + std::size_t(l) * MF_TS;
     int* acc = reinterpret_cast<int*>(high + std::size_t(l) * MF_TS);
 
@@ -319,7 +321,7 @@ __global__ void crt_mma_fast_kernel(CrtArgs plan, const u32* residues,
 // ---- shared-bytes calculator ----------------------------------------------
 inline std::size_t shared_bytes(unsigned l, unsigned pitch) {
     return std::size_t(pitch) * MF_TS * sizeof(u32)
-         + 4ull * MF_JG * MF_M_COEF * sizeof(u32)
+         + (4ull * MF_JG * MF_M_COEF + 1u) * sizeof(u32)   // +1 u32 alignment pad
          + 2ull * std::size_t(l) * MF_TS * sizeof(u64)
          + MF_ACC_WORDS * sizeof(int);
 }
