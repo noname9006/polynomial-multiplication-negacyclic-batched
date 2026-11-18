@@ -137,6 +137,9 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC19_PF
 #define TC19_PF 1
 #endif
+#ifndef TC20_R8
+#define TC20_R8 1
+#endif
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -1234,6 +1237,41 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
             }
             __syncthreads();
+        }
+#elif TC20_R8
+        // TC20: radix-8 DIT - stage triples (0,1,2),(3,4,5),(6,7,8): 3 shared
+        // passes.  8 primes x 64 groups = 512 groups, one per thread.  Group =
+        // positions x0 + e*H (e=0..7, x0 = blk*8H + w); stage m+s pairs
+        // (e, e+2^s) for bit s of e clear, twiddle index j = w + (e mod 2^s)*H.
+        {
+            const unsigned q = tid >> 6, gi = tid & 63;
+            const unsigned kk = nt0 * 2 + q;
+            const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
+            u32* row = sT[q];
+            const u32* tw8 = sR[q];
+#pragma unroll
+            for (unsigned m = 0; m < 9; m += 3) {
+                const unsigned H = 1u << m;
+                const unsigned w = gi & (H - 1);
+                const unsigned x0 = (gi - w) * 8 + w;
+                u32 v[8];
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) v[e] = row[padw(x0 + e * H)];
+#pragma unroll
+                for (unsigned st = 0; st < 3; ++st) {
+                    const unsigned span = 1u << st;
+#pragma unroll
+                    for (unsigned e = 0; e < 8; ++e) {
+                        if (e & span) continue;
+                        const unsigned j = w + (e & (span - 1)) * H;
+                        const u32 tw = tw8[j << (8 - (m + st))];
+                        gpu31::butterfly(v[e], v[e + span], tw, pr8);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) row[padw(x0 + e * H)] = v[e];
+                __syncthreads();
+            }
         }
 #elif TC16_R4
         // TC16: radix-4 DIT - stage pairs (0,1),(2,3),(4,5),(6,7) then 8.
