@@ -171,6 +171,16 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC12_R4
 #define TC12_R4 1
 #endif
+// OC26 (parallel branch): carry propagation in crt_tc2 phase 4.  The current
+// path runs the NT*2-word carry chain on one thread per row (32 of 128 active);
+// this variant splits each row's chain into four contiguous segments handled
+// by four threads and has one owner thread propagate the four segment carries
+// through a separate digit buffer in the dead sA region.  Flag 0 is a bit-exact
+// copy of the original path.  No change to shared size (sA is dead here) and
+// no inline asm / shfl, so the OC23 ptxas and OC13 mask pitfalls do not apply.
+#ifndef OC26_CARRY
+#define OC26_CARRY 1
+#endif
 
 // OC8 (parallel branch): radix-8 high stages in fused_high - three DIT/DIF
 // stages per shared round trip (s, s+1, s+2), plus radix-2 tail stages.
@@ -525,6 +535,69 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     TCP_ADD(3, t3, t4); TCP_ADD(4, t4, t5);
 }
 
+// OC26: parallel carry propagation helper (device-only).  The four cooperate
+// threads of a row each scan one contiguous segment of u64 addends into a
+// separate digit buffer (in the dead sA region); a row owner then propagates
+// the four segment carries.  cout[] holds the u64 outgoing carry of each
+// segment; bit 63 is set when a segment contains a huge (>= 2^48) addend,
+// in which case the owner replays the whole chain exactly (u64 wrap in the
+// local running sum would otherwise lose high bits).  All barriers are
+// uniform: every one of the 128 threads reaches both __syncthreads.
+#if OC26_CARRY
+__device__ __forceinline__ void oc26_carry_row(
+        const u64* __restrict__ xs, u32* __restrict__ dg, u64* __restrict__ cout,
+        unsigned words, unsigned l2) {
+    const unsigned seg = threadIdx.x & 3;           // segment 0..3
+    const unsigned row = threadIdx.x >> 2;          // owner row 0..31
+    const unsigned base = words >> 2, rem = words & 3;
+    const unsigned a0 = seg * base + (seg < rem ? seg : rem);
+    const unsigned len = base + (seg < rem ? 1u : 0u);
+    u64 run = 0, big = 0;
+    for (unsigned j = 0; j < len; ++j) {
+        const u64 x = xs[a0 + j];
+        const u64 t = run + x;
+        dg[a0 + j] = u32(t);
+        run = t >> 32;
+        big |= x >> 48;
+    }
+    cout[row * 4 + seg] = run | (big ? (u64(1) << 63) : u64(0));
+    __syncthreads();
+    if (seg != 0) return;                          // seg 0 owns its row
+    u64 cin = 0;
+    bool replay = false;
+    for (unsigned s = 0; s < 4; ++s) replay |= (cout[row * 4 + s] >> 63) != 0;
+    if (replay) {
+        // Rare exact fallback: extreme u64 addends where the local "carry"
+        // recurrence is not a small integer.  Serial but correct; length is
+        // only `words` (56 in the production config).
+        u64 carry = 0;
+        for (unsigned w = 0; w < words; ++w) {
+            carry += xs[w];
+            dg[w] = u32(carry);
+            carry >>= 32;
+        }
+        cin = carry;
+    } else {
+        for (unsigned s = 0; s < 4; ++s) {
+            const unsigned a = s * base + (s < rem ? s : rem);
+            u64 delta = cin;
+            if (delta) {
+                for (unsigned j = 0; j < base + (s < rem ? 1u : 0u) && delta; ++j) {
+                    const u64 sum = u64(dg[a + j]) + u32(delta);
+                    dg[a + j] = u32(sum);
+                    delta = (delta >> 32) + (sum >> 32);
+                }
+            }
+            cin = cout[row * 4 + s] + delta;
+        }
+    }
+    for (unsigned w = words; w < l2; ++w) {
+        dg[w] = u32(cin);
+        cin >>= 32;
+    }
+}
+#endif // OC26_CARRY
+
 // TC15 CRT variant: 32 rows/CTA, warps split n-tiles, B reused by 2 m-tiles.
 __global__ void __launch_bounds__(128, 3)
 crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
@@ -652,8 +725,30 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     __syncthreads();
 
     TCP_T(t3);
-    // 4. carry + reduce, one thread per coefficient, digits in place over sX
+    // 4. carry + reduce.  OC26_CARRY=0: exact original path (one thread per
+    // row, digits in place over sX).  OC26_CARRY=1: four threads per row,
+    // separate digit buffer in the dead sA region, owner propagates carries.
     const unsigned DS = 2 * cfg.SX;
+#if OC26_CARRY
+    u32* digits = reinterpret_cast<u32*>(sA);   // separate from xs (no race)
+    {
+        const unsigned words = cfg.NT * 2;
+        // sA is 32*SA*4 bytes; digits need 32*DS*4 = 32*2*SX*4 bytes.  With
+        // SA >= 2*SX in all configs (SA=124, SX=57), this fits; cout[] lives
+        // in the tail of the same sA region beyond the digit buffer.
+        u64* cout = reinterpret_cast<u64*>(digits + CRT2_ROWS * DS);
+        const unsigned row = tid >> 2;
+        oc26_carry_row(sX + row * cfg.SX, digits + row * DS, cout,
+                       words, l + 2);
+        // oc26_carry_row contains the only __syncthreads of this phase; it is
+        // reached by all 128 threads, so the barrier is uniform.
+        if (row < CRT2_ROWS) {
+            u32* dg = digits + row * DS;
+            gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
+        }
+    }
+    __syncthreads();
+#else
     u32* digits = reinterpret_cast<u32*>(sX);
     if (tid < CRT2_ROWS) {
         u32* dg = digits + tid * DS;
@@ -672,6 +767,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
     }
     __syncthreads();
+#endif
 
     TCP_T(t4);
     // 5. store the tile's rows
