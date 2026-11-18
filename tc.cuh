@@ -512,25 +512,56 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_T(t0);
         // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
         u64 fsum = 0;
+        // OC_staging_coalesced: each thread processes 2 adjacent coefficients (i, i+1)
+        // enabling 64-bit coalesced loads from residues/untw_inv arrays
+        const unsigned c2 = c & ~1u;  // even coefficient index within CTA
+        const bool active2 = c2 < CRT2_ROWS && (start + c2 + 1) < n;
         if (untw_inv && K <= CRT_KMAX_C) {
-            // TC11: batched loads (8 independent residue+untwist pairs in flight),
+            // TC11 + OC_staging_coalesced: batched loads (8 independent residue+untwist pairs in flight),
             // prime and correction constants from __constant__ (warp-uniform j).
+            // Each thread processes 2 coefficients for coalesced 64-bit loads.
     #pragma unroll 1
             for (unsigned j0 = jg; j0 < K; j0 += 8 * NG) {
-                u32 r[8], u[8];
+                u32 r[8][2], u[8][2];
     #pragma unroll
                 for (unsigned q = 0; q < 8; ++q) {
                     const unsigned j = j0 + NG * q;
-                    r[q] = (j < K && active) ? residues[rbase + u64(j) * n + i] : 0u;
-                    u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
+                    if (j < K) {
+                        if (active2) {
+                            // Coalesced 64-bit load for 2 adjacent coefficients
+                            const u64 r_pair = *reinterpret_cast<const u64*>(&residues[rbase + u64(j) * n + start + c2]);
+                            const u64 u_pair = (TC22_MERGED && slot_logN) ? 0u : *reinterpret_cast<const u64*>(&untw_inv[u64(j) * n + start + c2]);
+                            r[q][0] = u32(r_pair);
+                            r[q][1] = u32(r_pair >> 32);
+                            u[q][0] = u32(u_pair);
+                            u[q][1] = u32(u_pair >> 32);
+                        } else if (active && c2 < CRT2_ROWS) {
+                            // Boundary: only first coefficient valid
+                            r[q][0] = residues[rbase + u64(j) * n + i];
+                            r[q][1] = 0u;
+                            u[q][0] = (TC22_MERGED && slot_logN) ? 0u : untw_inv[u64(j) * n + i];
+                            u[q][1] = 0u;
+                        } else {
+                            r[q][0] = r[q][1] = 0u;
+                            u[q][0] = u[q][1] = 0u;
+                        }
+                    } else {
+                        r[q][0] = r[q][1] = 0u;
+                        u[q][0] = u[q][1] = 0u;
+                    }
                 }
     #pragma unroll
                 for (unsigned q = 0; q < 8; ++q) {
                     const unsigned j = j0 + NG * q;
                     if (j < K) {
-                        const u32 term = gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
-                        sA[c * cfg.SA + j] = term;
-                        fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                        const u32 term0 = gpu31::mont(r[q][0], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q][0], c_crt_prime[j]);
+                        sA[c2 * cfg.SA + j] = term0;
+                        fsum += (u64(term0) * c_crt_corr[j]) >> 30;
+                        if (c2 + 1 < CRT2_ROWS && start + c2 + 1 < n) {
+                            const u32 term1 = gpu31::mont(r[q][1], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q][1], c_crt_prime[j]);
+                            sA[(c2 + 1) * cfg.SA + j] = term1;
+                            fsum += (u64(term1) * c_crt_corr[j]) >> 30;
+                        }
                     }
                 }
             }
