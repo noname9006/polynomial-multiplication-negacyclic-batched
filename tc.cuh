@@ -32,6 +32,14 @@
 #define TC10_SHUF 0   // OC2 measured slower: encode 24.4 -> 26.2 ms
 #endif
 
+// Agent B, inv_crt phase-A variant (b): split the first cluster barrier into
+// arrive.relaxed + a wait.acquire deferred to just before the first DSMEM
+// store, so the cluster-wide wait shadows the local inverse-NTT work.
+// 0 (default) keeps the original full cl_sync.  Second cl_sync unchanged.
+#ifndef INVCRT_SPLIT_SYNC
+#define INVCRT_SPLIT_SYNC 0
+#endif
+
 namespace tc {
 
 using u32 = std::uint32_t;
@@ -1746,6 +1754,18 @@ __device__ __forceinline__ unsigned cl_rank() {
 __device__ __forceinline__ void cl_sync() {
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
+// INVCRT_SPLIT_SYNC: split the first cluster barrier without breaking its
+// release/acquire ordering.  arrive.release keeps the sA zero-init visible to
+// remote CTAs (a relaxed arrive would race: zeroes could clobber already-
+// stored terms where j0 >= K+1); only wait.acquire is deferred to just before
+// the first DSMEM store.  Still hides most of the cluster wait behind the
+// local inverse-NTT work.
+__device__ __forceinline__ void cl_arrive_release() {
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+}
+__device__ __forceinline__ void cl_wait_acquire() {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
 __device__ __forceinline__ void st_cluster4(const u32* local, unsigned rank, u32 a, u32 b, u32 c, u32 d) {
     const u32 ad = u32(__cvta_generic_to_shared(local));
     u32 ra;
@@ -1770,12 +1790,19 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
     const unsigned start = tile * NT_TILE + rank * ROWS;
     const unsigned W = cfg.KS * 8;
 
+    TCP_T(z0);   // g_tcprof[15]: zero-init + first cluster sync
     if (W > K + 1)
     for (unsigned idx = tid; idx < ROWS * (W - K - 1); idx += NTH) {
         const unsigned r = idx / (W - K - 1), j = K + 1 + idx % (W - K - 1);
         sA[r * cfg.SA + j] = 0u;
     }
+#if INVCRT_SPLIT_SYNC
+    cl_arrive_release();  // variant (b): release kept, wait deferred to first DSMEM store
+#else
     cl_sync();   // all CTAs of the cluster running before DSMEM stores
+#endif
+    TCP_T(z1);
+    TCP_ADD(15, z0, z1);
 
     // ---- Phase A
     {
@@ -1844,6 +1871,9 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
             if (q == 3) {
                 const unsigned j0 = j - 3;
                 if (j0 + 4 <= W) {
+#if INVCRT_SPLIT_SYNC
+                    cl_wait_acquire();  // variant (b): wait shadows the inverse-NTT work above
+#endif
                     st_cluster4(sA + w0 * cfg.SA + j0, o0, k0[0], k0[1], k0[2], k0[3]);
                     st_cluster4(sA + w1 * cfg.SA + j0, o1, k1[0], k1[1], k1[2], k1[3]);
                 }
@@ -1851,8 +1881,11 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
             c0 = n0; c1 = n1; cw0 = nw0; cw1 = nw1;
             __syncthreads();   // sa/sr reused next iteration
         }
+        TCP_T(a1);
     }
     cl_sync();
+    TCP_T(c1);
+    TCP_ADD(0, z1, c1);        // phase A + 2nd cluster sync (inverse NTT + DSMEM stores)
 
     // ---- Phase B: v = round(sum term_j/p_j), 8 threads/row
     {
@@ -1866,6 +1899,8 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         if (q == 0) sA[row * cfg.SA + K] = u32((fsum + (u64(1) << 31)) >> 32);
     }
     __syncthreads();
+    TCP_T(b1);
+    TCP_ADD(1, c1, b1);        // phase B (fsum / correction)
 
     // ---- Phase C: GEMM, warps split n-tiles, MT m-tiles per B fragment
     {
@@ -1911,6 +1946,8 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         }
     }
     __syncthreads();
+    TCP_T(g1);
+    TCP_ADD(2, b1, g1);        // phase C (GEMM)
 
     // ---- Phase D: carry + reduce
     const unsigned DS = 2 * cfg.SX;
@@ -1932,6 +1969,8 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
     }
     __syncthreads();
+    TCP_T(d1);
+    TCP_ADD(3, g1, d1);        // phase D (carry + reduce)
 
     // ---- Phase E: store
     const u64 obase = u64(pair) * n * l;
@@ -1940,6 +1979,8 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         const unsigned pos = __brev(start + r) >> (32 - logN);
         out[obase + u64(pos) * l + cc] = digits[r * DS + cc];
     }
+    TCP_T(e1);
+    TCP_ADD(4, d1, e1);        // phase E (store)
 }
 #endif
 
