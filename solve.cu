@@ -31,6 +31,7 @@
 #include "polymul_gpu.cuh"
 #if !defined(PGPU_HOST_CHECK)
 #include "gpu31.cuh"
+#include "crt_barrier.cuh"
 #include "crt_mma.cuh"
 #endif
 #endif
@@ -106,9 +107,11 @@ struct State {
     // the older 62-bit pgpu path stays compiled as a fallback but is untouched.
 #if !defined(PGPU_HOST_CHECK)
     std::unique_ptr<gpu31::Device> gpu31_dev;
+    std::unique_ptr<crt_barrier::CrtBarrierPlan> crt_barrier_plan;
     std::unique_ptr<crt_mma::CrtMmaPlan> crt_mma_plan;
     bool gpu31_ok = false;
-    bool crt_mma_ok = false;  // fixed CRT proved identical to the reference CRT
+    bool crt_barrier_ok = false;  // barrier-reduced CRT proved identical
+    bool crt_mma_ok = false;      // fixed CRT proved identical to the reference CRT
 #endif
 
     bool gpu_ok = false;           // the device path is trusted for this point
@@ -639,21 +642,35 @@ void* fherma_init(const fherma::Point& p) {
                 state->d_resa = nullptr;
                 state->d_resb = nullptr;
 
-                // Try the conflict-free CRT, keeping it only if bit-identical to
-                // the reference CRT on deterministic residue data.
+                // Try barrier-reduced CRT first, then conflict-free CRT as fallback.
                 const auto& pl = state->gpu31_dev->plan();
                 try {
-                    state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
+                    state->crt_barrier_plan = std::make_unique<crt_barrier::CrtBarrierPlan>(
                         pl.crt_weights, pl.L, pl.K + 1);
-                    crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
-                    state->crt_mma_ok = crt_vs_reference(
+                    crt_barrier::CrtBarrierPlan* p = state->crt_barrier_plan.get();
+                    state->crt_barrier_ok = crt_vs_reference(
                         *state,
-                        [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
-                            return p_plan->run(r, o, a, b, s);
+                        [p](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                            return p->run(r, o, a, b, s);
                         },
-                        2, "CRT");
+                        2, "barrierCRT");
                 } catch (const std::exception& e) {
-                    std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
+                    std::fprintf(stderr, "polymul: barrierCRT setup failed: %s\n", e.what());
+                }
+                if (!state->crt_barrier_ok) {
+                    try {
+                        state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
+                            pl.crt_weights, pl.L, pl.K + 1);
+                        crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
+                        state->crt_mma_ok = crt_vs_reference(
+                            *state,
+                            [p_plan](const u32* r, u32* o, const auto& a, u32 b, cudaStream_t s) {
+                                return p_plan->run(r, o, a, b, s);
+                            },
+                            2, "CRT");
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
+                    }
                 }
             }
         } catch (const std::exception& e) {
@@ -706,10 +723,15 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 #if !defined(PGPU_HOST_CHECK)
             if (s->gpu31_ok) {
                 const u32 Bc = static_cast<u32>(B);
+                const bool use_barrier = s->crt_barrier_ok && s->crt_barrier_plan != nullptr;
                 const bool use_mma = s->crt_mma_ok && s->crt_mma_plan != nullptr;
                 ok = s->gpu31_dev->run(s->d_a, s->d_b, s->d_c, Bc, s->stream,
-                                       /*skip_crt=*/use_mma) == cudaSuccess;
-                if (ok && use_mma)
+                                       /*skip_crt=*/(use_barrier || use_mma)) == cudaSuccess;
+                if (ok && use_barrier)
+                    ok = s->crt_barrier_plan->run(s->gpu31_dev->residues_device(), s->d_c,
+                                                  s->gpu31_dev->crt_args(), Bc, s->stream)
+                         == cudaSuccess;
+                else if (ok && use_mma)
                     ok = s->crt_mma_plan->run(s->gpu31_dev->residues_device(), s->d_c,
                                               s->gpu31_dev->crt_args(), Bc, s->stream)
                          == cudaSuccess;
