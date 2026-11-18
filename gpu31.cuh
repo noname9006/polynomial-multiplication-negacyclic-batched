@@ -750,6 +750,10 @@ __global__ void reconstruct_kernel(CrtArgs plan, const u32* residues, u32* out) 
     }
 }
 
+}  // namespace gpu31
+#include "tc.cuh"
+namespace gpu31 {
+
 // ===========================================================================
 // 4. Host-side Device: uploads tables once, owns scratch, launches the pipeline
 // ===========================================================================
@@ -770,6 +774,15 @@ struct Device {
 
     // per-pair scratch, sized for capacity_ pairs
     u32 *d_ra = nullptr, *d_rb = nullptr, *d_rc = nullptr;
+
+    // Tensor-core encode / CRT (tc.cuh).  Built in the constructor when the
+    // point fits; enabled by the caller only after a self-check passes.
+    uint2 *d_fenc = nullptr, *d_fcrt = nullptr;
+    unsigned enc_KS = 0, enc_NT = 0;
+    tc::CrtTc crt_cfg{};
+    std::size_t crt_tc_shared = 0;
+    bool tc_enc_ready = false, tc_crt_ready = false;
+    bool tc_enc = false, tc_crt = false;
 
     // Per-stage timing (diagnostic). 8 events bracket the 7 pipeline stages.
     static constexpr int kStages = 7;
@@ -830,6 +843,7 @@ struct Device {
                 throw std::runtime_error("gpu31: cannot query device properties");
             if (crt_shared_ > prop.sharedMemPerBlock)
                 throw std::runtime_error("gpu31: CRT tile exceeds shared memory capacity");
+            build_tc(prop);
             for (int i = 0; i <= kStages; ++i)
                 if (cudaEventCreate(&ev_[i]) != cudaSuccess) break;
             profiling_ = (ev_[kStages] != nullptr);
@@ -864,6 +878,14 @@ struct Device {
         cudaError_t st = cudaSuccess;
         if (profiling_) cudaEventRecord(ev_[0], stream);
 
+        if (tc_enc) {
+            // 1+2. tensor-core encode reads bit-reversed rows directly.
+            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 128, 0, stream>>>(
+                d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                n, l, k, logN, enc_KS, enc_NT);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (profiling_) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream); }
+        } else {
         // 1. bit-reverse coefficient positions in the pair's a/b arrays (in place)
         reindex<<<dim3((n + reindex_rows - 1) / reindex_rows, 1, B),
                   dim3(warp_size, reindex_rows), 0, stream>>>(
@@ -880,6 +902,7 @@ struct Device {
             d_a, d_b, d_ra, d_rb, d_primes, d_weights, d_reversed_twist, n, l, k);
         if ((st = cudaGetLastError()) != cudaSuccess) return st;
         if (profiling_) cudaEventRecord(ev_[2], stream);
+        }
 
         // 3. forward NTT of both operands
         if (ntt_hook_)
@@ -912,7 +935,11 @@ struct Device {
         // 7. centered CRT -> canonical [pair][coefficient][limb] output in d_c.
         // When skip_crt is set, the caller runs an external CRT (e.g. tensor-core
         // MMA) on d_rc after this pipeline returns.
-        if (!skip_crt) {
+        if (!skip_crt && tc_crt) {
+            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
+                          crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg);
+            st = cudaGetLastError();
+        } else if (!skip_crt) {
             reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
                                  dim3(crt_tile_x, crt_tile_y), crt_shared_, stream>>>(
                 crt_args_, d_rc, d_c);
@@ -961,6 +988,50 @@ struct Device {
     }
 
 private:
+    void build_tc(const cudaDeviceProp& prop) {
+        if (prop.major < 8) return;
+        std::vector<u32> ps;
+        for (const Prime& pr : plan_.primes) ps.push_back(pr.p);
+        if (plan_.L <= 8 * tc::ENC_KS_MAX) {
+            std::vector<u32> f = tc::bake_encode(ps, plan_.L, enc_KS, enc_NT);
+            upload_words(d_fenc, f);
+            tc_enc_ready = d_fenc != nullptr;
+        }
+        const unsigned pitch = plan_.K + 1;
+        if (pitch <= 8 * tc::CRT_KS_MAX) {
+            unsigned ks = 0, nt = 0;
+            std::vector<u32> f = tc::bake_crt(plan_.crt_weights, plan_.L, pitch, ks, nt);
+            crt_cfg.KS = ks;
+            crt_cfg.NT = nt;
+            crt_cfg.SA = tc::crt_sa_stride(ks);
+            crt_cfg.SX = 2 * nt + 1;
+            crt_cfg.DS = (plan_.L + 2) | 1u;
+            crt_tc_shared = tc::crt_tc_smem(crt_cfg);
+            if (crt_tc_shared > 48 * 1024) {
+                if (cudaFuncSetAttribute(tc::crt_tc, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         int(crt_tc_shared)) != cudaSuccess) {
+                    cudaGetLastError();
+                    return;
+                }
+            }
+            upload_words(d_fcrt, f);
+            tc_crt_ready = d_fcrt != nullptr;
+        }
+        std::fprintf(stderr, "[TC] enc ready=%d KS=%u NT=%u | crt ready=%d KS=%u NT=%u SA=%u smem=%zu
+",
+                     int(tc_enc_ready), enc_KS, enc_NT, int(tc_crt_ready), crt_cfg.KS, crt_cfg.NT,
+                     crt_cfg.SA, crt_tc_shared);
+    }
+    static void upload_words(uint2*& dst, const std::vector<u32>& src) {
+        void* p = nullptr;
+        if (cudaMalloc(&p, src.size() * sizeof(u32)) != cudaSuccess) { cudaGetLastError(); return; }
+        if (cudaMemcpy(p, src.data(), src.size() * sizeof(u32), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(p);
+            cudaGetLastError();
+            return;
+        }
+        dst = static_cast<uint2*>(p);
+    }
     static void* raw_alloc(std::size_t bytes) {
         void* p = nullptr;
         if (cudaMalloc(&p, bytes) != cudaSuccess)
@@ -990,6 +1061,9 @@ private:
         if (d_ra) cudaFree(d_ra);
         if (d_rb) cudaFree(d_rb);
         if (d_rc) cudaFree(d_rc);
+        if (d_fenc) cudaFree(d_fenc);
+        if (d_fcrt) cudaFree(d_fcrt);
+        d_fenc = d_fcrt = nullptr;
         for (int i = 0; i <= kStages; ++i)
             if (ev_[i]) cudaEventDestroy(ev_[i]);
         d_primes = nullptr;

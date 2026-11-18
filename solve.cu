@@ -684,10 +684,26 @@ void* fherma_init(const fherma::Point& p) {
                 state->d_resa = nullptr;
                 state->d_resb = nullptr;
 
+                // Tensor-core encode and CRT (tc.cuh): each is kept only if the
+                // whole pipeline still matches the host answer exactly.
+                {
+                    gpu31::Device& d = *state->gpu31_dev;
+                    if (d.tc_enc_ready) {
+                        d.tc_enc = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_enc = false;
+                    }
+                    if (d.tc_crt_ready) {
+                        d.tc_crt = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_crt = false;
+                    }
+                    std::fprintf(stderr, "[TC] selfcheck enc=%d crt=%d
+", int(d.tc_enc), int(d.tc_crt));
+                }
+
                 // Try the conflict-free CRT, keeping it only if bit-identical to
                 // the reference CRT on deterministic residue data.
                 const auto& pl = state->gpu31_dev->plan();
-                try {
+                if (!state->gpu31_dev->tc_crt) try {
                     state->crt_mma_plan = std::make_unique<crt_mma::CrtMmaPlan>(
                         pl.crt_weights, pl.L, pl.K + 1);
                     crt_mma::CrtMmaPlan* p_plan = state->crt_mma_plan.get();
@@ -701,6 +717,7 @@ void* fherma_init(const fherma::Point& p) {
                     std::fprintf(stderr, "polymul: CRT setup failed: %s\n", e.what());
                 }
 
+                if (false) // H15 CRT-fast: measured slower (56 ms); disabled
                 // H15: try the pre-baked tensor-core CRT.  It replaces the
                 // ~121 scalar packing instructions per MMA of crt_mma_diag
                 // with 6 loads, by baking the B operand on the host and the
