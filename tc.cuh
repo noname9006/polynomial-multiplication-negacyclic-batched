@@ -147,17 +147,6 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC20_R8
 #define TC20_R8 1
 #endif
-
-// OC25 (agent A, task 4): software-pipeline the tensor-core MMA of group g+1
-// with the shared/ALU DIT passes of group g.  sR/sB are double buffered so the
-// next group's B fragments can be loaded before the current group's DIT starts
-// using its own buffer.  The MMA accumulator is reused (epilogue of group g
-// runs before its DIT, so acc is dead then) -- no extra registers, no change
-// to __launch_bounds__(512,1) or active thread count.  Flag OC25_OVERLAP=0
-// restores the exact original sequential path.
-#ifndef OC25_OVERLAP
-#define OC25_OVERLAP 1
-#endif
 // TC28: encode_fwdlow runs 1 CTA/SM (register-bound), so the bit-reversed A
 // gather (~24% of the kernel) is never overlapped.  Each CTA prefetches into
 // L2 the A rows of the CTA one wave ahead (linear id + #SMs); its own gather
@@ -1511,13 +1500,8 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
               const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
               unsigned logN, unsigned KS, unsigned NT) {
     __shared__ u32 sT[EF_PR][EF_PT];
-#if OC25_OVERLAP
-    __shared__ u32 sR[2][EF_PR][TC_LT];
-    __shared__ uint2 sB[2][EF_NTB * ENC_KS_MAX * 32];
-#else
     __shared__ u32 sR[EF_PR][TC_LT];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
-#endif
     const u32* src = blockIdx.y ? src_b : src_a;
     u32* dst = blockIdx.y ? rb : ra;
     const unsigned pair = blockIdx.z;
@@ -1604,167 +1588,6 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     };
     prefetch(0);
 #endif
-#if OC25_OVERLAP
-    // ---- OC25 software pipeline: MMA(g+1) chunks are issued between the
-    // three radix-8 DIT passes of group g.  sR/sB are double buffered; the
-    // accumulator is reused because group g's epilogue finishes before its
-    // DIT starts (no second acc set, no extra registers).
-    const unsigned NG = (NT + EF_NTB - 1) / EF_NTB;
-    auto ef_zero = [&](int (&acc)[2][EF_NTB][4], u32 (&tw)[2][EF_NTB], unsigned nt) {
-#pragma unroll
-        for (unsigned mt = 0; mt < 2; ++mt)
-#pragma unroll
-            for (unsigned j = 0; j < EF_NTB; ++j) {
-                acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0;
-                const unsigned k = (nt + j) * 2 + (t >> 1);
-                const unsigned i = start + rowbase + mt * 16 + g + (odd ? 8 : 0);
-                tw[mt][j] = (rtwist && k < K) ? rtwist[u64(k) * n + i] : 0u;
-            }
-    };
-    auto ef_mma = [&](unsigned ks0, unsigned ks1, unsigned nt, unsigned buf,
-                      int (&acc)[2][EF_NTB][4]) {
-        for (unsigned ks = ks0; ks < ks1; ++ks) {
-            if (ks < KS) {
-                uint2 b[EF_NTB];
-#pragma unroll
-                for (unsigned j = 0; j < EF_NTB; ++j)
-                    b[j] = sB[buf][(j * KS + ks) * 32 + lane];
-#pragma unroll
-                for (unsigned j = 0; j < EF_NTB; ++j)
-                    if (nt + j < NT) {
-                        mma_u8(acc[0][j], a[0][ks][0], a[0][ks][1], a[0][ks][2], a[0][ks][3], b[j].x, b[j].y);
-                        mma_u8(acc[1][j], a[1][ks][0], a[1][ks][1], a[1][ks][2], a[1][ks][3], b[j].x, b[j].y);
-                    }
-            }
-        }
-    };
-    auto ef_epi = [&](unsigned nt, int (&acc)[2][EF_NTB][4], u32 (&tw)[2][EF_NTB]) {
-#pragma unroll
-        for (unsigned j = 0; j < EF_NTB; ++j) {
-            const unsigned k = (nt + j) * 2 + (t >> 1);
-            gpu31::Prime p{}; gpu31::Weight w0{};
-            if (k < K) { p = primes[k]; w0 = weights[std::size_t(k) * l]; }
-#pragma unroll
-            for (unsigned mt = 0; mt < 2; ++mt) {
-                const u64 pg = (u64(u32(acc[mt][j][0])) << sh) + (u64(u32(acc[mt][j][1])) << (sh + 8));
-                const u64 pg8 = (u64(u32(acc[mt][j][2])) << sh) + (u64(u32(acc[mt][j][3])) << (sh + 8));
-                const u64 send = odd ? pg : pg8;
-                const u64 mine = odd ? pg8 : pg;
-                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
-                u32 val = 0;
-                if (k < K) {
-                    const u32 lo = gpu31::canonical_word(u32(tot), p.p);
-                    u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
-                    if (hi >= p.p) hi -= p.p;
-                    val = rtwist ? gpu31::mont(gpu31::add(lo, hi, p.p), tw[mt][j], p)
-                                 : gpu31::add(lo, hi, p.p);
-                }
-                const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);
-                sT[j * 2 + (t >> 1)][padw(rl)] = val;
-            }
-        }
-        __syncthreads();
-    };
-    auto ef_setup = [&](unsigned nt, unsigned buf) {
-        if (nt == 0) {
-            for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
-                const unsigned q = idx / TC_LT, r = idx % TC_LT;
-                sR[buf][q][r] = (q < K) ? packed[u64(q) * TC_LT + r] : 0u;
-            }
-            for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
-                const unsigned j = idx / (KS * 32);
-                sB[buf][idx] = (j < NT) ? frag[std::size_t(idx)] : make_uint2(0u, 0u);
-            }
-        } else {
-#if TC19_PF
-#pragma unroll
-            for (unsigned u = 0; u < PF_R; ++u) {
-                const unsigned idx = tid + u * 512;
-                sR[buf][idx / TC_LT][idx % TC_LT] = pfR[u];
-            }
-#pragma unroll
-            for (unsigned u = 0; u < PF_B; ++u) {
-                const unsigned idx = tid + u * 512;
-                if (idx < EF_NTB * KS * 32) sB[buf][idx] = pfB[u];
-            }
-#else
-            for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
-                const unsigned q = idx / TC_LT, r = idx % TC_LT;
-                const unsigned kk = nt * 2 + q;
-                sR[buf][q][r] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
-            }
-            for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
-                const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
-                const unsigned nt2 = nt + j;
-                sB[buf][idx] = nt2 < NT ? frag[std::size_t(nt2) * KS * 32 + rem] : make_uint2(0u, 0u);
-            }
-#endif
-        }
-        __syncthreads();
-    };
-    // group 0: setup, MMA, epilogue before the pipeline loop
-    int acc[2][EF_NTB][4]; u32 tw[2][EF_NTB];
-    ef_setup(0, 0);
-    ef_zero(acc, tw, 0);
-    ef_mma(0, ENC_KS_MAX, 0, 0, acc);
-    ef_epi(0, acc, tw);
-#if TC19_PF
-    prefetch(EF_NTB);
-#endif
-    for (unsigned g = 0; g < NG; ++g) {
-        const unsigned nt0 = g * EF_NTB, buf = g & 1, nbuf = (g + 1) & 1;
-        const bool has_next = (g + 1 < NG);
-        if (has_next) {
-            ef_setup(nt0 + EF_NTB, nbuf);
-            ef_zero(acc, tw, nt0 + EF_NTB);
-#if TC19_PF
-            if (g + 2 < NG) prefetch(nt0 + 2 * EF_NTB);
-#endif
-        }
-        // ---- DIT of group g, with MMA(g+1) chunks between the passes ----
-        {
-            const unsigned q = tid >> 6, gi = tid & 63;
-            const unsigned kk = nt0 * 2 + q;
-            const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
-            u32* row = sT[q];
-            const u32* tw8 = sR[buf][q];
-#pragma unroll
-            for (unsigned m = 0; m < 9; m += 3) {
-                const unsigned H = 1u << m;
-                const unsigned w = gi & (H - 1);
-                const unsigned x0 = (gi - w) * 8 + w;
-                u32 v[8];
-#pragma unroll
-                for (unsigned e = 0; e < 8; ++e) v[e] = row[padw(x0 + e * H)];
-#pragma unroll
-                for (unsigned st = 0; st < 3; ++st) {
-                    const unsigned span = 1u << st;
-#pragma unroll
-                    for (unsigned e = 0; e < 8; ++e) {
-                        if (e & span) continue;
-                        const unsigned j = w + (e & (span - 1)) * H;
-                        gpu31::butterfly(v[e], v[e + span], tw8[TWI(m + st, j)], pr8);
-                    }
-                }
-#pragma unroll
-                for (unsigned e = 0; e < 8; ++e) row[padw(x0 + e * H)] = v[e];
-                __syncthreads();
-                if (has_next) {
-                    if (m == 0) ef_mma(0, 3, nt0 + EF_NTB, nbuf, acc);
-                    else if (m == 3) ef_mma(3, 5, nt0 + EF_NTB, nbuf, acc);
-                    else ef_mma(5, ENC_KS_MAX, nt0 + EF_NTB, nbuf, acc);
-                }
-            }
-        }
-        for (unsigned idx = tid; idx < EF_PR * NT_TILE; idx += blockDim.x) {
-            const unsigned q = idx / NT_TILE, pos = idx % NT_TILE;
-            const unsigned kk = nt0 * 2 + q;
-            if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
-        }
-        __syncthreads();
-        if (has_next) ef_epi(nt0 + EF_NTB, acc, tw);
-    }
-#else
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
         TCP_T(g0);
 #if TC19_PF
@@ -2016,7 +1839,6 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         TCP_T(g5);
         pe[0] += g1 - g0; pe[1] += g2 - g1; pe[2] += g3 - g2; pe[3] += g4 - g3; pe[4] += g5 - g4;
     }
-#endif  // OC25_OVERLAP
     TCP_ADD(10, 0, pe[0]); TCP_ADD(11, 0, pe[1]); TCP_ADD(12, 0, pe[2]);
     TCP_ADD(13, 0, pe[3]); TCP_ADD(14, 0, pe[4]);
 }
