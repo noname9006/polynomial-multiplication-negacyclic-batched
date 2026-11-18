@@ -1094,11 +1094,7 @@ struct Device {
         {
             unsigned long long h[16] = {};
             if (cudaMemcpyFromSymbol(h, tc::g_tcprof, sizeof(h)) == cudaSuccess) {
-                // Agent B: with tc_invcrt active, crt_tc2 is off, so slots 0-4
-                // carry the inv_crt phase times.  Slot 15 (zero+first cl_sync)
-                // is shared with encode_fwdlow's "setup" — reported here as
-                // crt.zero; read it only when [TC] invcrt=1.
-                const char* nm[10] = {"invcrt.A+sync", "invcrt.fsum", "invcrt.gemm", "invcrt.carry", "invcrt.store",
+                const char* nm[10] = {"crt.stage", "crt.aload", "crt.mma", "crt.carry", "crt.store",
                                       "fh.load", "fh.fwd", "fh.pw", "fh.inv", "fh.store"};
                 double c = 0, fsum = 0;
                 for (int i = 0; i < 5; ++i) c += double(h[i]);
@@ -1106,7 +1102,6 @@ struct Device {
                 std::fprintf(stderr, "[PROF] crt Gcyc=%.2f:", c / 1e9);
                 for (int i = 0; i < 5; ++i)
                     std::fprintf(stderr, " %s %.1f%%", nm[i], c > 0 ? 100.0 * double(h[i]) / c : 0.0);
-                std::fprintf(stderr, " zero %.1f%%", c > 0 ? 100.0 * double(h[15]) / c : 0.0);
                 std::fprintf(stderr, " | fh Gcyc=%.2f:", fsum / 1e9);
                 for (int i = 5; i < 10; ++i)
                     std::fprintf(stderr, " %s %.1f%%", nm[i], fsum > 0 ? 100.0 * double(h[i]) / fsum : 0.0);
