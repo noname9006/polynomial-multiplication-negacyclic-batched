@@ -29,7 +29,7 @@
 // TC10 (parallel branch): warp-shuffle for the first 5 DIT stages of
 // encode_fwdlow.  Set to 0 for A/B against the original shared-only path.
 #ifndef TC10_SHUF
-#define TC10_SHUF 1
+#define TC10_SHUF 0   // OC2 measured slower: encode 24.4 -> 26.2 ms
 #endif
 
 namespace tc {
