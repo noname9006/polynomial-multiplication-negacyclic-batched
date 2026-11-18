@@ -742,7 +742,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                        words, l + 2);
         // oc26_carry_row contains the only __syncthreads of this phase; it is
         // reached by all 128 threads, so the barrier is uniform.
-        if (row < CRT2_ROWS) {
+        if (row < CRT2_ROWS && (tid & 3) == 0) {   // one reducer per row
             u32* dg = digits + row * DS;
             gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
         }
