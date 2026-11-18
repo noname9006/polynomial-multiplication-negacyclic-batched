@@ -1121,6 +1121,13 @@ private:
                 for (unsigned kk = 0; kk < plan_.K; ++kk)
                     cm[kk] = u32((u64(1) << 62) / plan_.primes[kk].p);
                 upload_u32(d_corr_m, cm);
+                if (plan_.K <= tc::CRT_KMAX_C) {
+                    if (cudaMemcpyToSymbol(tc::c_crt_corr, cm.data(), cm.size() * sizeof(u32)) != cudaSuccess ||
+                        cudaMemcpyToSymbol(tc::c_crt_prime, plan_.primes.data(), plan_.K * sizeof(Prime)) != cudaSuccess) {
+                        cudaGetLastError();
+                        return;
+                    }
+                }
                 if (!d_corr_m) return;
             }
             crt_tc_shared = tc::crt_tc_smem(crt_cfg);

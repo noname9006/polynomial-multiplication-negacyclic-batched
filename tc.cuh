@@ -132,6 +132,9 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #define TC_PROF 1
 #endif
 __device__ unsigned long long g_tcprof[16];
+constexpr unsigned CRT_KMAX_C = 128;
+__constant__ gpu31::Prime c_crt_prime[CRT_KMAX_C];
+__constant__ u32 c_crt_corr[CRT_KMAX_C];
 #define TCP_T(v) const long long v = (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) ? (long long)clock64() : 0
 #define TCP_ADD(slot, a, b) do { if (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) \
     atomicAdd(&g_tcprof[slot], (unsigned long long)((b) - (a))); } while (0)
@@ -286,6 +289,29 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     TCP_T(t0);
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
     u64 fsum = 0;
+    if (untw_inv && K <= CRT_KMAX_C) {
+        // TC11: batched loads (8 independent residue+untwist pairs in flight),
+        // prime and correction constants from __constant__ (warp-uniform j).
+#pragma unroll 1
+        for (unsigned j0 = jg; j0 < K; j0 += 16) {
+            u32 r[8], u[8];
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) {
+                const unsigned j = j0 + 2 * q;
+                r[q] = (j < K && active) ? residues[rbase + u64(j) * n + i] : 0u;
+                u[q] = (j < K && active) ? untw_inv[u64(j) * n + i] : 0u;
+            }
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) {
+                const unsigned j = j0 + 2 * q;
+                if (j < K) {
+                    const u32 term = gpu31::mont(r[q], u[q], c_crt_prime[j]);
+                    sA[c * cfg.SA + j] = term;
+                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                }
+            }
+        }
+    } else {
 #pragma unroll 4
     for (unsigned j = jg; j < K; j += 2) {
         u32 term = 0;
@@ -298,6 +324,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
         }
         sA[c * cfg.SA + j] = term;
         fsum += (u64(term) * corr_m[j]) >> 30;
+    }
     }
     for (unsigned j = K + 1 + jg; j < W; j += 2) sA[c * cfg.SA + j] = 0;
     // spare words W..W+3 of the row hold the two partial sums
