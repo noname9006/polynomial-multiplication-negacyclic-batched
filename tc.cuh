@@ -134,6 +134,9 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // Slots: CRT 0 staging, 1 A-load, 2 mma+epilogue, 3 carry/reduce, 4 store;
 //        fused_high 5 load, 6 fwd, 7 pointwise, 8 inverse, 9 store;
 //        encode_fwdlow 10 setup, 11 mma, 12 epilogue, 13 DIT, 14 store, 15 A-load.
+#ifndef TC19_PF
+#define TC19_PF 1
+#endif
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -928,8 +931,49 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 
     TCP_T(e1);
     TCP_ADD(15, e0, e1);
+#if TC19_PF
+    // TC19: the next group's twiddles and B fragments are fetched into
+    // registers while the current group runs its DIT; setup is then only
+    // shared stores.  sR: 2048 words = 4 per thread; sB: <= 1024 uint2 = 2.
+    constexpr unsigned PF_R = EF_PR * (NT_TILE / 2) / 512, PF_B = 2;
+    u32 pfR[PF_R];
+    uint2 pfB[PF_B];
+    auto prefetch = [&](unsigned g0n) {
+#pragma unroll
+        for (unsigned u = 0; u < PF_R; ++u) {
+            const unsigned idx = tid + u * 512;
+            const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
+            const unsigned kk = g0n * 2 + q;
+            pfR[u] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+        }
+#pragma unroll
+        for (unsigned u = 0; u < PF_B; ++u) {
+            const unsigned idx = tid + u * 512;
+            uint2 v = make_uint2(0u, 0u);
+            if (idx < EF_NTB * KS * 32) {
+                const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+                const unsigned nt = g0n + j;
+                if (nt < NT) v = frag[std::size_t(nt) * KS * 32 + rem];
+            }
+            pfB[u] = v;
+        }
+    };
+    prefetch(0);
+#endif
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
         TCP_T(g0);
+#if TC19_PF
+#pragma unroll
+        for (unsigned u = 0; u < PF_R; ++u) {
+            const unsigned idx = tid + u * 512;
+            sR[idx / (NT_TILE / 2)][idx % (NT_TILE / 2)] = pfR[u];
+        }
+#pragma unroll
+        for (unsigned u = 0; u < PF_B; ++u) {
+            const unsigned idx = tid + u * 512;
+            if (idx < EF_NTB * KS * 32) sB[idx] = pfB[u];
+        }
+#else
         // twiddles of this group's primes
         for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
             const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
@@ -942,6 +986,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned nt = nt0 + j;
             sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
         }
+#endif
         __syncthreads();
         TCP_T(g1);
         int acc[2][EF_NTB][4];
@@ -1001,6 +1046,9 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         __syncthreads();
         TCP_T(g3);
 
+#if TC19_PF
+        if (nt0 + EF_NTB < NT) prefetch(nt0 + EF_NTB);
+#endif
         // 9 DIT stages on 8 primes: 8*256 butterflies, 4 per thread per stage
         gpu31::Prime pq[4];
 #pragma unroll
