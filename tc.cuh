@@ -800,80 +800,97 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     const unsigned k = blockIdx.y;
     const u64 plane = (u64(blockIdx.z) * K + k) * n;
     const gpu31::Prime p = primes[k];
-    constexpr unsigned TWS = 7 * NT_TILE + 127;
-    const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
-    const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
-    u32 waf[7], wai[7];
-#pragma unroll
-    for (unsigned q = 0; q < 7; ++q) {
-        waf[q] = q < logH ? twf[u64(k) * TWS + q * NT_TILE + low] : 0u;
-        wai[q] = q < logH ? twi[u64(k) * TWS + q * NT_TILE + low] : 0u;
-    }
+        constexpr unsigned TWS = 7 * NT_TILE + 127;
+        const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
+        const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
+        u32 waf[7], wai[7];
+        // OC16: precompute Shoup quotients for waf/wai (reused across all butterflies in stage)
+        u32 waf_q[7], wai_q[7];
+    #pragma unroll
+        for (unsigned q = 0; q < 7; ++q) {
+            waf[q] = q < logH ? twf[u64(k) * TWS + q * NT_TILE + low] : 0u;
+            wai[q] = q < logH ? twi[u64(k) * TWS + q * NT_TILE + low] : 0u;
+            if (q < logH) {
+                waf_q[q] = u32((u64(waf[q]) << 32) / p.p);
+                wai_q[q] = u32((u64(wai[q]) << 32) / p.p);
+            }
+        }
 
-    TCP_T(f0);
-    for (unsigned h = rw; h < HC; h += 8) {
-        sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
-        sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
-    }
-    __syncthreads();
-    TCP_T(f1);
-#if OC10_R16
-    // OC10: four DIT stages per shared round trip.  A group is rows
-    // r0 + i*H (i=0..15, H=2^s).  Stage s pairs (i,i+1) with within w;
-    // s+1 pairs (i,i+2) with within w+(i&1)*H; s+2 pairs (i,i+4) with
-    // within w+(i&3)*H; s+3 pairs (i,i+8) with within w+(i&7)*H.
-#pragma unroll
-    for (unsigned q = 0; q < 4; ++q) {
-        if (q >= n16) break;
-        const unsigned s = q << 2, H = 1u << s;
-        for (unsigned g = rw; g < HC / 16; g += 8) {
-            const unsigned w = g & (H - 1);
-            const unsigned r0 = (g - w) * 16 + w;
-            unsigned ix[16];
-#pragma unroll
-            for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            u32 t2[2], t4[4], t8[8];
-#pragma unroll
-            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + k * H], p);
-#pragma unroll
-            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + k * H], p);
-#pragma unroll
-            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
-            u32 av[16], bv[16];
-#pragma unroll
-            for (unsigned i = 0; i < 16; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
-#pragma unroll
-            for (unsigned i = 0; i < 16; i += 2) {
-                gpu31::butterfly(av[i], av[i+1], t1, p);
-                gpu31::butterfly(bv[i], bv[i+1], t1, p);
-            }
-#pragma unroll
-            for (unsigned k = 0; k < 2; ++k) {
-#pragma unroll
-                for (unsigned i = k; i < 16; i += 4) {
-                    gpu31::butterfly(av[i], av[i+2], t2[k], p);
-                    gpu31::butterfly(bv[i], bv[i+2], t2[k], p);
-                }
-            }
-#pragma unroll
-            for (unsigned k = 0; k < 4; ++k) {
-#pragma unroll
-                for (unsigned i = k; i < 16; i += 8) {
-                    gpu31::butterfly(av[i], av[i+4], t4[k], p);
-                    gpu31::butterfly(bv[i], bv[i+4], t4[k], p);
-                }
-            }
-#pragma unroll
-            for (unsigned i = 0; i < 8; ++i) {
-                gpu31::butterfly(av[i], av[i+8], t8[i], p);
-                gpu31::butterfly(bv[i], bv[i+8], t8[i], p);
-            }
-#pragma unroll
-            for (unsigned i = 0; i < 16; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
+        TCP_T(f0);
+        for (unsigned h = rw; h < HC; h += 8) {
+            sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
+            sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
         }
         __syncthreads();
-    }
+        TCP_T(f1);
+    #if OC10_R16
+        // OC10: four DIT stages per shared round trip.  A group is rows
+        // r0 + i*H (i=0..15, H=2^s).  Stage s pairs (i,i+1) with within w;
+        // s+1 pairs (i,i+2) with within w+(i&1)*H; s+2 pairs (i,i+4) with
+        // within w+(i&3)*H; s+3 pairs (i,i+8) with within w+(i&7)*H.
+    #pragma unroll
+        for (unsigned q = 0; q < 4; ++q) {
+            if (q >= n16) break;
+            const unsigned s = q << 2, H = 1u << s;
+            for (unsigned g = rw; g < HC / 16; g += 8) {
+                const unsigned w = g & (H - 1);
+                const unsigned r0 = (g - w) * 16 + w;
+                unsigned ix[16];
+    #pragma unroll
+                for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
+                // OC16: Shoup multiply for reused twiddle factors (waf[s] * tfB[...])
+                // t = waf[s] * tfB[...] * R^-1 mod p via lazy_product
+                const u32 t1 = gpu31::lazy_product(tfB[(H - 1) + w], {waf[s], waf_q[s]}, p.p);
+                            u32 t2[2], t4[4], t8[8];
+                #pragma unroll
+                            for (unsigned k = 0; k < 2; ++k) {
+                                const u32 tw = tfB[(2 * H - 1) + w + k * H];
+                                t2[k] = gpu31::lazy_product(tw, {waf[s+1], waf_q[s+1]}, p.p);
+                            }
+                #pragma unroll
+                            for (unsigned k = 0; k < 4; ++k) {
+                                const u32 tw = tfB[(4 * H - 1) + w + k * H];
+                                t4[k] = gpu31::lazy_product(tw, {waf[s+2], waf_q[s+2]}, p.p);
+                            }
+                #pragma unroll
+                            for (unsigned k = 0; k < 8; ++k) {
+                                const u32 tw = tfB[(8 * H - 1) + w + k * H];
+                                t8[k] = gpu31::lazy_product(tw, {waf[s+3], waf_q[s+3]}, p.p);
+                            }
+                u32 av[16], bv[16];
+    #pragma unroll
+                for (unsigned i = 0; i < 16; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
+    #pragma unroll
+                for (unsigned i = 0; i < 16; i += 2) {
+                    gpu31::butterfly(av[i], av[i+1], t1, p);
+                    gpu31::butterfly(bv[i], bv[i+1], t1, p);
+                }
+    #pragma unroll
+                for (unsigned k = 0; k < 2; ++k) {
+    #pragma unroll
+                    for (unsigned i = k; i < 16; i += 4) {
+                        gpu31::butterfly(av[i], av[i+2], t2[k], p);
+                        gpu31::butterfly(bv[i], bv[i+2], t2[k], p);
+                    }
+                }
+    #pragma unroll
+                for (unsigned k = 0; k < 4; ++k) {
+    #pragma unroll
+                    for (unsigned i = k; i < 16; i += 8) {
+                        gpu31::butterfly(av[i], av[i+4], t4[k], p);
+                        gpu31::butterfly(bv[i], bv[i+4], t4[k], p);
+                    }
+                }
+    #pragma unroll
+                for (unsigned i = 0; i < 8; ++i) {
+                    gpu31::butterfly(av[i], av[i+8], t8[i], p);
+                    gpu31::butterfly(bv[i], bv[i+8], t8[i], p);
+                }
+    #pragma unroll
+                for (unsigned i = 0; i < 16; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
+            }
+            __syncthreads();
+        }
     // radix-8 for the next min(3, logH-rs) stages, then radix-2 tail.
 #pragma unroll
     for (unsigned q = 0; q < 2; ++q) {
@@ -885,13 +902,13 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             unsigned ix[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2a = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + H], p);
-            u32 t4[4];
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + i * H], p);
+            const u32 t1 = gpu31::lazy_product(tfB[(H - 1) + w], {waf[s], waf_q[s]}, p.p);
+                        const u32 t2a = gpu31::lazy_product(tfB[(2 * H - 1) + w], {waf[s+1], waf_q[s+1]}, p.p);
+                        const u32 t2b = gpu31::lazy_product(tfB[(2 * H - 1) + w + H], {waf[s+1], waf_q[s+1]}, p.p);
+                        u32 t4[4];
+            #pragma unroll
+                        for (unsigned i = 0; i < 4; ++i)
+                            t4[i] = gpu31::lazy_product(tfB[(4 * H - 1) + w + i * H], {waf[s+2], waf_q[s+2]}, p.p);
             u32 av[8], bv[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
@@ -1023,7 +1040,8 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
             const u32 wa = (s == 6 ? waf[6] : (s == 4 ? waf[4] : (s == 2 ? waf[2] : waf[0])));
-            const u32 w = gpu31::mont(wa, tfB[(H - 1) + within], p);
+                        const u32 wa_q = (s == 6 ? waf_q[6] : (s == 4 ? waf_q[4] : (s == 2 ? waf_q[2] : waf_q[0])));
+                        const u32 w = gpu31::lazy_product(tfB[(H - 1) + within], {wa, wa_q}, p);
             gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
             gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
@@ -1077,12 +1095,12 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
             u32 t4[4];
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
-            const u32 t2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            #pragma unroll
+                        for (unsigned i = 0; i < 4; ++i)
+                            t4[i] = gpu31::lazy_product(tiB[(4 * H - 1) + w + i * H], {wai[s+2], wai_q[s+2]}, p.p);
+                        const u32 t2a = gpu31::lazy_product(tiB[(2 * H - 1) + w], {wai[s+1], wai_q[s+1]}, p.p);
+                        const u32 t2b = gpu31::lazy_product(tiB[(2 * H - 1) + w + H], {wai[s+1], wai_q[s+1]}, p.p);
+                        const u32 t1 = gpu31::lazy_product(tiB[(H - 1) + w], {wai[s], wai_q[s]}, p.p);
             u32 av[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) av[i] = sa[ix[i]];
@@ -1122,13 +1140,13 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
             u32 t2[2], t4[4], t8[8];
-#pragma unroll
-            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + k * H], p);
-#pragma unroll
-            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + k * H], p);
-#pragma unroll
-            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(wai[s+3], tiB[(8 * H - 1) + w + k * H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                        #pragma unroll
+                                    for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::lazy_product(tiB[(2 * H - 1) + w + k * H], {wai[s+1], wai_q[s+1]}, p.p);
+                        #pragma unroll
+                                    for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::lazy_product(tiB[(4 * H - 1) + w + k * H], {wai[s+2], wai_q[s+2]}, p.p);
+                        #pragma unroll
+                                    for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::lazy_product(tiB[(8 * H - 1) + w + k * H], {wai[s+3], wai_q[s+3]}, p.p);
+                                    const u32 t1 = gpu31::lazy_product(tiB[(H - 1) + w], {wai[s], wai_q[s]}, p.p);
             u32 av[16];
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) av[i] = sa[ix[i]];
@@ -1198,12 +1216,12 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
             u32 t4[4];
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(wai[s + 2], tiB[(4 * H - 1) + w + i * H], p);
-            const u32 t2a = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            #pragma unroll
+                        for (unsigned i = 0; i < 4; ++i)
+                                                    t4[i] = gpu31::lazy_product(tiB[(4 * H - 1) + w + i * H], {wai[s + 2], wai_q[s + 2]}, p.p);
+                                                const u32 t2a = gpu31::lazy_product(tiB[(2 * H - 1) + w], {wai[s + 1], wai_q[s + 1]}, p.p);
+                                                const u32 t2b = gpu31::lazy_product(tiB[(2 * H - 1) + w + H], {wai[s + 1], wai_q[s + 1]}, p.p);
+                                                const u32 t1 = gpu31::lazy_product(tiB[(H - 1) + w], {wai[s], wai_q[s]}, p.p);
             u32 av[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) av[i] = sa[ix[i]];
@@ -1234,53 +1252,56 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 #elif TC12_R4
     if (logH & 1) {
-        const unsigned s = logH - 1, H = 1u << s;
-        const u32 wa = (s == 6 ? wai[6] : (s == 4 ? wai[4] : (s == 2 ? wai[2] : wai[0])));
-        for (unsigned h = rw; h < HC / 2; h += 8) {
-            const unsigned within = h & (H - 1);
-            const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(wa, tiB[(H - 1) + within], p);
-            const u32 u = sa[first * S + lane], v = sa[second * S + lane];
-            sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+                const unsigned s = logH - 1, H = 1u << s;
+                const u32 wa = (s == 6 ? wai[6] : (s == 4 ? wai[4] : (s == 2 ? wai[2] : wai[0])));
+                const u32 wa_q = (s == 6 ? wai_q[6] : (s == 4 ? wai_q[4] : (s == 2 ? wai_q[2] : wai_q[0])));
+                for (unsigned h = rw; h < HC / 2; h += 8) {
+                    const unsigned within = h & (H - 1);
+                    const unsigned first = 2 * (h - within) + within, second = first + H;
+                    const u32 w = gpu31::lazy_product(tiB[(H - 1) + within], {wa, wa_q}, p.p);
+                    const u32 u = sa[first * S + lane], v = sa[second * S + lane];
+                    sa[first * S + lane] = gpu31::add(u, v, p.p);
+                    sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+                }
+                __syncthreads();
+            }
+            // DIF pairs (s+1, s) from the top: stage s+1 on (0,2),(1,3), then s on (0,1),(2,3).
+    #pragma unroll
+            for (int s = 4; s >= 0; s -= 2) {
+                if (unsigned(s) + 2 > logH - (logH & 1)) continue;
+                const unsigned H = 1u << s;
+                for (unsigned g = rw; g < HC / 4; g += 8) {
+                    const unsigned w = g & (H - 1);
+                    const unsigned r0 = (g - w) * 4 + w;
+                    const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
+                                   i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
+                    const u32 t2 = gpu31::lazy_product(tiB[(2 * H - 1) + w], {wai[s + 1], wai_q[s + 1]}, p.p);
+                    const u32 t3 = gpu31::lazy_product(tiB[(2 * H - 1) + w + H], {wai[s + 1], wai_q[s + 1]}, p.p);
+                    const u32 t1 = gpu31::lazy_product(tiB[(H - 1) + w], {wai[s], wai_q[s]}, p.p);
+                    u32 x0 = sa[i0], x1 = sa[i1], x2 = sa[i2], x3 = sa[i3];
+                    u32 u = x0, v = x2;
+                    x0 = gpu31::add(u, v, p.p); x2 = gpu31::mont(gpu31::sub(u, v, p.p), t2, p);
+                    u = x1; v = x3;
+                    x1 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t3, p);
+                    u = x0; v = x1;
+                    x0 = gpu31::add(u, v, p.p); x1 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+                    u = x2; v = x3;
+                    x2 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+                    sa[i0] = x0; sa[i1] = x1; sa[i2] = x2; sa[i3] = x3;
+            }
+            __syncthreads();
         }
-        __syncthreads();
-    }
-    // DIF pairs (s+1, s) from the top: stage s+1 on (0,2),(1,3), then s on (0,1),(2,3).
-#pragma unroll
-    for (int s = 4; s >= 0; s -= 2) {
-        if (unsigned(s) + 2 > logH - (logH & 1)) continue;
-        const unsigned H = 1u << s;
-        for (unsigned g = rw; g < HC / 4; g += 8) {
-            const unsigned w = g & (H - 1);
-            const unsigned r0 = (g - w) * 4 + w;
-            const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
-                           i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
-            const u32 t2 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
-            const u32 t3 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
-            u32 x0 = sa[i0], x1 = sa[i1], x2 = sa[i2], x3 = sa[i3];
-            u32 u = x0, v = x2;
-            x0 = gpu31::add(u, v, p.p); x2 = gpu31::mont(gpu31::sub(u, v, p.p), t2, p);
-            u = x1; v = x3;
-            x1 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t3, p);
-            u = x0; v = x1;
-            x0 = gpu31::add(u, v, p.p); x1 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
-            u = x2; v = x3;
-            x2 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
-            sa[i0] = x0; sa[i1] = x1; sa[i2] = x2; sa[i3] = x3;
-        }
-        __syncthreads();
-    }
 #else
 #pragma unroll
     for (int s = 6; s >= 0; --s) {
         if (unsigned(s) >= logH) continue;
         const unsigned H = 1u << s;
+        const u32 wa = wai[s];
+        const u32 wa_q = wai_q[s];
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 w = gpu31::lazy_product(tiB[(H - 1) + within], {wa, wa_q}, p.p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
             sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
