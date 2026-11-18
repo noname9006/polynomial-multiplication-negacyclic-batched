@@ -330,6 +330,7 @@ struct CrtMmaFastPlan {
     std::vector<u32> wb_host;
     u32* d_wb = nullptr;
     bool ok = false;
+    mutable bool diag_done_ = false;
 
     CrtMmaFastPlan() = default;
     CrtMmaFastPlan(const std::vector<u32>& w, unsigned L_, unsigned pitch_)
@@ -366,12 +367,20 @@ struct CrtMmaFastPlan {
         CrtArgs ca{a.n, a.limbs, a.bits, a.count, a.gap,
                    reinterpret_cast<const PrimeInfo*>(a.primes), nullptr, a.q};
         const std::size_t smem = shared_bytes(L, pitch);
-        cudaFuncSetAttribute(crt_mma_fast_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(smem));
+        const bool diag = !diag_done_;
+        diag_done_ = true;
+        const cudaError_t e_attr = cudaFuncSetAttribute(
+            crt_mma_fast_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem));
+        if (diag) std::fprintf(stderr, "[CRTF] attr=%d smem=%zu\n", (int)e_attr, smem);
+        if (e_attr != cudaSuccess) return e_attr;
+        (void)cudaGetLastError();
         crt_mma_fast_kernel<0><<<dim3((ca.n + MF_M_COEF - 1) / MF_M_COEF, 1, B),
                                  MF_THREADS, smem, stream>>>(
             ca, residues, d_wb, out, B);
-        return cudaGetLastError();
+        const cudaError_t e_launch = cudaGetLastError();
+        if (diag) std::fprintf(stderr, "[CRTF] launch=%d B=%u\n", (int)e_launch, B);
+        return e_launch;
 #else
         (void)residues; (void)out; (void)a; (void)B; (void)stream;
         return cudaSuccess;

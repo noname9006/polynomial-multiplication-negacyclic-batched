@@ -511,7 +511,11 @@ bool crt_vs_reference(State& s, Runner runner, u32 pair_count, const char* name)
     u32* src = s.d_a;
     const auto& args = s.gpu31_dev->crt_args();
     if (s.gpu31_dev->crt_reference(src, s.d_c, pairs, stm) != cudaSuccess) return false;
-    if (runner(src, s.d_b, args, pairs, stm) != cudaSuccess) return false;
+    const cudaError_t e_run = runner(src, s.d_b, args, pairs, stm);
+    if (e_run != cudaSuccess) {
+        std::fprintf(stderr, "polymul: %s runner returned CUDA error %d\n", name, (int)e_run);
+        return false;
+    }
     if (cudaStreamSynchronize(stm) != cudaSuccess) return false;
     const std::size_t nout = std::size_t(pairs) * n * s.plan.L;
     std::vector<u32> want(nout), got(nout);
