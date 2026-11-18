@@ -1,0 +1,25 @@
+#pragma once
+#include <cstdint>
+#define __global__
+#define __device__
+#define __host__
+#define __shared__
+#define __restrict__
+#define __constant__
+#define __forceinline__ inline
+#define __launch_bounds__(...)
+#define __align__(x)
+#define __noinline__
+struct ShimIndex { unsigned x, y, z; };
+inline ShimIndex threadIdx{0,0,0}, blockIdx{0,0,0}, blockDim{1,1,1}, gridDim{1,1,1};
+inline void __syncthreads() {}
+inline unsigned long long __umul64hi(unsigned long long a, unsigned long long b){return (unsigned long long)(((unsigned __int128)a*b)>>64);}
+struct uint2 { unsigned x, y; };
+struct uint4 { unsigned x, y, z, w; };
+inline unsigned __brev(unsigned x){return x;}
+inline unsigned __umulhi(unsigned a,unsigned b){return (unsigned)(((unsigned long long)a*b)>>32);}
+template<class T> inline T __shfl_xor_sync(unsigned, T v, int, int=32){return v;}
+template<class T> inline T __shfl_sync(unsigned, T v, int, int=32){return v;}
+template<class T> inline T __ldg(const T* p){return *p;}
+inline void __syncwarp(unsigned=0){}
+inline int __popc(unsigned x){return __builtin_popcount(x);}
