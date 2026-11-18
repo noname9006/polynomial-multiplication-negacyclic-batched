@@ -1416,7 +1416,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
               unsigned logN, unsigned KS, unsigned NT) {
     __shared__ u32 sT[EF_PR][EF_PT];
 #if OC25_OVERLAP
-    __shared__ u32 sR[2][EF_PR][TC_LT];
+    __shared__ u32 sR[EF_PR][TC_LT];   // single: next group's twiddles load after DIT(g)
     __shared__ uint2 sB[2][EF_NTB * ENC_KS_MAX * 32];
 #else
     __shared__ u32 sR[EF_PR][TC_LT];
@@ -1569,35 +1569,37 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
         __syncthreads();
     };
-    auto ef_setup = [&](unsigned nt, unsigned buf) {
+    auto ef_setup = [&](unsigned nt, unsigned buf, bool doR, bool doB) {
         if (nt == 0) {
-            for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
+            if (doR) for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
                 const unsigned q = idx / TC_LT, r = idx % TC_LT;
-                sR[buf][q][r] = (q < K) ? packed[u64(q) * TC_LT + r] : 0u;
+                sR[q][r] = (q < K) ? packed[u64(q) * TC_LT + r] : 0u;
             }
-            for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
+            if (doB) for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
                 const unsigned j = idx / (KS * 32);
                 sB[buf][idx] = (j < NT) ? frag[std::size_t(idx)] : make_uint2(0u, 0u);
             }
         } else {
 #if TC19_PF
+            if (doR)
 #pragma unroll
             for (unsigned u = 0; u < PF_R; ++u) {
                 const unsigned idx = tid + u * 512;
-                sR[buf][idx / TC_LT][idx % TC_LT] = pfR[u];
+                sR[idx / TC_LT][idx % TC_LT] = pfR[u];
             }
+            if (doB)
 #pragma unroll
             for (unsigned u = 0; u < PF_B; ++u) {
                 const unsigned idx = tid + u * 512;
                 if (idx < EF_NTB * KS * 32) sB[buf][idx] = pfB[u];
             }
 #else
-            for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
+            if (doR) for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
                 const unsigned q = idx / TC_LT, r = idx % TC_LT;
                 const unsigned kk = nt * 2 + q;
-                sR[buf][q][r] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
+                sR[q][r] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
             }
-            for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
+            if (doB) for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
                 const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
                 const unsigned nt2 = nt + j;
                 sB[buf][idx] = nt2 < NT ? frag[std::size_t(nt2) * KS * 32 + rem] : make_uint2(0u, 0u);
@@ -1608,7 +1610,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     };
     // group 0: setup, MMA, epilogue before the pipeline loop
     int acc[2][EF_NTB][4]; u32 tw[2][EF_NTB];
-    ef_setup(0, 0);
+    ef_setup(0, 0, true, true);
     ef_zero(acc, tw, 0);
     ef_mma(0, ENC_KS_MAX, 0, 0, acc);
     ef_epi(0, acc, tw);
@@ -1619,11 +1621,8 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         const unsigned nt0 = g * EF_NTB, buf = g & 1, nbuf = (g + 1) & 1;
         const bool has_next = (g + 1 < NG);
         if (has_next) {
-            ef_setup(nt0 + EF_NTB, nbuf);
+            ef_setup(nt0 + EF_NTB, nbuf, false, true);   // B only; sR still holds group g
             ef_zero(acc, tw, nt0 + EF_NTB);
-#if TC19_PF
-            if (g + 2 < NG) prefetch(nt0 + 2 * EF_NTB);
-#endif
         }
         // ---- DIT of group g, with MMA(g+1) chunks between the passes ----
         {
@@ -1631,7 +1630,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned kk = nt0 * 2 + q;
             const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
             u32* row = sT[q];
-            const u32* tw8 = sR[buf][q];
+            const u32* tw8 = sR[q];
 #pragma unroll
             for (unsigned m = 0; m < 9; m += 3) {
                 const unsigned H = 1u << m;
@@ -1666,7 +1665,13 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
         }
         __syncthreads();
-        if (has_next) ef_epi(nt0 + EF_NTB, acc, tw);
+        if (has_next) {
+            ef_setup(nt0 + EF_NTB, nbuf, true, false);   // twiddles of g+1 (DIT g done)
+#if TC19_PF
+            if (g + 2 < NG) prefetch(nt0 + 2 * EF_NTB);
+#endif
+            ef_epi(nt0 + EF_NTB, acc, tw);
+        }
     }
 #else
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
