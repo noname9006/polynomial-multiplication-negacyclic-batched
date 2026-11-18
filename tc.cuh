@@ -1720,18 +1720,24 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 }
 
 // ---------------------------------------------------------------------------
-// TC26: inv_low fused into CRT (merged-psi path only).  A cluster of 8 CTAs
-// owns one 512-slot tile of one pair; CTA `rank` owns slots rank*64..+63.
-// Phase A: every CTA runs the inverse DIF low stages for primes
-// j = rank, rank+8, ... (two primes at a time, one per 256-thread half) and
-// scatters term_j = mont(r, n^-1*inv_j) straight into the owner's sA through
-// distributed shared memory.  Phase B..E = crt_tc2 on 64 rows (4 m-tiles per
-// B fragment).  The rc round trip of inv_low (read + write) disappears.
-// grid (n/64, 1, B), cluster (8,1,1), block 512, dynamic smem invcrt_smem().
+// TC26/TC27: inv_low fused into CRT (merged-psi path only).  A cluster of
+// CL = 512/ROWS CTAs owns one 512-slot tile of one pair; CTA `rank` owns slots
+// rank*ROWS..+ROWS-1 and the contiguous prime block rank*P..rank*P+P-1.
+// Phase A: inverse DIF low stages per prime (one prime per 256-thread half,
+// the next prime's tile + twiddles prefetched into registers), terms of 4
+// consecutive primes packed and sent to the owner's sA with one 16-byte
+// st.shared::cluster.v4.  Phases B..E = crt_tc2 on ROWS rows.
+// TC26 (ROWS 64, cluster 8, 1 CTA/SM): correct but 78 ms.  TC27: ROWS 32,
+// cluster 16 (non-portable) -> ~31 KB smem -> 3 CTAs/SM; v4 DSMEM stores.
+// grid (n/ROWS, 1, B), cluster (CL,1,1) set at launch, block ROWS*8.
 // ---------------------------------------------------------------------------
-constexpr unsigned IC_ROWS = 64, IC_CL = 8;
-inline std::size_t invcrt_smem(unsigned SA, unsigned SX) {
-    return ((std::size_t(IC_ROWS) * SA * 4 + 15) & ~std::size_t(15)) + std::size_t(IC_ROWS) * SX * 8;
+inline std::size_t invcrt_smem(unsigned rows, unsigned SA, unsigned SX) {
+    return ((std::size_t(rows) * SA * 4 + 15) & ~std::size_t(15)) + std::size_t(rows) * SX * 8;
+}
+inline unsigned invcrt_P(unsigned K, unsigned rows) {   // primes per rank
+    const unsigned cl = NT_TILE / rows, halves = rows / 32;
+    const unsigned q = 4 * halves;
+    return ((K + cl - 1) / cl + q - 1) / q * q;
 }
 #ifdef __CUDACC__
 __device__ __forceinline__ unsigned cl_rank() {
@@ -1740,69 +1746,74 @@ __device__ __forceinline__ unsigned cl_rank() {
 __device__ __forceinline__ void cl_sync() {
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
-__device__ __forceinline__ void st_cluster(const u32* local, unsigned rank, u32 v) {
-    const u32 a = u32(__cvta_generic_to_shared(local));
+__device__ __forceinline__ void st_cluster4(const u32* local, unsigned rank, u32 a, u32 b, u32 c, u32 d) {
+    const u32 ad = u32(__cvta_generic_to_shared(local));
     u32 ra;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(a), "r"(rank));
-    asm volatile("st.shared::cluster.u32 [%0], %1;" :: "r"(ra), "r"(v) : "memory");
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(ad), "r"(rank));
+    asm volatile("st.shared::cluster.v4.u32 [%0], {%1, %2, %3, %4};" :: "r"(ra), "r"(a), "r"(b), "r"(c), "r"(d) : "memory");
 }
 
-__global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(512, 1)
+template <unsigned ROWS>
+__global__ void __launch_bounds__(ROWS * 8, ROWS == 32 ? 3 : 1)
 inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         const uint2* __restrict__ frag, CrtTc cfg,
-        const u32* __restrict__ packed, unsigned logN) {
+        const u32* __restrict__ packed, unsigned logN, unsigned P) {
+    constexpr unsigned NTH = ROWS * 8, WARPS = NTH / 32, MT = ROWS / 16, HALVES = ROWS / 32;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     u32* sA = reinterpret_cast<u32*>(smem_raw);
-    unsigned char* r2 = smem_raw + ((std::size_t(IC_ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15));
+    unsigned char* r2 = smem_raw + ((std::size_t(ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15));
     u64* sX = reinterpret_cast<u64*>(r2);
     const unsigned n = pl.n, l = pl.limbs, K = pl.count;
     const unsigned tid = threadIdx.x, pair = blockIdx.z;
     const unsigned rank = cl_rank();
-    const unsigned tile = blockIdx.x / IC_CL;
-    const unsigned start = tile * NT_TILE + rank * IC_ROWS;
+    const unsigned tile = blockIdx.x / (NT_TILE / ROWS);
+    const unsigned start = tile * NT_TILE + rank * ROWS;
     const unsigned W = cfg.KS * 8;
 
-    // zero padding columns K+1..W-1 of own rows (terms come from the cluster)
     if (W > K + 1)
-    for (unsigned idx = tid; idx < IC_ROWS * (W - K - 1); idx += blockDim.x) {
+    for (unsigned idx = tid; idx < ROWS * (W - K - 1); idx += NTH) {
         const unsigned r = idx / (W - K - 1), j = K + 1 + idx % (W - K - 1);
         sA[r * cfg.SA + j] = 0u;
     }
+    cl_sync();   // all CTAs of the cluster running before DSMEM stores
 
-    cl_sync();   // every CTA of the cluster is running before DSMEM stores
-
-    // ---- Phase A: inverse low stages, two primes at once (half = tid>>8)
+    // ---- Phase A
     {
         const unsigned h = tid >> 8, t = tid & 255;
         u32* sa = reinterpret_cast<u32*>(r2) + h * (NT_TILE + NT_TILE / 32 + TC_LT);
         u32* sr = sa + NT_TILE + NT_TILE / 32;
-        const unsigned per = (K + IC_CL - 1 - rank) / IC_CL;       // primes of this rank
-        const unsigned iters = (per + 1) / 2;
-        // destination of positions t and t+256 (slot -> owner rank, row)
-        const unsigned o0 = t / IC_ROWS, w0 = t % IC_ROWS;
-        const unsigned o1 = (t + 256) / IC_ROWS, w1 = (t + 256) % IC_ROWS;
-        for (unsigned it = 0; it < iters; ++it) {
-            const unsigned jj = 2 * it + h;
-            const bool ok = jj < per;
-            const unsigned j = rank + IC_CL * jj;
-            const u64 base = (u64(pair) * K + j) * n + u64(tile) * NT_TILE;
-            if (ok) {
-                for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(j) * TC_LT + x];
-                sa[padw(t)] = rc[base + t];
-                sa[padw(t + 256)] = rc[base + t + 256];
+        const unsigned PH = P / HALVES;                 // multiple of 4
+        const unsigned jb = rank * P + h * PH;          // first prime of this half
+        const unsigned o0 = t / ROWS, w0 = t % ROWS;
+        const unsigned o1 = (t + 256) / ROWS, w1 = (t + 256) % ROWS;
+        const u64 tb = u64(tile) * NT_TILE;
+        u32 c0 = 0, c1 = 0, cw0 = 0, cw1 = 0;
+        if (jb < K) {
+            const u64 base = (u64(pair) * K + jb) * n + tb;
+            c0 = rc[base + t]; c1 = rc[base + t + 256];
+            cw0 = packed[u64(jb) * TC_LT + t]; cw1 = packed[u64(jb) * TC_LT + t + 256];
+        }
+        u32 k0[4], k1[4];
+        for (unsigned jj = 0; jj < PH; ++jj) {
+            const unsigned j = jb + jj;
+            u32 n0 = 0, n1 = 0, nw0 = 0, nw1 = 0;
+            if (jj + 1 < PH && j + 1 < K) {
+                const u64 base = (u64(pair) * K + j + 1) * n + tb;
+                n0 = rc[base + t]; n1 = rc[base + t + 256];
+                nw0 = packed[u64(j + 1) * TC_LT + t]; nw1 = packed[u64(j + 1) * TC_LT + t + 256];
             }
+            sa[padw(t)] = c0; sa[padw(t + 256)] = c1;
+            sr[t] = cw0; sr[t + 256] = cw1;
             __syncthreads();
-            const gpu31::Prime p = c_crt_prime[ok ? j : 0];
+            const gpu31::Prime p = c_crt_prime[j < K ? j : 0];
 #pragma unroll
             for (int m = 8; m >= 5; --m) {
-                if (ok) {
-                    const unsigned half = 1u << m, jx = t & (half - 1);
-                    const unsigned first = 2 * (t - jx) + jx, second = first + half;
-                    const u32 w = sr[TWI(m, jx)];
-                    const u32 u = sa[padw(first)], v = sa[padw(second)];
-                    sa[padw(first)] = gpu31::add(u, v, p.p);
-                    sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
-                }
+                const unsigned half = 1u << m, jx = t & (half - 1);
+                const unsigned first = 2 * (t - jx) + jx, second = first + half;
+                const u32 w = sr[TWI(m, jx)];
+                const u32 u = sa[padw(first)], v = sa[padw(second)];
+                sa[padw(first)] = gpu31::add(u, v, p.p);
+                sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
                 __syncthreads();
             }
             u32 a0 = sa[padw(t)], a1 = sa[padw(t + 256)];
@@ -1821,17 +1832,29 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
                     a1 = gpu31::add(a1, v1, p.p);
                 }
             }
-            if (ok) {
-                const u32 c = c_crt_slotc[j];
-                st_cluster(sA + w0 * cfg.SA + j, o0, gpu31::mont(a0, c, p));
-                st_cluster(sA + w1 * cfg.SA + j, o1, gpu31::mont(a1, c, p));
+            const unsigned q = jj & 3;
+            u32 e0 = 0u, e1 = 0u;
+            if (j < K) {
+                const u32 cc = c_crt_slotc[j];
+                e0 = gpu31::mont(a0, cc, p);
+                e1 = gpu31::mont(a1, cc, p);
             }
-            __syncthreads();   // sa/sr reused by the next iteration
+#pragma unroll
+            for (unsigned z = 0; z < 4; ++z) if (z == q) { k0[z] = e0; k1[z] = e1; }
+            if (q == 3) {
+                const unsigned j0 = j - 3;
+                if (j0 + 4 <= W) {
+                    st_cluster4(sA + w0 * cfg.SA + j0, o0, k0[0], k0[1], k0[2], k0[3]);
+                    st_cluster4(sA + w1 * cfg.SA + j0, o1, k1[0], k1[1], k1[2], k1[3]);
+                }
+            }
+            c0 = n0; c1 = n1; cw0 = nw0; cw1 = nw1;
+            __syncthreads();   // sa/sr reused next iteration
         }
     }
     cl_sync();
 
-    // ---- Phase B: fixed-point correction v = round(sum term_j/p_j), 8 threads/row
+    // ---- Phase B: v = round(sum term_j/p_j), 8 threads/row
     {
         const unsigned row = tid >> 3, q = tid & 7;
         u64 fsum = 0;
@@ -1844,26 +1867,26 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
     }
     __syncthreads();
 
-    // ---- Phase C: GEMM, 16 warps split n-tiles, 4 m-tiles per B fragment
+    // ---- Phase C: GEMM, warps split n-tiles, MT m-tiles per B fragment
     {
         const unsigned warp = tid >> 5, lane = tid & 31;
         const unsigned g = lane >> 2, t = lane & 3;
         const bool odd = t & 1;
         const unsigned sh = (t & 1) * 16;
-        for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 32) {
-            const unsigned ntA = nt0, ntB = nt0 + 16;
+        for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 2 * WARPS) {
+            const unsigned ntA = nt0, ntB = nt0 + WARPS;
             const bool hasB = ntB < cfg.NT;
-            int acc[4][2][4];
+            int acc[MT][2][4];
 #pragma unroll
-            for (unsigned mt = 0; mt < 4; ++mt)
+            for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
                 for (unsigned q = 0; q < 2; ++q) acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
-#pragma unroll 2
+#pragma unroll 3
             for (unsigned ks = 0; ks < cfg.KS; ++ks) {
                 const uint2 b0 = frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane];
                 const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
 #pragma unroll
-                for (unsigned mt = 0; mt < 4; ++mt) {
+                for (unsigned mt = 0; mt < MT; ++mt) {
                     const u32* q0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
                     const u32* q1 = q0 + 8 * cfg.SA;
                     const u32 x0 = q0[0], x1 = q1[0], x2 = q0[4], x3 = q1[4];
@@ -1872,7 +1895,7 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
                 }
             }
 #pragma unroll
-            for (unsigned mt = 0; mt < 4; ++mt)
+            for (unsigned mt = 0; mt < MT; ++mt)
 #pragma unroll
                 for (unsigned q = 0; q < 2; ++q) {
                     if (q == 1 && !hasB) continue;
@@ -1889,10 +1912,10 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
     }
     __syncthreads();
 
-    // ---- Phase D: carry + reduce, one thread per row, digits in place over sX
+    // ---- Phase D: carry + reduce
     const unsigned DS = 2 * cfg.SX;
     u32* digits = reinterpret_cast<u32*>(sX);
-    if (tid < IC_ROWS) {
+    if (tid < ROWS) {
         u32* dg = digits + tid * DS;
         const u64* xs = sX + tid * cfg.SX;
         u64 carry = 0;
@@ -1910,9 +1933,9 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
     }
     __syncthreads();
 
-    // ---- Phase E: store rows (slot -> coefficient brv(slot))
+    // ---- Phase E: store
     const u64 obase = u64(pair) * n * l;
-    for (unsigned idx = tid; idx < IC_ROWS * l; idx += blockDim.x) {
+    for (unsigned idx = tid; idx < ROWS * l; idx += NTH) {
         const unsigned r = idx / l, cc = idx - r * l;
         const unsigned pos = __brev(start + r) >> (32 - logN);
         out[obase + u64(pos) * l + cc] = digits[r * DS + cc];

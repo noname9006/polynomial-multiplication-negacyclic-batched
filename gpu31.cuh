@@ -813,6 +813,7 @@ struct Device {
     bool tc_crt2 = false;  // TC15 CRT variant
     bool tc_invcrt = false; // TC26: inv_low fused into CRT (cluster of 8, DSMEM)
     std::size_t invcrt_shared = 0;
+    unsigned invcrt_rows = 32;
     bool tc_tail = false;  // TC17: per-pair tail on two streams
     unsigned crt2_SA = 0;
     std::size_t crt2_shared = 0;
@@ -1156,9 +1157,19 @@ struct Device {
             if (tc_invcrt) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
-                tc::inv_crt<<<dim3(n / tc::IC_ROWS, 1, B), 512, invcrt_shared, stream>>>(
-                    crt_args_, prc, pc, d_fcrt, c2, d_pk_inv, logN);
-                st = cudaGetLastError();
+                const unsigned R = invcrt_rows, P = tc::invcrt_P(k, R);
+                cudaLaunchConfig_t cf = {};
+                cudaLaunchAttribute at[1];
+                at[0].id = cudaLaunchAttributeClusterDimension;
+                at[0].val.clusterDim.x = tc::NT_TILE / R; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+                cf.gridDim = dim3(n / R, 1, B); cf.blockDim = dim3(R * 8, 1, 1);
+                cf.dynamicSmemBytes = invcrt_shared; cf.stream = stream; cf.attrs = at; cf.numAttrs = 1;
+                const uint2* fr = reinterpret_cast<const uint2*>(d_fcrt);
+                st = (R == 32) ? cudaLaunchKernelEx(&cf, tc::inv_crt<32>, crt_args_, (const u32*)prc, pc, fr, c2,
+                                                    (const u32*)d_pk_inv, logN, P)
+                               : cudaLaunchKernelEx(&cf, tc::inv_crt<64>, crt_args_, (const u32*)prc, pc, fr, c2,
+                                                    (const u32*)d_pk_inv, logN, P);
+                if (st == cudaSuccess) st = cudaGetLastError();
                 if (prof) for (int e = 5; e <= 7; ++e) cudaEventRecord(ev_[e], stream);
                 return st;
             }
@@ -1220,11 +1231,31 @@ private:
                 while (s2 % 32 != 4 && s2 % 32 != 28) ++s2;
                 crt2_SA = s2;
                 crt2_shared = tc::crt_tc2_smem(crt2_SA, crt_cfg.SX);
-                invcrt_shared = tc::invcrt_smem(crt2_SA, crt_cfg.SX);
-                if (cudaFuncSetAttribute(tc::inv_crt, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                         int(invcrt_shared)) != cudaSuccess) {
+                // TC27: prefer 32 rows / cluster 16 (non-portable), else 64 / 8
+                invcrt_shared = 0;
+                {
+                    const std::size_t s32 = tc::invcrt_smem(32, crt2_SA, crt_cfg.SX);
+                    bool ok = cudaFuncSetAttribute(tc::inv_crt<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(s32)) == cudaSuccess &&
+                              cudaFuncSetAttribute(tc::inv_crt<32>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) == cudaSuccess;
+                    if (ok) {
+                        cudaLaunchConfig_t cf = {};
+                        cudaLaunchAttribute at[1];
+                        at[0].id = cudaLaunchAttributeClusterDimension;
+                        at[0].val.clusterDim.x = 16; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+                        cf.gridDim = dim3(plan_.N / 32, 1, 1); cf.blockDim = dim3(256, 1, 1);
+                        cf.dynamicSmemBytes = s32; cf.attrs = at; cf.numAttrs = 1;
+                        int ncl = 0;
+                        ok = cudaOccupancyMaxActiveClusters(&ncl, tc::inv_crt<32>, &cf) == cudaSuccess && ncl > 0;
+                    }
                     cudaGetLastError();
-                    invcrt_shared = 0;
+                    if (ok) { invcrt_rows = 32; invcrt_shared = s32; }
+                    else {
+                        const std::size_t s64 = tc::invcrt_smem(64, crt2_SA, crt_cfg.SX);
+                        if (cudaFuncSetAttribute(tc::inv_crt<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(s64)) == cudaSuccess) {
+                            invcrt_rows = 64; invcrt_shared = s64;
+                        }
+                        cudaGetLastError();
+                    }
                 }
             }
             if (crt_tc_shared > 48 * 1024) {

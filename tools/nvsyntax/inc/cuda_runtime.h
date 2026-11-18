@@ -3,7 +3,7 @@
 typedef int cudaError_t;
 const cudaError_t cudaSuccess = 0, cudaErrorInvalidValue = 1;
 enum cudaMemcpyKind { cudaMemcpyHostToHost, cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost, cudaMemcpyDeviceToDevice };
-enum cudaFuncAttribute { cudaFuncAttributeMaxDynamicSharedMemorySize, cudaFuncAttributePreferredSharedMemoryCarveout };
+enum cudaFuncAttribute { cudaFuncAttributeMaxDynamicSharedMemorySize, cudaFuncAttributePreferredSharedMemoryCarveout, cudaFuncAttributeNonPortableClusterSizeAllowed };
 struct CUstream_st; typedef CUstream_st* cudaStream_t;
 struct CUevent_st; typedef CUevent_st* cudaEvent_t;
 struct cudaDeviceProp { int major, minor; std::size_t sharedMemPerBlock, sharedMemPerBlockOptin; int multiProcessorCount; char name[256]; };
@@ -22,3 +22,8 @@ struct dim3 { unsigned x, y, z; dim3(unsigned a=1,unsigned b=1,unsigned c=1):x(a
 const unsigned cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2;
 CUDA_ANY(cudaStreamCreateWithFlags)
 CUDA_ANY(cudaMemcpyFromSymbol)
+enum cudaLaunchAttributeID { cudaLaunchAttributeClusterDimension };
+struct cudaLaunchAttributeValue { struct { unsigned x, y, z; } clusterDim; };
+struct cudaLaunchAttribute { cudaLaunchAttributeID id; cudaLaunchAttributeValue val; };
+struct cudaLaunchConfig_t { dim3 gridDim, blockDim; std::size_t dynamicSmemBytes; cudaStream_t stream; cudaLaunchAttribute* attrs; unsigned numAttrs; };
+CUDA_ANY(cudaLaunchKernelEx) CUDA_ANY(cudaOccupancyMaxActiveClusters)
