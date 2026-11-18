@@ -1200,6 +1200,7 @@ private:
             {
                 const unsigned K = plan_.K, N = plan_.N, logN = plan_.logN;
                 std::vector<u32> t(std::size_t(K) * N), ts(std::size_t(K) * N);
+                std::vector<u32> slotc(K, 0u);
                 for (unsigned kk = 0; kk < K; ++kk) {
                     const Prime& pr = plan_.primes[kk];
                     const u32 inv_m = plan_.crt_primes[kk].inv;
@@ -1211,6 +1212,7 @@ private:
                     const u32 ninv = host_powmod(N % pr.p, pr.p - 2, pr.p);
                     const u32 cst = u32(u64(ninv) * inv_m % pr.p);
                     for (unsigned i = 0; i < N; ++i) ts[std::size_t(kk) * N + i] = cst;
+                    slotc[kk] = cst;
 #else
                     for (unsigned i = 0; i < N; ++i)
                         ts[std::size_t(kk) * N + i] =
@@ -1218,6 +1220,11 @@ private:
 #endif
                 }
                 upload_u32(d_untw_inv, t);
+#if TC22_MERGED
+                if (K <= tc::CRT_KMAX_C &&
+                    cudaMemcpyToSymbol(tc::c_crt_slotc, slotc.data(), K * sizeof(u32)) != cudaSuccess)
+                    cudaGetLastError();
+#endif
                 if (N >= 1024 && N % tc::NT_TILE == 0 && N / tc::NT_TILE <= 128 && N / tc::NT_TILE >= 2) {
                     upload_u32(d_untw_slot, ts);
                     build_ntt_tables();

@@ -167,6 +167,7 @@ __device__ unsigned long long g_tcprof[16];
 constexpr unsigned CRT_KMAX_C = 128;
 __constant__ gpu31::Prime c_crt_prime[CRT_KMAX_C];
 __constant__ u32 c_crt_corr[CRT_KMAX_C];
+__constant__ u32 c_crt_slotc[CRT_KMAX_C];   // TC23: merged-NTT per-prime n^-1*inv
 #define TCP_T(v) const long long v = (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) ? (long long)clock64() : 0
 #define TCP_ADD(slot, a, b) do { if (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) \
     atomicAdd(&g_tcprof[slot], (unsigned long long)((b) - (a))); } while (0)
@@ -331,13 +332,13 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + 2 * q;
                 r[q] = (j < K && active) ? residues[rbase + u64(j) * n + i] : 0u;
-                u[q] = (j < K && active) ? untw_inv[u64(j) * n + i] : 0u;
+                u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
             }
 #pragma unroll
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + 2 * q;
                 if (j < K) {
-                    const u32 term = gpu31::mont(r[q], u[q], c_crt_prime[j]);
+                    const u32 term = gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
                     fsum += (u64(term) * c_crt_corr[j]) >> 30;
                 }
@@ -510,13 +511,13 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + NG * q;
                 r[q] = (j < K && active) ? residues[rbase + u64(j) * n + i] : 0u;
-                u[q] = (j < K && active) ? untw_inv[u64(j) * n + i] : 0u;
+                u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
             }
 #pragma unroll
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + NG * q;
                 if (j < K) {
-                    const u32 term = gpu31::mont(r[q], u[q], c_crt_prime[j]);
+                    const u32 term = gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
                     fsum += (u64(term) * c_crt_corr[j]) >> 30;
                 }
