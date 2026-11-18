@@ -713,7 +713,7 @@ void* fherma_init(const fherma::Point& p) {
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_crt2 = false;
                         std::fprintf(stderr, "[TC] crt2=%d SA=%u smem=%zu\n", int(d.tc_crt2), d.crt2_SA, d.crt2_shared);
                     }
-                    if (d.tc_crt2 && TC22_MERGED && d.invcrt_shared && p.N % 512 == 0) {   // TC26
+                    if (false && d.tc_crt2 && TC22_MERGED && d.invcrt_shared && p.N % 512 == 0) {   // TC26: correct but 78 ms (1 CTA/SM), see log
                         d.tc_invcrt = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_invcrt = false;
                         std::fprintf(stderr, "[TC] invcrt=%d smem=%zu\n", int(d.tc_invcrt), d.invcrt_shared);
