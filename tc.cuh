@@ -247,8 +247,10 @@ __device__ __forceinline__ void ldmatrix_a4(u32& a0, u32& a1, u32& a2, u32& a3,
     const unsigned r = lane & 7, m = lane >> 3;
     const u32* addr = sA + (mt * 16 + r + (m & 1) * 8) * SA + ks * 8 + (m >> 1) * 4;
     u32 a0v, a1v, a2v, a3v;
-    const unsigned sh = static_cast<unsigned>(__cvta_generic_to_shared(addr));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" \n        : "=r"(a0v), "=r"(a1v), "=r"(a2v), "=r"(a3v) : "r"(sh));
+    asm volatile("{ .reg .u32 sh; cvta.to.shared.u32 sh, %4; "
+                 "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [sh]; }\n"
+        : "=r"(a0v), "=r"(a1v), "=r"(a2v), "=r"(a3v)
+        : "l"(addr));
     a0 = a0v; a1 = a1v; a2 = a2v; a3 = a3v;
 }
 
