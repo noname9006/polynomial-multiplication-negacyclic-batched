@@ -787,6 +787,7 @@ struct Device {
     bool tc_ntt_ready = false, tc_ntt = false;
     bool tc_efl = false;   // TC5: encode fused with fwd low stages
     bool tc_crt2 = false;  // TC15 CRT variant
+    bool tc_tail = false;  // TC17: per-pair tail on two streams
     unsigned crt2_SA = 0;
     std::size_t crt2_shared = 0;
     bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
@@ -922,6 +923,32 @@ struct Device {
                 cudaStreamWaitEvent(stream, evj_[1], 0);
                 if (profiling_)
                     for (int e = 1; e <= kStages; ++e) cudaEventRecord(ev_[e], stream);
+                return cudaGetLastError();
+            }
+            if (tc_tail && cs_[0] && cs_[1] && B > 1) {
+                // TC17: encode batched over all pairs; the tail (fused_high,
+                // inv_low, CRT) pair by pair on two streams so each pair's rc
+                // (K x N x 4 B ~ 31 MB) stays in L2 between the three kernels.
+                st = tc_pipeline(d_a, d_b, d_c, d_ra, d_rb, d_rc, B, stream, profiling_, 1);
+                if (st != cudaSuccess) return st;
+                cudaEventRecord(evf_, stream);
+                cudaStreamWaitEvent(cs_[0], evf_, 0);
+                cudaStreamWaitEvent(cs_[1], evf_, 0);
+                const std::size_t in_stride = std::size_t(n) * l;
+                const std::size_t res_stride = std::size_t(k) * n;
+                for (u32 j = 0; j < B; ++j) {
+                    const unsigned sl = j & 1u;
+                    st = tc_pipeline(d_a + j * in_stride, d_b + j * in_stride, d_c + j * in_stride,
+                                     d_ra + j * res_stride, d_rb + j * res_stride,
+                                     d_rc + sl * res_stride, 1, cs_[sl], false, 2);
+                    if (st != cudaSuccess) return st;
+                }
+                cudaEventRecord(evj_[0], cs_[0]);
+                cudaEventRecord(evj_[1], cs_[1]);
+                cudaStreamWaitEvent(stream, evj_[0], 0);
+                cudaStreamWaitEvent(stream, evj_[1], 0);
+                if (profiling_)
+                    for (int e = 4; e <= kStages; ++e) cudaEventRecord(ev_[e], stream);
                 return cudaGetLastError();
             }
             return tc_pipeline(d_a, d_b, d_c, d_ra, d_rb, d_rc, B, stream, profiling_);
@@ -1069,10 +1096,12 @@ struct Device {
     }
 
     cudaError_t tc_pipeline(const u32* pa, const u32* pb, u32* pc, u32* pra, u32* prb, u32* prc,
-                            u32 B, cudaStream_t stream, bool prof) {
+                            u32 B, cudaStream_t stream, bool prof, int part = 0) {
+        // part 0: whole pipeline, 1: encode (+fwd low) only, 2: tail only
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
         cudaError_t st = cudaSuccess;
             const unsigned logH = logN - 9;
+            if (part != 2) {
             if (tc_efl) {
                 tc::encode_fwdlow<<<dim3(n / tc::EF_ROWS, 2, B), 512, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights, d_reversed_twist,
@@ -1091,6 +1120,8 @@ struct Device {
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) cudaEventRecord(ev_[3], stream);
             }
+            }
+            if (part == 1) return cudaGetLastError();
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
                 pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH);
