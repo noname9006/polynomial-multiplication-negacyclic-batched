@@ -119,6 +119,17 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 
 #if defined(__CUDACC__)
 
+// Phase profiling: thread (0,0) of every CTA adds clock64 deltas per phase.
+// Slots: CRT 0 staging, 1 A-load, 2 mma+epilogue, 3 carry/reduce, 4 store;
+//        fused_high 5 load, 6 fwd, 7 pointwise, 8 inverse, 9 store.
+#ifndef TC_PROF
+#define TC_PROF 1
+#endif
+__device__ unsigned long long g_tcprof[16];
+#define TCP_T(v) const long long v = (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) ? (long long)clock64() : 0
+#define TCP_ADD(slot, a, b) do { if (TC_PROF && threadIdx.x == 0 && threadIdx.y == 0) \
+    atomicAdd(&g_tcprof[slot], (unsigned long long)((b) - (a))); } while (0)
+
 __device__ __forceinline__ void mma_u8(int (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3,
                                        u32 b0, u32 b1) {
     asm volatile(
@@ -266,6 +277,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     const u64 rbase = u64(pair) * K * n;
     const unsigned W = cfg.KS * 8;
 
+    TCP_T(t0);
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
     u64 fsum = 0;
 #pragma unroll 4
@@ -293,6 +305,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     }
     __syncthreads();
 
+    TCP_T(t1);
     // 2. A fragments to registers
     const unsigned warp = tid >> 5, lane = tid & 31;
     const unsigned g = lane >> 2, t = lane & 3;
@@ -310,6 +323,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     }
     __syncthreads();   // sA is now overwritten by sX
 
+    TCP_T(t2);
     // 3. GEMM over output byte positions, CRT_NTB chains in flight
     const bool odd = t & 1;
     const unsigned sh = (t & 1) * 16;
@@ -348,6 +362,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     }
     __syncthreads();
 
+    TCP_T(t3);
     // 4. carry + reduce, one thread per coefficient, digits in place over sX
     const unsigned DS = 2 * cfg.SX;
     u32* digits = reinterpret_cast<u32*>(smem_raw);
@@ -369,6 +384,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     }
     __syncthreads();
 
+    TCP_T(t4);
     // 5. store the tile's rows
     const unsigned rows = (n - start < CRT_ROWS) ? (n - start) : CRT_ROWS;
     if (slot_logN == 0) {
@@ -385,6 +401,9 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
             out[obase + u64(pos) * l + cc] = digits[r * DS + cc];
         }
     }
+    TCP_T(t5);
+    TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2); TCP_ADD(2, t2, t3);
+    TCP_ADD(3, t3, t4); TCP_ADD(4, t4, t5);
 }
 
 
@@ -459,11 +478,13 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
         wai[q] = q < logH ? twi[u64(k) * TWS + q * NT_TILE + low] : 0u;
     }
 
+    TCP_T(f0);
     for (unsigned h = rw; h < HC; h += 8) {
         sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
         sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
     }
     __syncthreads();
+    TCP_T(f1);
 #pragma unroll
     for (unsigned s = 0; s < 7; ++s) {
         if (s >= logH) break;
@@ -477,9 +498,11 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
         }
         __syncthreads();
     }
+    TCP_T(f2);
     for (unsigned h = rw; h < HC; h += 8)
         sa[h * S + lane] = gpu31::mont(sa[h * S + lane], sb[h * S + lane], p);
     __syncthreads();
+    TCP_T(f3);
 #pragma unroll
     for (int s = 6; s >= 0; --s) {
         if (unsigned(s) >= logH) continue;
@@ -494,8 +517,12 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
         }
         __syncthreads();
     }
+    TCP_T(f4);
     for (unsigned h = rw; h < HC; h += 8)
         rc[plane + u64(h) * NT_TILE + low] = sa[h * S + lane];
+    TCP_T(f5);
+    TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
+    TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
 }
 
 // inverse DIF low stages in 512-tiles (output: bit-reversed slot order).

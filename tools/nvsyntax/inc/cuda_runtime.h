@@ -21,3 +21,4 @@ struct dim3 { unsigned x, y, z; dim3(unsigned a=1,unsigned b=1,unsigned c=1):x(a
 
 const unsigned cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2;
 CUDA_ANY(cudaStreamCreateWithFlags)
+CUDA_ANY(cudaMemcpyFromSymbol)

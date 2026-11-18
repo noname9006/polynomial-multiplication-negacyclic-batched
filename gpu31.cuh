@@ -1034,6 +1034,27 @@ struct Device {
             std::fprintf(stderr, " %s %.3f", names[i], t);
         }
         std::fprintf(stderr, " | total %.3f\n", sum);
+        {
+            unsigned long long h[16] = {};
+            if (cudaMemcpyFromSymbol(h, tc::g_tcprof, sizeof(h)) == cudaSuccess) {
+                const char* nm[10] = {"crt.stage", "crt.aload", "crt.mma", "crt.carry", "crt.store",
+                                      "fh.load", "fh.fwd", "fh.pw", "fh.inv", "fh.store"};
+                double c = 0, fsum = 0;
+                for (int i = 0; i < 5; ++i) c += double(h[i]);
+                for (int i = 5; i < 10; ++i) fsum += double(h[i]);
+                std::fprintf(stderr, "[PROF] crt Gcyc=%.2f:", c / 1e9);
+                for (int i = 0; i < 5; ++i)
+                    std::fprintf(stderr, " %s %.1f%%", nm[i], c > 0 ? 100.0 * double(h[i]) / c : 0.0);
+                std::fprintf(stderr, " | fh Gcyc=%.2f:", fsum / 1e9);
+                for (int i = 5; i < 10; ++i)
+                    std::fprintf(stderr, " %s %.1f%%", nm[i], fsum > 0 ? 100.0 * double(h[i]) / fsum : 0.0);
+                std::fprintf(stderr, "\n");
+                unsigned long long z[16] = {};
+                cudaMemcpyToSymbol(tc::g_tcprof, z, sizeof(z));
+            } else {
+                cudaGetLastError();
+            }
+        }
     }
 
     cudaError_t tc_pipeline(const u32* pa, const u32* pb, u32* pc, u32* pra, u32* prb, u32* prc,
