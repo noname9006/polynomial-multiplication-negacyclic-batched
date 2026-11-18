@@ -1258,25 +1258,6 @@ private:
                 }
             }
         }
-#if TC21_SHOUP
-        // [plain w | floor(w * 2^32 / p)] per prime for the Shoup butterflies
-        {
-            std::vector<u32> sf(std::size_t(K) * 512), si(std::size_t(K) * 512);
-            for (unsigned kk = 0; kk < K; ++kk) {
-                const Prime& pr = plan_.primes[kk];
-                for (unsigned p = 0; p < T / 2; ++p) {
-                    const u32 wf = mont(pf[std::size_t(kk) * (T / 2) + p], 1u, pr);
-                    const u32 wi = mont(pi[std::size_t(kk) * (T / 2) + p], 1u, pr);
-                    sf[std::size_t(kk) * 512 + p] = wf;
-                    sf[std::size_t(kk) * 512 + 256 + p] = u32((u64(wf) << 32) / pr.p);
-                    si[std::size_t(kk) * 512 + p] = wi;
-                    si[std::size_t(kk) * 512 + 256 + p] = u32((u64(wi) << 32) / pr.p);
-                }
-            }
-            pf.swap(sf);
-            pi.swap(si);
-        }
-#endif
         upload_u32(d_pk_fwd, pf);
         upload_u32(d_pk_inv, pi);
         upload_u32(d_twf, tf);
