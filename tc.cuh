@@ -511,6 +511,150 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
     c[base + t + 256] = sa[padw(t + 256)];
 }
 
+
+// ---------------------------------------------------------------------------
+// TC5: encode + forward DIT low stages in one kernel.  A CTA owns 512
+// consecutive output positions (one NTT low tile) of one operand and loops
+// over groups of 8 primes: tensor-core encode -> twisted residues into shared
+// -> 9 DIT stages in shared -> one coalesced 2 KB store per prime.  The
+// separate fwd_low pass (read+write of ra and rb) disappears.
+// grid (n/512, 2, B), block 512 (16 warps x 32 rows), static smem ~25 KB.
+// ---------------------------------------------------------------------------
+constexpr unsigned EF_ROWS = 512;
+constexpr unsigned EF_NTB = 4;                 // n-tiles per group = 8 primes
+constexpr unsigned EF_PR = EF_NTB * 2;
+constexpr unsigned EF_PT = NT_TILE + NT_TILE / 32;
+__global__ void __launch_bounds__(512, 1)
+encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
+              u32* __restrict__ ra, u32* __restrict__ rb,
+              const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
+              const gpu31::Weight* __restrict__ weights, const u32* __restrict__ rtwist,
+              const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
+              unsigned logN, unsigned KS, unsigned NT) {
+    __shared__ u32 sT[EF_PR][EF_PT];
+    __shared__ u32 sR[EF_PR][NT_TILE / 2];
+    const u32* src = blockIdx.y ? src_b : src_a;
+    u32* dst = blockIdx.y ? rb : ra;
+    const unsigned pair = blockIdx.z;
+    const unsigned start = blockIdx.x * EF_ROWS;
+    const u64 base = u64(pair) * n * l;
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid >> 5, lane = tid & 31;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const unsigned rowbase = warp * 32;
+
+    // A fragments straight from global (rows are bit-reversed coefficients)
+    u32 a[2][ENC_KS_MAX][4];
+#pragma unroll
+    for (unsigned mt = 0; mt < 2; ++mt) {
+        const unsigned i0 = start + rowbase + mt * 16 + g, i1 = i0 + 8;
+        const u32* r0 = src + base + u64(__brev(i0) >> (32 - logN)) * l;
+        const u32* r1 = src + base + u64(__brev(i1) >> (32 - logN)) * l;
+#pragma unroll
+        for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
+            const unsigned w0 = ks * 8 + t, w1 = w0 + 4;
+            const bool on = ks < KS;
+            a[mt][ks][0] = (on && w0 < l) ? r0[w0] : 0u;
+            a[mt][ks][1] = (on && w0 < l) ? r1[w0] : 0u;
+            a[mt][ks][2] = (on && w1 < l) ? r0[w1] : 0u;
+            a[mt][ks][3] = (on && w1 < l) ? r1[w1] : 0u;
+        }
+    }
+
+    const bool odd = t & 1;
+    const unsigned sh = (t & 1) * 16;
+    const u64 rbase = u64(pair) * K * n;
+
+    for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
+        // twiddles of this group's primes
+        for (unsigned idx = tid; idx < EF_PR * (NT_TILE / 2); idx += blockDim.x) {
+            const unsigned q = idx / (NT_TILE / 2), r = idx % (NT_TILE / 2);
+            const unsigned kk = nt0 * 2 + q;
+            sR[q][r] = kk < K ? packed[u64(kk) * (NT_TILE / 2) + r] : 0u;
+        }
+        int acc[2][EF_NTB][4];
+        u32 tw[2][EF_NTB];
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (unsigned j = 0; j < EF_NTB; ++j) {
+                acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0;
+                const unsigned k = (nt0 + j) * 2 + (t >> 1);
+                const unsigned i = start + rowbase + mt * 16 + g + (odd ? 8 : 0);
+                tw[mt][j] = k < K ? rtwist[u64(k) * n + i] : 0u;
+            }
+#pragma unroll
+        for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
+            if (ks < KS) {
+                uint2 b[EF_NTB];
+#pragma unroll
+                for (unsigned j = 0; j < EF_NTB; ++j) {
+                    const unsigned nt = nt0 + j;
+                    b[j] = nt < NT ? frag[(std::size_t(nt) * KS + ks) * 32 + lane] : make_uint2(0u, 0u);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < EF_NTB; ++j)
+                    if (nt0 + j < NT) {
+                        mma_u8(acc[0][j], a[0][ks][0], a[0][ks][1], a[0][ks][2], a[0][ks][3], b[j].x, b[j].y);
+                        mma_u8(acc[1][j], a[1][ks][0], a[1][ks][1], a[1][ks][2], a[1][ks][3], b[j].x, b[j].y);
+                    }
+            }
+        }
+#pragma unroll
+        for (unsigned j = 0; j < EF_NTB; ++j) {
+            const unsigned k = (nt0 + j) * 2 + (t >> 1);
+            gpu31::Prime p{};
+            gpu31::Weight w0{};
+            if (k < K) { p = primes[k]; w0 = weights[std::size_t(k) * l]; }
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const u64 pg = (u64(u32(acc[mt][j][0])) << sh) + (u64(u32(acc[mt][j][1])) << (sh + 8));
+                const u64 pg8 = (u64(u32(acc[mt][j][2])) << sh) + (u64(u32(acc[mt][j][3])) << (sh + 8));
+                const u64 send = odd ? pg : pg8;
+                const u64 mine = odd ? pg8 : pg;
+                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                u32 val = 0;
+                if (k < K) {
+                    const u32 lo = gpu31::canonical_word(u32(tot), p.p);
+                    u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
+                    if (hi >= p.p) hi -= p.p;
+                    val = gpu31::mont(gpu31::add(lo, hi, p.p), tw[mt][j], p);
+                }
+                const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);
+                sT[j * 2 + (t >> 1)][padw(rl)] = val;
+            }
+        }
+        __syncthreads();
+
+        // 9 DIT stages on 8 primes: 8*256 butterflies, 4 per thread per stage
+        gpu31::Prime pq[4];
+#pragma unroll
+        for (unsigned rep = 0; rep < 4; ++rep) {
+            const unsigned q = (tid >> 8) + rep * 2;
+            const unsigned kk = nt0 * 2 + q;
+            pq[rep] = primes[kk < K ? kk : 0];
+        }
+#pragma unroll
+        for (unsigned m = 0; m < 9; ++m) {
+            const unsigned half = 1u << m;
+#pragma unroll
+            for (unsigned rep = 0; rep < 4; ++rep) {
+                const unsigned q = (tid >> 8) + rep * 2, bt = tid & 255;
+                const unsigned j = bt & (half - 1);
+                const unsigned first = 2 * (bt - j) + j, second = first + half;
+                gpu31::butterfly(sT[q][padw(first)], sT[q][padw(second)], sR[q][j << (8 - m)], pq[rep]);
+            }
+            __syncthreads();
+        }
+        for (unsigned idx = tid; idx < EF_PR * NT_TILE; idx += blockDim.x) {
+            const unsigned q = idx / NT_TILE, pos = idx % NT_TILE;
+            const unsigned kk = nt0 * 2 + q;
+            if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
+        }
+        __syncthreads();
+    }
+}
+
 #endif  // __CUDACC__
 
 }  // namespace tc

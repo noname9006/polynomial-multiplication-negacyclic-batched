@@ -785,6 +785,7 @@ struct Device {
     u32 *d_pk_fwd = nullptr, *d_pk_inv = nullptr, *d_twf = nullptr, *d_twi = nullptr,
         *d_untw_slot = nullptr;
     bool tc_ntt_ready = false, tc_ntt = false;
+    bool tc_efl = false;   // TC5: encode fused with fwd low stages
     unsigned enc_KS = 0, enc_NT = 0;
     tc::CrtTc crt_cfg{};
     std::size_t crt_tc_shared = 0;
@@ -887,6 +888,14 @@ struct Device {
 
         if (tc_ntt && tc_enc && tc_crt && !skip_crt) {
             const unsigned logH = logN - 9;
+            if (tc_efl) {
+                tc::encode_fwdlow<<<dim3(n / tc::EF_ROWS, 2, B), 512, 0, stream>>>(
+                    d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
+                if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                if (profiling_) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
+                                  cudaEventRecord(ev_[3], stream); }
+            } else {
             tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 256, 0, stream>>>(
                 d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
                 n, l, k, logN, enc_KS, enc_NT);
@@ -896,6 +905,7 @@ struct Device {
                 d_ra, d_rb, d_primes, d_pk_fwd, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (profiling_) cudaEventRecord(ev_[3], stream);
+            }
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
                 d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH);
