@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <vector>
 #include <random>
+#include <cstdlib>
 typedef uint32_t u32; typedef uint64_t u64;
 struct Prime { u32 p, neg_inv, r2, one; };
 u32 mont(u32 a, u32 b, const Prime& p) { u64 t = u64(a) * b; u32 m = u32(t) * p.neg_inv; u32 u = u32((t + u64(m) * p.p) >> 32); return u >= p.p ? u - p.p : u; }
@@ -12,8 +13,9 @@ void butterfly(u32& a, u32& b, u32 w, const Prime& p) { u32 u = a, v = mont(b, w
 u32 rev(u32 x, unsigned bits) { u32 r = 0; for (unsigned i = 0; i < bits; i++) { r = (r << 1) | (x & 1); x >>= 1; } return r; }
 u32 pw(u32 a, u64 e, u32 p) { u32 r = 1; while (e) { if (e & 1) r = u32(u64(r) * a % p); a = u32(u64(a) * a % p); e >>= 1; } return r; }
 bool isprime(u32 p) { for (u32 d = 2; u64(d) * d <= p; d++) if (p % d == 0) return false; return true; }
-int main() {
-  const unsigned N = 4096, logN = 12, T = 512, HC = N / T, logH = 3;
+int main(int argc, char** argv) {
+  const unsigned logN = argc > 1 ? atoi(argv[1]) : 12, N = 1u << logN, T = 512, HC = N / T, logH = logN - 9;
+  const bool R4 = argc > 2 && atoi(argv[2]);
   u32 pp = ((1u << 31) - 2) / (2 * N) * (2 * N) + 1; while (!isprime(pp)) pp -= 2 * N;
   u32 inv = 1; for (int j = 0; j < 5; j++) inv *= 2 - pp * inv;
   u32 one = u32((u64(1) << 32) % pp);
@@ -39,8 +41,27 @@ int main() {
   // fused_high (per column low)
   for (unsigned low = 0; low < T; low++) {
     std::vector<u32> sa(HC), sb(HC); for (unsigned h = 0; h < HC; h++) { sa[h] = ra[h * T + low]; sb[h] = rb[h * T + low]; }
+    auto TWF=[&](unsigned st, unsigned w){ return mont(roots[size_t(low) << (logH - st - 1)], roots[size_t(w * T) << (logH - st - 1)], pr); };
+    auto TWI=[&](unsigned st, unsigned w){ return mont(iroots[size_t(low) << (logH - st - 1)], iroots[size_t(w * T) << (logH - st - 1)], pr); };
+    if (R4) {
+      for (unsigned s = 0; s + 1 < logH; s += 2) { unsigned H = 1u << s; for (unsigned g = 0; g < HC / 4; g++) { unsigned w = g & (H - 1), r0 = (g - w) * 4 + w;
+        u32 t1 = TWF(s, w), t2 = TWF(s + 1, w), t3 = TWF(s + 1, w + H);
+        for (std::vector<u32>* X : {&sa, &sb}) { auto& x = *X; butterfly(x[r0], x[r0 + H], t1, pr); butterfly(x[r0 + 2 * H], x[r0 + 3 * H], t1, pr); butterfly(x[r0], x[r0 + 2 * H], t2, pr); butterfly(x[r0 + H], x[r0 + 3 * H], t3, pr); } } }
+      if (logH & 1) { unsigned s = logH - 1, H = 1u << s; for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = TWF(s, within); butterfly(sa[first], sa[second], w, pr); butterfly(sb[first], sb[second], w, pr); } }
+    } else
     for (unsigned s = 0; s < logH; s++) { unsigned H = 1u << s, off = T * (H - 1); for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = mont(roots[size_t(low) << (logH - s - 1)], roots[size_t(within * T) << (logH - s - 1)], pr); butterfly(sa[first], sa[second], w, pr); butterfly(sb[first], sb[second], w, pr); } }
     for (unsigned h = 0; h < HC; h++) sa[h] = mont(sa[h], sb[h], pr);
+    if (R4) {
+      if (logH & 1) { unsigned s = logH - 1, H = 1u << s; for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = TWI(s, within); u32 u = sa[first], v = sa[second]; sa[first] = add(u, v, pp); sa[second] = mont(sub(u, v, pp), w, pr); } }
+      for (int s = 4; s >= 0; s -= 2) { if (unsigned(s) + 2 > logH - (logH & 1)) continue; unsigned H = 1u << s;
+        for (unsigned g = 0; g < HC / 4; g++) { unsigned w = g & (H - 1), r0 = (g - w) * 4 + w; u32 t2 = TWI(s + 1, w), t3 = TWI(s + 1, w + H), t1 = TWI(s, w);
+          u32 x0 = sa[r0], x1 = sa[r0 + H], x2 = sa[r0 + 2 * H], x3 = sa[r0 + 3 * H], u, v;
+          u = x0; v = x2; x0 = add(u, v, pp); x2 = mont(sub(u, v, pp), t2, pr);
+          u = x1; v = x3; x1 = add(u, v, pp); x3 = mont(sub(u, v, pp), t3, pr);
+          u = x0; v = x1; x0 = add(u, v, pp); x1 = mont(sub(u, v, pp), t1, pr);
+          u = x2; v = x3; x2 = add(u, v, pp); x3 = mont(sub(u, v, pp), t1, pr);
+          sa[r0] = x0; sa[r0 + H] = x1; sa[r0 + 2 * H] = x2; sa[r0 + 3 * H] = x3; } }
+    } else
     for (unsigned s = logH; s-- > 0;) { unsigned H = 1u << s, off = T * (H - 1); for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = mont(iroots[size_t(low) << (logH - s - 1)], iroots[size_t(within * T) << (logH - s - 1)], pr); u32 u = sa[first], v = sa[second]; sa[first] = add(u, v, pp); sa[second] = mont(sub(u, v, pp), w, pr); } }
     for (unsigned h = 0; h < HC; h++) rc[h * T + low] = sa[h];
   }
