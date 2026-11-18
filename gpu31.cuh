@@ -1087,7 +1087,7 @@ private:
                             t[std::size_t(kk) * N + reverse_bits(i, logN)];
                 }
                 upload_u32(d_untw_inv, t);
-                if (N >= 1024 && N % tc::NT_TILE == 0 && N / tc::NT_TILE <= 128) {
+                if (N >= 1024 && N % tc::NT_TILE == 0 && N / tc::NT_TILE <= 128 && N / tc::NT_TILE >= 2) {
                     upload_u32(d_untw_slot, ts);
                     build_ntt_tables();
                 }
@@ -1113,7 +1113,8 @@ private:
         unsigned logH = 0;
         while ((1u << logH) < HC) ++logH;
         std::vector<u32> pf(std::size_t(K) * (T / 2)), pi(pf.size());
-        std::vector<u32> tf(std::size_t(K) * (HC - 1) * T), ti(tf.size());
+        const std::size_t TWS = 7 * T + 127;
+        std::vector<u32> tf(std::size_t(K) * TWS, 0u), ti(tf.size(), 0u);
         for (unsigned kk = 0; kk < K; ++kk) {
             const u32* r = plan_.roots.data() + std::size_t(kk) * (N / 2);
             const u32* ri = plan_.inverse_roots.data() + std::size_t(kk) * (N / 2);
@@ -1122,13 +1123,15 @@ private:
                 pi[std::size_t(kk) * (T / 2) + p] = ri[std::size_t(p) * HC];
             }
             for (unsigned st = 0; st < logH; ++st) {
-                const unsigned H = 1u << st, off = T * (H - 1);
-                for (unsigned w = 0; w < H; ++w)
-                    for (unsigned low = 0; low < T; ++low) {
-                        const std::size_t e = std::size_t(w * T + low) << (logH - st - 1);
-                        tf[std::size_t(kk) * (HC - 1) * T + off + w * T + low] = r[e];
-                        ti[std::size_t(kk) * (HC - 1) * T + off + w * T + low] = ri[e];
-                    }
+                const unsigned H = 1u << st, d = logH - st - 1;
+                for (unsigned low = 0; low < T; ++low) {
+                    tf[std::size_t(kk) * TWS + st * T + low] = r[std::size_t(low) << d];
+                    ti[std::size_t(kk) * TWS + st * T + low] = ri[std::size_t(low) << d];
+                }
+                for (unsigned w = 0; w < H; ++w) {
+                    tf[std::size_t(kk) * TWS + 7 * T + (H - 1) + w] = r[std::size_t(w * T) << d];
+                    ti[std::size_t(kk) * TWS + 7 * T + (H - 1) + w] = ri[std::size_t(w * T) << d];
+                }
             }
         }
         upload_u32(d_pk_fwd, pf);

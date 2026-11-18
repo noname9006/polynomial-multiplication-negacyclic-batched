@@ -450,6 +450,8 @@ __global__ void __launch_bounds__(256)
 fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH) {
+    // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
+    // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
     constexpr unsigned S = NT_COLS + 1;
     const unsigned HC = 1u << logH;
@@ -460,20 +462,29 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     const unsigned k = blockIdx.y;
     const u64 plane = (u64(blockIdx.z) * K + k) * n;
     const gpu31::Prime p = primes[k];
-    const u32* tf = twf + u64(k) * (HC - 1) * NT_TILE;
-    const u32* ti = twi + u64(k) * (HC - 1) * NT_TILE;
+    constexpr unsigned TWS = 7 * NT_TILE + 127;
+    const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
+    const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
+    u32 waf[7], wai[7];
+#pragma unroll
+    for (unsigned q = 0; q < 7; ++q) {
+        waf[q] = q < logH ? twf[u64(k) * TWS + q * NT_TILE + low] : 0u;
+        wai[q] = q < logH ? twi[u64(k) * TWS + q * NT_TILE + low] : 0u;
+    }
 
     for (unsigned h = rw; h < HC; h += 8) {
         sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
         sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
     }
     __syncthreads();
-    for (unsigned s = 0; s < logH; ++s) {
-        const unsigned H = 1u << s, off = NT_TILE * (H - 1);
+#pragma unroll
+    for (unsigned s = 0; s < 7; ++s) {
+        if (s >= logH) break;
+        const unsigned H = 1u << s;
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = tf[off + within * NT_TILE + low];
+            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
             gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
             gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
@@ -482,12 +493,14 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     for (unsigned h = rw; h < HC; h += 8)
         sa[h * S + lane] = gpu31::mont(sa[h * S + lane], sb[h * S + lane], p);
     __syncthreads();
-    for (unsigned s = logH; s-- > 0;) {
-        const unsigned H = 1u << s, off = NT_TILE * (H - 1);
+#pragma unroll
+    for (int s = 6; s >= 0; --s) {
+        if (unsigned(s) >= logH) continue;
+        const unsigned H = 1u << s;
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = ti[off + within * NT_TILE + low];
+            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
             sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);

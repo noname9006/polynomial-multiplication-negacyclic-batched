@@ -39,9 +39,9 @@ int main() {
   // fused_high (per column low)
   for (unsigned low = 0; low < T; low++) {
     std::vector<u32> sa(HC), sb(HC); for (unsigned h = 0; h < HC; h++) { sa[h] = ra[h * T + low]; sb[h] = rb[h * T + low]; }
-    for (unsigned s = 0; s < logH; s++) { unsigned H = 1u << s, off = T * (H - 1); for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = tf[off + within * T + low]; butterfly(sa[first], sa[second], w, pr); butterfly(sb[first], sb[second], w, pr); } }
+    for (unsigned s = 0; s < logH; s++) { unsigned H = 1u << s, off = T * (H - 1); for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = mont(roots[size_t(low) << (logH - s - 1)], roots[size_t(within * T) << (logH - s - 1)], pr); butterfly(sa[first], sa[second], w, pr); butterfly(sb[first], sb[second], w, pr); } }
     for (unsigned h = 0; h < HC; h++) sa[h] = mont(sa[h], sb[h], pr);
-    for (unsigned s = logH; s-- > 0;) { unsigned H = 1u << s, off = T * (H - 1); for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = ti[off + within * T + low]; u32 u = sa[first], v = sa[second]; sa[first] = add(u, v, pp); sa[second] = mont(sub(u, v, pp), w, pr); } }
+    for (unsigned s = logH; s-- > 0;) { unsigned H = 1u << s, off = T * (H - 1); for (unsigned h = 0; h < HC / 2; h++) { unsigned within = h & (H - 1), first = 2 * (h - within) + within, second = first + H; u32 w = mont(iroots[size_t(low) << (logH - s - 1)], iroots[size_t(within * T) << (logH - s - 1)], pr); u32 u = sa[first], v = sa[second]; sa[first] = add(u, v, pp); sa[second] = mont(sub(u, v, pp), w, pr); } }
     for (unsigned h = 0; h < HC; h++) rc[h * T + low] = sa[h];
   }
   // inv_low
