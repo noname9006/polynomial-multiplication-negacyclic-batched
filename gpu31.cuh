@@ -779,6 +779,7 @@ struct Device {
     // point fits; enabled by the caller only after a self-check passes.
     uint2 *d_fenc = nullptr, *d_fcrt = nullptr;
     u32* d_untw_inv = nullptr;   // mont-form untwist * (P/p)^-1, for fused decode
+    u32* d_corr_m = nullptr;     // floor(2^62 / p_k), fixed-point CRT correction
     bool tc_fuse_decode = false;
     // TC3 fused NTT pipeline tables
     u32 *d_pk_fwd = nullptr, *d_pk_inv = nullptr, *d_twf = nullptr, *d_twi = nullptr,
@@ -886,7 +887,7 @@ struct Device {
 
         if (tc_ntt && tc_enc && tc_crt && !skip_crt) {
             const unsigned logH = logN - 9;
-            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 128, 0, stream>>>(
+            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 256, 0, stream>>>(
                 d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
                 n, l, k, logN, enc_KS, enc_NT);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
@@ -906,7 +907,7 @@ struct Device {
             if (profiling_) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
-                                                   d_primes, d_untw_slot, logN);
+                                                   d_primes, d_untw_slot, logN, d_corr_m);
             st = cudaGetLastError();
             if (profiling_) cudaEventRecord(ev_[7], stream);
             return st;
@@ -914,7 +915,7 @@ struct Device {
 
         if (tc_enc) {
             // 1+2. tensor-core encode reads bit-reversed rows directly.
-            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 128, 0, stream>>>(
+            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 256, 0, stream>>>(
                 d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
                 n, l, k, logN, enc_KS, enc_NT);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
@@ -974,7 +975,7 @@ struct Device {
         if (!skip_crt && tc_crt) {
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
-                                                   d_primes, tc_fuse_decode ? d_untw_inv : nullptr, 0u);
+                                                   d_primes, tc_fuse_decode ? d_untw_inv : nullptr, 0u, d_corr_m);
             st = cudaGetLastError();
         } else if (!skip_crt) {
             reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
@@ -1042,7 +1043,14 @@ private:
             crt_cfg.NT = nt;
             crt_cfg.SA = tc::crt_sa_stride(ks);
             crt_cfg.SX = 2 * nt + 1;
-            crt_cfg.DS = (plan_.L + 2) | 1u;
+            crt_cfg.DS = 2 * crt_cfg.SX;
+            {
+                std::vector<u32> cm(plan_.K);
+                for (unsigned kk = 0; kk < plan_.K; ++kk)
+                    cm[kk] = u32((u64(1) << 62) / plan_.primes[kk].p);
+                upload_u32(d_corr_m, cm);
+                if (!d_corr_m) return;
+            }
             crt_tc_shared = tc::crt_tc_smem(crt_cfg);
             if (crt_tc_shared > 48 * 1024) {
                 if (cudaFuncSetAttribute(tc::crt_tc, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1161,6 +1169,8 @@ private:
         if (d_fenc) cudaFree(d_fenc);
         if (d_fcrt) cudaFree(d_fcrt);
         if (d_untw_inv) cudaFree(d_untw_inv);
+        if (d_corr_m) cudaFree(d_corr_m);
+        d_corr_m = nullptr;
         d_untw_inv = nullptr;
         for (u32** pp : {&d_pk_fwd, &d_pk_inv, &d_twf, &d_twi, &d_untw_slot}) {
             if (*pp) cudaFree(*pp);

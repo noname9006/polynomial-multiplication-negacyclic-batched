@@ -111,9 +111,9 @@ inline std::vector<u32> bake_crt(const std::vector<u32>& weights, unsigned L, un
     return frag;
 }
 
-inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8 words, == 4 (mod 32)
-    unsigned s = KS * 8;
-    while (s % 32 != 4) ++s;
+inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 32)
+    unsigned s = KS * 8 + 4;
+    while (s % 32 != 4 && s % 32 != 28) ++s;
     return s;
 }
 
@@ -133,7 +133,8 @@ __device__ __forceinline__ void mma_u8(int (&c)[4], u32 a0, u32 a1, u32 a2, u32 
 // exactly what gpu31 reindex + encode_tiled produce.
 // grid (ceil(n/128), 2 operands, B), block 128, smem ENC_ROWS*ENC_S*4.
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(128)
+constexpr unsigned ENC_NTB = 8;   // independent accumulator chains per warp
+__global__ void __launch_bounds__(256, 2)
 encode_tc(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
           u32* __restrict__ ra, u32* __restrict__ rb,
           const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
@@ -160,54 +161,67 @@ encode_tc(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 
     const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const unsigned g = lane >> 2, t = lane & 3;
-    const unsigned rowbase = warp * 32;
+    const unsigned rowbase = warp * 16;
 
-    u32 a[2][ENC_KS_MAX][4];
+    u32 a[ENC_KS_MAX][4];
 #pragma unroll
-    for (unsigned mt = 0; mt < 2; ++mt)
-#pragma unroll
-        for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
-            const u32* r0 = sA + (rowbase + mt * 16 + g) * ENC_S + ks * 8 + t;
-            const u32* r1 = r0 + 8 * ENC_S;
-            const bool on = ks < KS;
-            a[mt][ks][0] = on ? r0[0] : 0;
-            a[mt][ks][1] = on ? r1[0] : 0;
-            a[mt][ks][2] = on ? r0[4] : 0;
-            a[mt][ks][3] = on ? r1[4] : 0;
-        }
+    for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
+        const u32* r0 = sA + (rowbase + g) * ENC_S + ks * 8 + t;
+        const u32* r1 = r0 + 8 * ENC_S;
+        const bool on = ks < KS;
+        a[ks][0] = on ? r0[0] : 0;
+        a[ks][1] = on ? r1[0] : 0;
+        a[ks][2] = on ? r0[4] : 0;
+        a[ks][3] = on ? r1[4] : 0;
+    }
 
+    const bool odd = t & 1;
+    const unsigned sh = (t & 1) * 16;
+    const unsigned i = start + rowbase + g + (odd ? 8 : 0);
+    const bool rowok = i < n;
     const u64 rbase = u64(pair) * K * n;
-    for (unsigned nt = 0; nt < NT; ++nt) {
-        int acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
-        const uint2* fp = frag + std::size_t(nt) * KS * 32 + lane;
+
+    for (unsigned nt0 = 0; nt0 < NT; nt0 += ENC_NTB) {
+        int acc[ENC_NTB][4];
+        u32 tw[ENC_NTB];
+#pragma unroll
+        for (unsigned j = 0; j < ENC_NTB; ++j) {
+            acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
+            const unsigned k = (nt0 + j) * 2 + (t >> 1);
+            tw[j] = (k < K && rowok) ? rtwist[u64(k) * n + i] : 0u;
+        }
 #pragma unroll
         for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
             if (ks < KS) {
-                const uint2 b = fp[ks * 32];
-                mma_u8(acc[0], a[0][ks][0], a[0][ks][1], a[0][ks][2], a[0][ks][3], b.x, b.y);
-                mma_u8(acc[1], a[1][ks][0], a[1][ks][1], a[1][ks][2], a[1][ks][3], b.x, b.y);
+                uint2 b[ENC_NTB];
+#pragma unroll
+                for (unsigned j = 0; j < ENC_NTB; ++j) {
+                    const unsigned nt = nt0 + j;
+                    if (nt < NT) b[j] = frag[(std::size_t(nt) * KS + ks) * 32 + lane];
+                    else b[j] = make_uint2(0u, 0u);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < ENC_NTB; ++j)
+                    if (nt0 + j < NT)
+                        mma_u8(acc[j], a[ks][0], a[ks][1], a[ks][2], a[ks][3], b[j].x, b[j].y);
             }
         }
-        const unsigned k = nt * 2 + (t >> 1);
-        const unsigned sh = (t & 1) * 16;
-        const bool odd = t & 1;
-        gpu31::Prime p{};
-        gpu31::Weight w0{};
-        if (k < K) { p = primes[k]; w0 = weights[std::size_t(k) * l]; }
 #pragma unroll
-        for (unsigned mt = 0; mt < 2; ++mt) {
-            const u64 pg = (u64(u32(acc[mt][0])) << sh) + (u64(u32(acc[mt][1])) << (sh + 8));
-            const u64 pg8 = (u64(u32(acc[mt][2])) << sh) + (u64(u32(acc[mt][3])) << (sh + 8));
+        for (unsigned j = 0; j < ENC_NTB; ++j) {
+            const u64 pg = (u64(u32(acc[j][0])) << sh) + (u64(u32(acc[j][1])) << (sh + 8));
+            const u64 pg8 = (u64(u32(acc[j][2])) << sh) + (u64(u32(acc[j][3])) << (sh + 8));
             const u64 send = odd ? pg : pg8;
             const u64 mine = odd ? pg8 : pg;
             const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
-            const unsigned i = start + rowbase + mt * 16 + g + (odd ? 8 : 0);
-            if (k < K && i < n) {
+            const unsigned k = (nt0 + j) * 2 + (t >> 1);
+            if (k < K && rowok) {
+                const gpu31::Prime p = primes[k];
+                const gpu31::Weight w0 = weights[std::size_t(k) * l];
                 const u32 lo = gpu31::canonical_word(u32(tot), p.p);
                 u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
                 if (hi >= p.p) hi -= p.p;
                 const u32 v = gpu31::add(lo, hi, p.p);
-                dst[rbase + u64(k) * n + i] = gpu31::mont(v, rtwist[u64(k) * n + i], p);
+                dst[rbase + u64(k) * n + i] = gpu31::mont(v, tw[j], p);
             }
         }
     }
@@ -226,30 +240,22 @@ struct CrtTc {
 inline std::size_t crt_tc_smem(const CrtTc& c) {
     std::size_t a = std::size_t(CRT_ROWS) * c.SA * 4;
     const std::size_t x = std::size_t(CRT_ROWS) * c.SX * 8;
-    if (x > a) a = x;
-    a = (a + 15) & ~std::size_t(15);
-    return a + std::size_t(CRT_ROWS) * c.DS * 4 + 2 * CRT_ROWS * sizeof(double) + 16;
+    return a > x ? a : x;
 }
 
-__global__ void __launch_bounds__(128)
+constexpr unsigned CRT_NTB = 7;   // independent accumulator chains per warp
+__global__ void __launch_bounds__(128, 3)
 crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
-       unsigned slot_logN) {
+       unsigned slot_logN, const u32* __restrict__ corr_m) {
     // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
     // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
+    // Shared: one region, used as sA (u32, stride SA) -> sX (u64, stride SX)
+    // -> digits (u32, in place over sX, stride 2*SX).
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    std::size_t abytes = std::size_t(CRT_ROWS) * cfg.SA * 4;
-    {
-        const std::size_t x = std::size_t(CRT_ROWS) * cfg.SX * 8;
-        if (x > abytes) abytes = x;
-        abytes = (abytes + 15) & ~std::size_t(15);
-    }
     u32* sA = reinterpret_cast<u32*>(smem_raw);
     u64* sX = reinterpret_cast<u64*>(smem_raw);
-    u32* digits = reinterpret_cast<u32*>(smem_raw + abytes);
-    double* red = reinterpret_cast<double*>(smem_raw + abytes + std::size_t(CRT_ROWS) * cfg.DS * 4 +
-                                            (16 - (std::size_t(CRT_ROWS) * cfg.DS * 4) % 16) % 16);
 
     const unsigned n = pl.n, l = pl.limbs, K = pl.count;
     const unsigned pair = blockIdx.z, start = blockIdx.x * CRT_ROWS;
@@ -260,25 +266,31 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     const u64 rbase = u64(pair) * K * n;
     const unsigned W = cfg.KS * 8;
 
-    // 1. terms, correction sum
-    double dsum = 0;
+    // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
+    u64 fsum = 0;
+#pragma unroll 4
     for (unsigned j = jg; j < K; j += 2) {
-        const gpu31::PrimeInfo pi = pl.primes[j];
         u32 term = 0;
         if (active) {
             const u32 r = residues[rbase + u64(j) * n + i];
-            if (untw_inv)   // fused decode: one Montgomery product by untwist*inv
+            if (untw_inv)
                 term = gpu31::mont(r, untw_inv[u64(j) * n + i], primes[j]);
             else
-                term = gpu31::weight_residue(r, pi);
+                term = gpu31::weight_residue(r, pl.primes[j]);
         }
         sA[c * cfg.SA + j] = term;
-        dsum += double(term) * pi.reciprocal;
+        fsum += (u64(term) * corr_m[j]) >> 30;
     }
-    red[jg * CRT_ROWS + c] = dsum;
     for (unsigned j = K + 1 + jg; j < W; j += 2) sA[c * cfg.SA + j] = 0;
+    // spare words W..W+3 of the row hold the two partial sums
+    sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
+    sA[c * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
     __syncthreads();
-    if (jg == 0) sA[c * cfg.SA + K] = u32(red[c] + red[CRT_ROWS + c] + 0.5);
+    if (jg == 0) {
+        const u32* rw = sA + c * cfg.SA + W;
+        const u64 s = (u64(rw[0]) | (u64(rw[1]) << 32)) + (u64(rw[2]) | (u64(rw[3]) << 32));
+        sA[c * cfg.SA + K] = u32((s + (u64(1) << 31)) >> 32);
+    }
     __syncthreads();
 
     // 2. A fragments to registers
@@ -298,33 +310,49 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     }
     __syncthreads();   // sA is now overwritten by sX
 
-    // 3. GEMM over output byte positions, fold into 32-bit-word partial sums
+    // 3. GEMM over output byte positions, CRT_NTB chains in flight
     const bool odd = t & 1;
     const unsigned sh = (t & 1) * 16;
-    for (unsigned nt = 0; nt < cfg.NT; ++nt) {
-        int acc[4] = {0, 0, 0, 0};
-        const uint2* fp = frag + std::size_t(nt) * cfg.KS * 32 + lane;
+    const unsigned row = rowbase + g + (odd ? 8 : 0);
+    for (unsigned nt0 = 0; nt0 < cfg.NT; nt0 += CRT_NTB) {
+        int acc[CRT_NTB][4];
+#pragma unroll
+        for (unsigned j = 0; j < CRT_NTB; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
 #pragma unroll
         for (unsigned ks = 0; ks < CRT_KS_MAX; ++ks) {
             if (ks < cfg.KS) {
-                const uint2 b = fp[ks * 32];
-                mma_u8(acc, a[ks][0], a[ks][1], a[ks][2], a[ks][3], b.x, b.y);
+                uint2 b[CRT_NTB];
+#pragma unroll
+                for (unsigned j = 0; j < CRT_NTB; ++j) {
+                    const unsigned nt = nt0 + j;
+                    if (nt < cfg.NT) b[j] = frag[(std::size_t(nt) * cfg.KS + ks) * 32 + lane];
+                    else b[j] = make_uint2(0u, 0u);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < CRT_NTB; ++j)
+                    if (nt0 + j < cfg.NT)
+                        mma_u8(acc[j], a[ks][0], a[ks][1], a[ks][2], a[ks][3], b[j].x, b[j].y);
             }
         }
-        const u64 pg = (u64(u32(acc[0])) << sh) + (u64(u32(acc[1])) << (sh + 8));
-        const u64 pg8 = (u64(u32(acc[2])) << sh) + (u64(u32(acc[3])) << (sh + 8));
-        const u64 send = odd ? pg : pg8;
-        const u64 mine = odd ? pg8 : pg;
-        const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
-        const unsigned row = rowbase + g + (odd ? 8 : 0);
-        const unsigned word = nt * 2 + (t >> 1);
-        sX[row * cfg.SX + word] = tot;
+#pragma unroll
+        for (unsigned j = 0; j < CRT_NTB; ++j) {
+            if (nt0 + j < cfg.NT) {
+                const u64 pg = (u64(u32(acc[j][0])) << sh) + (u64(u32(acc[j][1])) << (sh + 8));
+                const u64 pg8 = (u64(u32(acc[j][2])) << sh) + (u64(u32(acc[j][3])) << (sh + 8));
+                const u64 send = odd ? pg : pg8;
+                const u64 mine = odd ? pg8 : pg;
+                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                sX[row * cfg.SX + (nt0 + j) * 2 + (t >> 1)] = tot;
+            }
+        }
     }
     __syncthreads();
 
-    // 4. carry + reduce, one thread per coefficient
+    // 4. carry + reduce, one thread per coefficient, digits in place over sX
+    const unsigned DS = 2 * cfg.SX;
+    u32* digits = reinterpret_cast<u32*>(smem_raw);
     if (tid < CRT_ROWS) {
-        u32* dg = digits + tid * cfg.DS;
+        u32* dg = digits + tid * DS;
         const u64* xs = sX + tid * cfg.SX;
         u64 carry = 0;
         const unsigned words = cfg.NT * 2;
@@ -341,20 +369,20 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
     }
     __syncthreads();
 
-    // 5. coalesced store of the tile's rows
+    // 5. store the tile's rows
     const unsigned rows = (n - start < CRT_ROWS) ? (n - start) : CRT_ROWS;
     if (slot_logN == 0) {
         const u64 obase = u64(pair) * n * l + u64(start) * l;
         for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
             const unsigned r = idx / l, cc = idx - r * l;
-            out[obase + idx] = digits[r * cfg.DS + cc];
+            out[obase + idx] = digits[r * DS + cc];
         }
     } else {
         const u64 obase = u64(pair) * n * l;
         for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
             const unsigned r = idx / l, cc = idx - r * l;
             const unsigned pos = __brev(start + r) >> (32 - slot_logN);
-            out[obase + u64(pos) * l + cc] = digits[r * cfg.DS + cc];
+            out[obase + u64(pos) * l + cc] = digits[r * DS + cc];
         }
     }
 }

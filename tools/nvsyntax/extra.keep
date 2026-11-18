@@ -23,3 +23,4 @@ template<class T> inline T __shfl_sync(unsigned, T v, int, int=32){return v;}
 template<class T> inline T __ldg(const T* p){return *p;}
 inline void __syncwarp(unsigned=0){}
 inline int __popc(unsigned x){return __builtin_popcount(x);}
+inline uint2 make_uint2(unsigned a,unsigned b){return {a,b};}
