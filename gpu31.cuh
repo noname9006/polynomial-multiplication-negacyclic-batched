@@ -780,6 +780,10 @@ struct Device {
     uint2 *d_fenc = nullptr, *d_fcrt = nullptr;
     u32* d_untw_inv = nullptr;   // mont-form untwist * (P/p)^-1, for fused decode
     bool tc_fuse_decode = false;
+    // TC3 fused NTT pipeline tables
+    u32 *d_pk_fwd = nullptr, *d_pk_inv = nullptr, *d_twf = nullptr, *d_twi = nullptr,
+        *d_untw_slot = nullptr;
+    bool tc_ntt_ready = false, tc_ntt = false;
     unsigned enc_KS = 0, enc_NT = 0;
     tc::CrtTc crt_cfg{};
     std::size_t crt_tc_shared = 0;
@@ -880,6 +884,34 @@ struct Device {
         cudaError_t st = cudaSuccess;
         if (profiling_) cudaEventRecord(ev_[0], stream);
 
+        if (tc_ntt && tc_enc && tc_crt && !skip_crt) {
+            const unsigned logH = logN - 9;
+            tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 128, 0, stream>>>(
+                d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_reversed_twist,
+                n, l, k, logN, enc_KS, enc_NT);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (profiling_) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream); }
+            tc::fwd_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
+                d_ra, d_rb, d_primes, d_pk_fwd, n, k);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (profiling_) cudaEventRecord(ev_[3], stream);
+            tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
+                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
+                d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (profiling_) cudaEventRecord(ev_[4], stream);
+            tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
+                d_rc, d_primes, d_pk_inv, n, k);
+            if ((st = cudaGetLastError()) != cudaSuccess) return st;
+            if (profiling_) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
+            tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
+                          crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
+                                                   d_primes, d_untw_slot, logN);
+            st = cudaGetLastError();
+            if (profiling_) cudaEventRecord(ev_[7], stream);
+            return st;
+        }
+
         if (tc_enc) {
             // 1+2. tensor-core encode reads bit-reversed rows directly.
             tc::encode_tc<<<dim3((n + tc::ENC_ROWS - 1) / tc::ENC_ROWS, 2, B), 128, 0, stream>>>(
@@ -942,7 +974,7 @@ struct Device {
         if (!skip_crt && tc_crt) {
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, d_rc, d_c, d_fcrt, crt_cfg,
-                                                   d_primes, tc_fuse_decode ? d_untw_inv : nullptr);
+                                                   d_primes, tc_fuse_decode ? d_untw_inv : nullptr, 0u);
             st = cudaGetLastError();
         } else if (!skip_crt) {
             reconstruct_kernel<<<dim3((n + crt_tile_x - 1) / crt_tile_x, 1, B),
@@ -1024,25 +1056,68 @@ private:
             // fused decode table: decode(r) = r*u*R^-2, term = decode(r)*inv
             // -> c = mont(u, inv) = u*inv*R^-1, and mont(r, c) = r*u*inv*R^-2.
             {
-                const unsigned K = plan_.K, N = plan_.N;
-                std::vector<u32> t(std::size_t(K) * N);
+                const unsigned K = plan_.K, N = plan_.N, logN = plan_.logN;
+                std::vector<u32> t(std::size_t(K) * N), ts(std::size_t(K) * N);
                 for (unsigned kk = 0; kk < K; ++kk) {
                     const Prime& pr = plan_.primes[kk];
                     const u32 inv_m = plan_.crt_primes[kk].inv;
                     for (unsigned i = 0; i < N; ++i)
                         t[std::size_t(kk) * N + i] =
                             mont(plan_.untwist[std::size_t(kk) * N + i], inv_m, pr);
+                    for (unsigned i = 0; i < N; ++i)
+                        ts[std::size_t(kk) * N + i] =
+                            t[std::size_t(kk) * N + reverse_bits(i, logN)];
                 }
-                void* pt = nullptr;
-                if (cudaMalloc(&pt, t.size() * 4) == cudaSuccess &&
-                    cudaMemcpy(pt, t.data(), t.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess)
-                    d_untw_inv = static_cast<u32*>(pt);
-                else { if (pt) cudaFree(pt); cudaGetLastError(); }
+                upload_u32(d_untw_inv, t);
+                if (N >= 1024 && N % tc::NT_TILE == 0 && N / tc::NT_TILE <= 128) {
+                    upload_u32(d_untw_slot, ts);
+                    build_ntt_tables();
+                }
             }
         }
         std::fprintf(stderr, "[TC] enc ready=%d KS=%u NT=%u | crt ready=%d KS=%u NT=%u SA=%u smem=%zu\n",
                      int(tc_enc_ready), enc_KS, enc_NT, int(tc_crt_ready), crt_cfg.KS, crt_cfg.NT,
                      crt_cfg.SA, crt_tc_shared);
+    }
+    static void upload_u32(u32*& dst, const std::vector<u32>& src) {
+        void* p = nullptr;
+        if (cudaMalloc(&p, src.size() * sizeof(u32)) != cudaSuccess) { cudaGetLastError(); return; }
+        if (cudaMemcpy(p, src.data(), src.size() * sizeof(u32), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(p);
+            cudaGetLastError();
+            return;
+        }
+        dst = static_cast<u32*>(p);
+    }
+    void build_ntt_tables() {
+        const unsigned K = plan_.K, N = plan_.N, T = tc::NT_TILE;
+        const unsigned HC = N / T;
+        unsigned logH = 0;
+        while ((1u << logH) < HC) ++logH;
+        std::vector<u32> pf(std::size_t(K) * (T / 2)), pi(pf.size());
+        std::vector<u32> tf(std::size_t(K) * (HC - 1) * T), ti(tf.size());
+        for (unsigned kk = 0; kk < K; ++kk) {
+            const u32* r = plan_.roots.data() + std::size_t(kk) * (N / 2);
+            const u32* ri = plan_.inverse_roots.data() + std::size_t(kk) * (N / 2);
+            for (unsigned p = 0; p < T / 2; ++p) {
+                pf[std::size_t(kk) * (T / 2) + p] = r[std::size_t(p) * HC];
+                pi[std::size_t(kk) * (T / 2) + p] = ri[std::size_t(p) * HC];
+            }
+            for (unsigned st = 0; st < logH; ++st) {
+                const unsigned H = 1u << st, off = T * (H - 1);
+                for (unsigned w = 0; w < H; ++w)
+                    for (unsigned low = 0; low < T; ++low) {
+                        const std::size_t e = std::size_t(w * T + low) << (logH - st - 1);
+                        tf[std::size_t(kk) * (HC - 1) * T + off + w * T + low] = r[e];
+                        ti[std::size_t(kk) * (HC - 1) * T + off + w * T + low] = ri[e];
+                    }
+            }
+        }
+        upload_u32(d_pk_fwd, pf);
+        upload_u32(d_pk_inv, pi);
+        upload_u32(d_twf, tf);
+        upload_u32(d_twi, ti);
+        tc_ntt_ready = d_pk_fwd && d_pk_inv && d_twf && d_twi && d_untw_slot;
     }
     static void upload_words(uint2*& dst, const std::vector<u32>& src) {
         void* p = nullptr;
@@ -1087,6 +1162,10 @@ private:
         if (d_fcrt) cudaFree(d_fcrt);
         if (d_untw_inv) cudaFree(d_untw_inv);
         d_untw_inv = nullptr;
+        for (u32** pp : {&d_pk_fwd, &d_pk_inv, &d_twf, &d_twi, &d_untw_slot}) {
+            if (*pp) cudaFree(*pp);
+            *pp = nullptr;
+        }
         d_fenc = d_fcrt = nullptr;
         for (int i = 0; i <= kStages; ++i)
             if (ev_[i]) cudaEventDestroy(ev_[i]);

@@ -234,7 +234,10 @@ inline std::size_t crt_tc_smem(const CrtTc& c) {
 __global__ void __launch_bounds__(128)
 crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
-       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv) {
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       unsigned slot_logN) {
+    // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
+    // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::size_t abytes = std::size_t(CRT_ROWS) * cfg.SA * 4;
     {
@@ -340,11 +343,144 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
 
     // 5. coalesced store of the tile's rows
     const unsigned rows = (n - start < CRT_ROWS) ? (n - start) : CRT_ROWS;
-    const u64 obase = u64(pair) * n * l + u64(start) * l;
-    for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
-        const unsigned r = idx / l, cc = idx - r * l;
-        out[obase + idx] = digits[r * cfg.DS + cc];
+    if (slot_logN == 0) {
+        const u64 obase = u64(pair) * n * l + u64(start) * l;
+        for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
+            const unsigned r = idx / l, cc = idx - r * l;
+            out[obase + idx] = digits[r * cfg.DS + cc];
+        }
+    } else {
+        const u64 obase = u64(pair) * n * l;
+        for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
+            const unsigned r = idx / l, cc = idx - r * l;
+            const unsigned pos = __brev(start + r) >> (32 - slot_logN);
+            out[obase + u64(pos) * l + cc] = digits[r * cfg.DS + cc];
+        }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Fused NTT pipeline (TC3).  Forward: gpu31's DIT (bit-reversed twisted input
+// from encode_tc -> low stages in 512-tiles -> high stages across tiles, natural
+// order out).  The high forward stages, the pointwise product and the high
+// stages of a Gentleman-Sande DIF inverse run in ONE kernel per column group,
+// then the DIF low stages run in 512-tiles; the result is in bit-reversed slot
+// order, which crt_tc (slot_logN) consumes directly.  No reindex, no
+// scattered pointwise store, no separate decode pass.
+// ---------------------------------------------------------------------------
+constexpr unsigned NT_TILE = 512;
+constexpr unsigned NT_COLS = 32;
+__device__ __forceinline__ unsigned padw(unsigned x) { return x + (x >> 5); }
+
+// forward DIT low stages over both operands (identical to ntt_fast low).
+__global__ void __launch_bounds__(256)
+fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict__ primes,
+        const u32* __restrict__ packed, unsigned n, unsigned K) {
+    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sb[NT_TILE + NT_TILE / 32], sr[NT_TILE / 2];
+    const unsigned t = threadIdx.x;
+    const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
+    const gpu31::Prime p = primes[blockIdx.y];
+    sr[t] = packed[u64(blockIdx.y) * (NT_TILE / 2) + t];
+    sa[padw(t)] = a[base + t];
+    sa[padw(t + 256)] = a[base + t + 256];
+    sb[padw(t)] = b[base + t];
+    sb[padw(t + 256)] = b[base + t + 256];
+    __syncthreads();
+#pragma unroll
+    for (unsigned m = 0; m < 9; ++m) {
+        const unsigned half = 1u << m, j = t & (half - 1);
+        const unsigned first = 2 * (t - j) + j, second = first + half;
+        const u32 w = sr[j << (8 - m)];
+        gpu31::butterfly(sa[padw(first)], sa[padw(second)], w, p);
+        gpu31::butterfly(sb[padw(first)], sb[padw(second)], w, p);
+        __syncthreads();
+    }
+    a[base + t] = sa[padw(t)];
+    a[base + t + 256] = sa[padw(t + 256)];
+    b[base + t] = sb[padw(t)];
+    b[base + t + 256] = sb[padw(t + 256)];
+}
+
+// forward DIT high stages (a, b) + pointwise + inverse DIF high stages -> c.
+// grid (512/NT_COLS, K, B), block (NT_COLS, 8), smem 2*HC*(NT_COLS+1)*4.
+// tw tables: [k][(HC-1)*512], stage s at offset 512*(2^s-1), [within][low].
+__global__ void __launch_bounds__(256)
+fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
+           const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
+           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH) {
+    extern __shared__ u32 sm[];
+    constexpr unsigned S = NT_COLS + 1;
+    const unsigned HC = 1u << logH;
+    u32* sa = sm;
+    u32* sb = sm + HC * S;
+    const unsigned lane = threadIdx.x, rw = threadIdx.y;
+    const unsigned low = blockIdx.x * NT_COLS + lane;
+    const unsigned k = blockIdx.y;
+    const u64 plane = (u64(blockIdx.z) * K + k) * n;
+    const gpu31::Prime p = primes[k];
+    const u32* tf = twf + u64(k) * (HC - 1) * NT_TILE;
+    const u32* ti = twi + u64(k) * (HC - 1) * NT_TILE;
+
+    for (unsigned h = rw; h < HC; h += 8) {
+        sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
+        sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
+    }
+    __syncthreads();
+    for (unsigned s = 0; s < logH; ++s) {
+        const unsigned H = 1u << s, off = NT_TILE * (H - 1);
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = tf[off + within * NT_TILE + low];
+            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
+            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+        }
+        __syncthreads();
+    }
+    for (unsigned h = rw; h < HC; h += 8)
+        sa[h * S + lane] = gpu31::mont(sa[h * S + lane], sb[h * S + lane], p);
+    __syncthreads();
+    for (unsigned s = logH; s-- > 0;) {
+        const unsigned H = 1u << s, off = NT_TILE * (H - 1);
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = ti[off + within * NT_TILE + low];
+            const u32 u = sa[first * S + lane], v = sa[second * S + lane];
+            sa[first * S + lane] = gpu31::add(u, v, p.p);
+            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+        }
+        __syncthreads();
+    }
+    for (unsigned h = rw; h < HC; h += 8)
+        rc[plane + u64(h) * NT_TILE + low] = sa[h * S + lane];
+}
+
+// inverse DIF low stages in 512-tiles (output: bit-reversed slot order).
+__global__ void __launch_bounds__(256)
+inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
+        const u32* __restrict__ packed, unsigned n, unsigned K) {
+    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[NT_TILE / 2];
+    const unsigned t = threadIdx.x;
+    const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
+    const gpu31::Prime p = primes[blockIdx.y];
+    sr[t] = packed[u64(blockIdx.y) * (NT_TILE / 2) + t];
+    sa[padw(t)] = c[base + t];
+    sa[padw(t + 256)] = c[base + t + 256];
+    __syncthreads();
+#pragma unroll
+    for (int m = 8; m >= 0; --m) {
+        const unsigned half = 1u << m, j = t & (half - 1);
+        const unsigned first = 2 * (t - j) + j, second = first + half;
+        const u32 w = sr[j << (8 - m)];
+        const u32 u = sa[padw(first)], v = sa[padw(second)];
+        sa[padw(first)] = gpu31::add(u, v, p.p);
+        sa[padw(second)] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+        __syncthreads();
+    }
+    c[base + t] = sa[padw(t)];
+    c[base + t + 256] = sa[padw(t + 256)];
 }
 
 #endif  // __CUDACC__
