@@ -1466,11 +1466,22 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
 #else
         // twiddles of this group's primes
-        for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
-            const unsigned q = idx / TC_LT, r = idx % TC_LT;
-            const unsigned kk = nt0 * 2 + q;
-            sR[q][r] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
-        }
+                // OC17: precompute Shoup quotients for twiddles (reused across many butterflies)
+                for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
+                    const unsigned q = idx / TC_LT, r = idx % TC_LT;
+                    const unsigned kk = nt0 * 2 + q;
+                    const u32 tw = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
+                    sR[q][r] = tw;
+                }
+                // Precompute Shoup quotients for twiddles
+                __shared__ u32 sR_q[EF_PR][TC_LT];
+                for (unsigned idx = tid; idx < EF_PR * TC_LT; idx += blockDim.x) {
+                    const unsigned q = idx / TC_LT, r = idx % TC_LT;
+                    const u32 tw = sR[q][r];
+                    const unsigned kk = nt0 * 2 + q;
+                    const u32 p = (kk < K) ? primes[kk].p : 0u;
+                    sR_q[q][r] = (tw && p) ? u32((u64(tw) << 32) / p) : 0u;
+                }
         // this group's B fragments, shared by all 16 warps
         for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += blockDim.x) {
             const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
@@ -1569,14 +1580,15 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             for (unsigned rep = 0; rep < 4; ++rep) {
                 const unsigned q = jg + rep * 2;
                 const u32 w = sR[q][TWI(m, j)];
+                const u32 w_q = sR_q[q][TWI(m, j)];
                 const u32 x0 = __shfl_xor_sync(0xffffffffu, v0[rep], half);
                 const u32 x1 = __shfl_xor_sync(0xffffffffu, v1[rep], half);
                 if (bt & half) {
-                    v0[rep] = gpu31::sub(x0, gpu31::mont(v0[rep], w, pq[rep]), pq[rep].p);
-                    v1[rep] = gpu31::sub(x1, gpu31::mont(v1[rep], w, pq[rep]), pq[rep].p);
+                    v0[rep] = gpu31::sub(x0, gpu31::lazy_product(v0[rep], {w, w_q}, pq[rep].p), pq[rep].p);
+                    v1[rep] = gpu31::sub(x1, gpu31::lazy_product(v1[rep], {w, w_q}, pq[rep].p), pq[rep].p);
                 } else {
-                    v0[rep] = gpu31::add(v0[rep], gpu31::mont(x0, w, pq[rep]), pq[rep].p);
-                    v1[rep] = gpu31::add(v1[rep], gpu31::mont(x1, w, pq[rep]), pq[rep].p);
+                    v0[rep] = gpu31::add(v0[rep], gpu31::lazy_product(x0, {w, w_q}, pq[rep].p), pq[rep].p);
+                    v1[rep] = gpu31::add(v1[rep], gpu31::lazy_product(x1, {w, w_q}, pq[rep].p), pq[rep].p);
                 }
             }
         }
@@ -1655,14 +1667,23 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned x0 = (gi - w) * 4 + w;
                 u32* row = sT[q];
                 const unsigned i0 = padw(x0), i1 = padw(x0 + H), i2 = padw(x0 + 2 * H), i3 = padw(x0 + 3 * H);
-                u32 v0 = row[i0], v1 = row[i1], v2 = row[i2], v3 = row[i3];
-                const u32 t1 = sR[q][w << (8 - m)];
-                const u32 t2 = sR[q][w << (7 - m)];
-                const u32 t3 = sR[q][(w + H) << (7 - m)];
-                gpu31::butterfly(v0, v1, t1, pr4[rep]);
-                gpu31::butterfly(v2, v3, t1, pr4[rep]);
-                gpu31::butterfly(v0, v2, t2, pr4[rep]);
-                gpu31::butterfly(v1, v3, t3, pr4[rep]);
+                                u32 v0 = row[i0], v1 = row[i1], v2 = row[i2], v3 = row[i3];
+                                const u32 t1 = sR[q][w << (8 - m)];
+                                const u32 t1_q = sR_q[q][w << (8 - m)];
+                                const u32 t2 = sR[q][w << (7 - m)];
+                                const u32 t2_q = sR_q[q][w << (7 - m)];
+                                const u32 t3 = sR[q][(w + H) << (7 - m)];
+                                const u32 t3_q = sR_q[q][(w + H) << (7 - m)];
+                                // OC17: use lazy_product for twiddle multiplication
+                                auto bfly_shoup = [&](u32& a, u32& b, u32 tw, u32 tw_q, const gpu31::Prime& pr) {
+                                    const u32 u = a, v = gpu31::lazy_product(b, {tw, tw_q}, pr.p);
+                                    a = gpu31::add(u, v, pr.p);
+                                    b = gpu31::sub(u, v, pr.p);
+                                };
+                                bfly_shoup(v0, v1, t1, t1_q, pr4[rep]);
+                                bfly_shoup(v2, v3, t1, t1_q, pr4[rep]);
+                                bfly_shoup(v0, v2, t2, t2_q, pr4[rep]);
+                                bfly_shoup(v1, v3, t3, t3_q, pr4[rep]);
                 row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
             }
             __syncthreads();
