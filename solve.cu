@@ -702,7 +702,21 @@ void* fherma_init(const fherma::Point& p) {
                     }
                     if (d.tc_enc && d.tc_crt && d.tc_ntt_ready) {
                         d.tc_ntt = true;
+#if OC31_TILE_RC
+                        // inv_low now writes tile-major residues into pra,
+                        // which only crt_tc2 knows how to read.  The NTT/efl
+                        // self-checks must therefore exercise tc_pipeline
+                        // with crt_tc2 enabled, otherwise the legacy crt_tc
+                        // reads the stale prc buffer and rejects a correct
+                        // pipeline.  A failing crt_tc2 still disables both.
+                        d.tc_crt2 = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) {
+                            d.tc_ntt = false;
+                            d.tc_crt2 = false;
+                        }
+#else
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_ntt = false;
+#endif
                     }
                     if (d.tc_ntt && d.d_fenc) {
                         d.tc_efl = true;
