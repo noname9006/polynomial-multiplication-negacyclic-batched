@@ -1184,15 +1184,16 @@ struct Device {
                 return st;
             }
             tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
-                prc, d_primes, d_pk_inv, n, k);
+                prc, OC31_TILE_RC ? pra : nullptr, d_primes, d_pk_inv, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
-                              crt2_shared, stream>>>(crt_args_, prc, pc, d_fcrt, c2,
-                                                     d_primes, d_untw_slot, logN, d_corr_m);
+                              crt2_shared, stream>>>(crt_args_, OC31_TILE_RC ? pra : prc, pc, d_fcrt, c2,
+                                                     d_primes, d_untw_slot, logN, d_corr_m,
+                                                     OC31_TILE_RC ? n / tc::NT_TILE : 0);
             } else
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, prc, pc, d_fcrt, crt_cfg,

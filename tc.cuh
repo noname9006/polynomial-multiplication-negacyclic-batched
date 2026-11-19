@@ -221,6 +221,20 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC29_EF256
 #define TC29_EF256 1
 #endif
+// OC31: inv_low writes its residues in 512-tile-major order into the (dead)
+// pra buffer; crt_tc2 staging then reads 114 primes 2 KB apart instead of
+// 256 KB apart.  Same bytes, fewer TLB/L2 page touches.  0 = exact old path.
+#ifndef OC31_TILE_RC
+#define OC31_TILE_RC 1
+#endif
+// OC32: apply the per-prime CRT constant (n^-1*inv) inside inv_low, after
+// the inverse NTT.  Montgomery-by-constant commutes with the linear inverse
+// NTT, so crt_tc2 can use the residue as the term directly and drops one
+// Montgomery per (prime, coefficient).  inv_low is DRAM-bound, so the extra
+// arithmetic there is nearly free.  0 = exact old path.
+#ifndef OC32_PREWEIGHT
+#define OC32_PREWEIGHT 0
+#endif
 #ifndef OC12_IO
 #define OC12_IO 1
 #endif
@@ -604,7 +618,7 @@ __global__ void __launch_bounds__(128, 3)
 crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
-       unsigned slot_logN, const u32* __restrict__ corr_m) {
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0) {
     // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
     // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
     // Shared: one region, used as sA (u32, stride SA) -> sX (u64, stride SX)
@@ -623,6 +637,15 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     const unsigned i = start + c;
     const bool active = i < n;
     const u64 rbase = u64(pair) * K * n;
+    // OC31: tile-major rc written by inv_low into the dead pra buffer.
+    // CRT2_ROWS (32) divides NT_TILE (512), so a CTA never straddles tiles.
+    const u64 rbase2 = (OC31_TILE_RC && ntiles)
+        ? (u64(pair) * ntiles + (start >> 9)) * K : 0ull;
+    auto RC = [&](unsigned j, unsigned coeff) -> u32 {
+        return (OC31_TILE_RC && ntiles)
+            ? residues[(rbase2 + j) * 512u + (coeff & 511u)]
+            : residues[rbase + u64(j) * n + coeff];
+    };
     const unsigned W = cfg.KS * 8;
 
     TCP_T(t0);
@@ -637,14 +660,16 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
 #pragma unroll
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + NG * q;
-                r[q] = (j < K && active) ? residues[rbase + u64(j) * n + i] : 0u;
+                r[q] = (j < K && active) ? RC(j, i) : 0u;
                 u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
             }
 #pragma unroll
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + NG * q;
                 if (j < K) {
-                    const u32 term = gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
+                    const u32 term = (OC32_PREWEIGHT && TC22_MERGED && slot_logN)
+                        ? r[q]
+                        : gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
                     fsum += (u64(term) * c_crt_corr[j]) >> 30;
                 }
@@ -655,8 +680,10 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     for (unsigned j = jg; j < K; j += NG) {
         u32 term = 0;
         if (active) {
-            const u32 r = residues[rbase + u64(j) * n + i];
-            if (untw_inv)
+            const u32 r = RC(j, i);
+            if (OC32_PREWEIGHT && TC22_MERGED && slot_logN && untw_inv)
+                term = r;
+            else if (untw_inv)
                 term = gpu31::mont(r, untw_inv[u64(j) * n + i], primes[j]);
             else
                 term = gpu31::weight_residue(r, pl.primes[j]);
@@ -1467,7 +1494,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 
 // inverse DIF low stages in 512-tiles (output: bit-reversed slot order).
 __global__ void __launch_bounds__(256)
-inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
+inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K) {
     __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[TC_LT];
     const unsigned t = threadIdx.x;
@@ -1507,8 +1534,24 @@ inv_low(u32* __restrict__ c, const gpu31::Prime* __restrict__ primes,
             a1 = gpu31::add(a1, v1, p.p);
         }
     }
-    c[base + t] = a0;
-    c[base + t + 256] = a1;
+#if OC32_PREWEIGHT
+    if (TC22_MERGED) {
+        const u32 cw = c_crt_slotc[blockIdx.y];
+        a0 = gpu31::mont(a0, cw, p);
+        a1 = gpu31::mont(a1, cw, p);
+    }
+#endif
+    if (OC31_TILE_RC && dst2) {
+        // tile-major: [pair][tile][prime][512].  One CTA writes two
+        // contiguous 1 KB blocks (lanes 0..255 and 256..511).
+        const u64 tile = u64(blockIdx.z) * (n / NT_TILE) + blockIdx.x;
+        const u64 ob = (tile * K + blockIdx.y) * NT_TILE;
+        dst2[ob + t] = a0;
+        dst2[ob + t + 256] = a1;
+    } else {
+        c[base + t] = a0;
+        c[base + t + 256] = a1;
+    }
 }
 
 
