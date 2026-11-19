@@ -732,7 +732,7 @@ void* fherma_init(const fherma::Point& p) {
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_invcrt = false;
                         std::fprintf(stderr, "[TC] invcrt=%d rows=%u smem=%zu\n", int(d.tc_invcrt), d.invcrt_rows, d.invcrt_shared);
                     }
-                    if (false && d.tc_ntt && d.cs_[0] && p.B > 1) {   // TC17 tail: measured +2.1 ms
+                    if (TC35_TAIL && d.tc_ntt && d.cs_[0] && p.B > 1) {   // TC35 (was TC17 +2.1 ms when compute-bound)
                         d.tc_tail = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_tail = false;
                         std::fprintf(stderr, "[TC] tail=%d\n", int(d.tc_tail));

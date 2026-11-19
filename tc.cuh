@@ -162,6 +162,20 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // -- an odd bank offset -- so the two primes' rows land in disjoint banks.
 // Row contents / padw(pos) / DIT / store indices are unchanged; only the
 // spacing between rows changes.  Flag 0 restores the original stride.
+// TC35: L2-resident tail.  Encode stays batched over all pairs; fused_high ->
+// inv_low -> CRT run pair by pair on one stream with rc and the inv_low output
+// in two fixed scratch slots (2 x K x N x 4 B ~ 60 MB) under a persisting L2
+// window, so the 15 GB of rc traffic between the tail kernels stays in L2.
+// Re-test of TC17 now that fused_high/inv_low are DRAM-bound.
+#ifndef TC35_TAIL
+#define TC35_TAIL 1
+#endif
+#ifndef TC35_STREAMS
+#define TC35_STREAMS 1
+#endif
+#ifndef TC35_PERSIST
+#define TC35_PERSIST 1
+#endif
 #ifndef OC28_EPICONF
 #define OC28_EPICONF 0
 #endif

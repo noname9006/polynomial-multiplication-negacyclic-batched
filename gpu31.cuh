@@ -820,6 +820,20 @@ struct Device {
     bool crt2_r64 = false;          // OC27: 64-row crt_tc2_r64 variant
     unsigned crt2_SX = 0;           // cfg.SX for the selected crt2 kernel
     std::size_t crt2_r64_shared = 0;
+    std::size_t persist_bytes_ = 0;   // TC35 access-policy window on d_rc slots
+    float persist_ratio_ = 0.f;
+    // TC35: attach the persisting window to a stream (no-op when unsupported).
+    void tc35_window(cudaStream_t s) {
+        if (!persist_bytes_ || !s) return;
+        cudaStreamAttrValue a{};
+        a.accessPolicyWindow.base_ptr = d_rc;
+        a.accessPolicyWindow.num_bytes = persist_bytes_;
+        a.accessPolicyWindow.hitRatio = persist_ratio_;
+        a.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        a.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &a);
+        cudaGetLastError();
+    }
     bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
     cudaStream_t cs_[2] = {nullptr, nullptr};
     cudaEvent_t evf_ = nullptr, evj_[2] = {nullptr, nullptr};
@@ -889,6 +903,24 @@ struct Device {
             if (crt_shared_ > prop.sharedMemPerBlock)
                 throw std::runtime_error("gpu31: CRT tile exceeds shared memory capacity");
             build_tc(prop);
+#if TC35_TAIL && TC35_PERSIST
+            // TC35: keep the tail scratch slots (d_rc[0 .. 2*streams)) in L2.
+            if (prop.persistingL2CacheMaxSize > 0 && prop.accessPolicyMaxWindowSize > 0) {
+                const std::size_t want = std::size_t(2) * TC35_STREAMS * plan_.K * plan_.N * sizeof(u32);
+                std::size_t lim = want < std::size_t(prop.persistingL2CacheMaxSize)
+                                      ? want : std::size_t(prop.persistingL2CacheMaxSize);
+                if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, lim) == cudaSuccess) {
+                    persist_bytes_ = want < std::size_t(prop.accessPolicyMaxWindowSize)
+                                         ? want : std::size_t(prop.accessPolicyMaxWindowSize);
+                    persist_ratio_ = float(lim) / float(persist_bytes_);
+                    if (persist_ratio_ > 1.f) persist_ratio_ = 1.f;
+                }
+                std::fprintf(stderr, "[TC35] persistL2 max=%d win=%d set=%zu ratio=%.2f\n",
+                             prop.persistingL2CacheMaxSize, prop.accessPolicyMaxWindowSize,
+                             persist_bytes_, double(persist_ratio_));
+                cudaGetLastError();
+            }
+#endif
             if (cudaStreamCreateWithFlags(&cs_[0], cudaStreamNonBlocking) != cudaSuccess ||
                 cudaStreamCreateWithFlags(&cs_[1], cudaStreamNonBlocking) != cudaSuccess ||
                 cudaEventCreateWithFlags(&evf_, cudaEventDisableTiming) != cudaSuccess ||
@@ -897,6 +929,10 @@ struct Device {
                 cudaGetLastError();
                 cs_[0] = cs_[1] = nullptr;
             }
+#if TC35_TAIL && TC35_PERSIST
+            tc35_window(cs_[0]);
+            tc35_window(cs_[1]);
+#endif
             for (int i = 0; i <= kStages; ++i)
                 if (cudaEventCreate(&ev_[i]) != cudaSuccess) break;
             profiling_ = (ev_[kStages] != nullptr);
@@ -955,7 +991,34 @@ struct Device {
                     for (int e = 1; e <= kStages; ++e) cudaEventRecord(ev_[e], stream);
                 return cudaGetLastError();
             }
-            if (tc_tail && cs_[0] && cs_[1] && B > 1) {
+            if (tc_tail && B > 1 && capacity_ >= 2u * TC35_STREAMS &&
+                cs_[0] && (TC35_STREAMS == 1 || cs_[1])) {
+                // TC35: encode batched; tail pair by pair with rc / inv_low
+                // output in fixed slots d_rc[2s], d_rc[2s+1] (L2-resident).
+                st = tc_pipeline(d_a, d_b, d_c, d_ra, d_rb, d_rc, B, stream, profiling_, 1);
+                if (st != cudaSuccess) return st;
+                const std::size_t in_stride = std::size_t(n) * l;
+                const std::size_t res_stride = std::size_t(k) * n;
+                cudaEventRecord(evf_, stream);
+                for (unsigned q = 0; q < TC35_STREAMS; ++q) cudaStreamWaitEvent(cs_[q], evf_, 0);
+                for (u32 j = 0; j < B; ++j) {
+                    const unsigned sl = TC35_STREAMS > 1 ? (j & 1u) : 0u;
+                    cudaStream_t s = cs_[sl];
+                    st = tc_pipeline(d_a + j * in_stride, d_b + j * in_stride, d_c + j * in_stride,
+                                     d_ra + j * res_stride, d_rb + j * res_stride,
+                                     d_rc + (2 * sl) * res_stride, 1, s, false, 2,
+                                     d_rc + (2 * sl + 1) * res_stride);
+                    if (st != cudaSuccess) return st;
+                }
+                for (unsigned q = 0; q < TC35_STREAMS; ++q) {
+                    cudaEventRecord(evj_[q], cs_[q]);
+                    cudaStreamWaitEvent(stream, evj_[q], 0);
+                }
+                if (profiling_)
+                    for (int e = 4; e <= kStages; ++e) cudaEventRecord(ev_[e], stream);
+                return cudaGetLastError();
+            }
+            if (false && tc_tail && cs_[0] && cs_[1] && B > 1) {
                 // TC17: encode batched over all pairs; the tail (fused_high,
                 // inv_low, CRT) pair by pair on two streams so each pair's rc
                 // (K x N x 4 B ~ 31 MB) stays in L2 between the three kernels.
@@ -1126,7 +1189,9 @@ struct Device {
     }
 
     cudaError_t tc_pipeline(const u32* pa, const u32* pb, u32* pc, u32* pra, u32* prb, u32* prc,
-                            u32 B, cudaStream_t stream, bool prof, int part = 0) {
+                            u32 B, cudaStream_t stream, bool prof, int part = 0,
+                            u32* pinv = nullptr) {
+        u32* const pio = pinv ? pinv : pra;   // TC35: inv_low output slot
         // part 0: whole pipeline, 1: encode (+fwd low) only, 2: tail only
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
         cudaError_t st = cudaSuccess;
@@ -1187,7 +1252,7 @@ struct Device {
                 return st;
             }
             tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
-                prc, OC31_TILE_RC ? pra : nullptr, d_primes, d_pk_inv, n, k);
+                prc, OC31_TILE_RC ? pio : nullptr, d_primes, d_pk_inv, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
             if (tc_crt2) {
@@ -1203,7 +1268,7 @@ struct Device {
                 } else
 #endif
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
-                              crt2_shared, stream>>>(crt_args_, OC31_TILE_RC ? pra : prc, pc, d_fcrt, c2,
+                              crt2_shared, stream>>>(crt_args_, OC31_TILE_RC ? pio : prc, pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
                                                      OC31_TILE_RC ? n / tc::NT_TILE : 0);
             } else

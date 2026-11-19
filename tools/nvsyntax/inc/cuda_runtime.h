@@ -6,7 +6,7 @@ enum cudaMemcpyKind { cudaMemcpyHostToHost, cudaMemcpyHostToDevice, cudaMemcpyDe
 enum cudaFuncAttribute { cudaFuncAttributeMaxDynamicSharedMemorySize, cudaFuncAttributePreferredSharedMemoryCarveout, cudaFuncAttributeNonPortableClusterSizeAllowed };
 struct CUstream_st; typedef CUstream_st* cudaStream_t;
 struct CUevent_st; typedef CUevent_st* cudaEvent_t;
-struct cudaDeviceProp { int major, minor; std::size_t sharedMemPerBlock, sharedMemPerBlockOptin; int multiProcessorCount; char name[256]; };
+struct cudaDeviceProp { int major, minor; std::size_t sharedMemPerBlock, sharedMemPerBlockOptin; int multiProcessorCount; char name[256]; int persistingL2CacheMaxSize, accessPolicyMaxWindowSize, l2CacheSize; };
 #define CUDA_ANY(name) template<class... A> inline cudaError_t name(A...) { return 0; }
 CUDA_ANY(cudaMalloc) CUDA_ANY(cudaFree) CUDA_ANY(cudaMemcpy) CUDA_ANY(cudaMemcpyAsync) CUDA_ANY(cudaMemsetAsync) CUDA_ANY(cudaMemset)
 CUDA_ANY(cudaStreamCreate) CUDA_ANY(cudaStreamDestroy) CUDA_ANY(cudaStreamSynchronize) CUDA_ANY(cudaGetDeviceCount)
@@ -14,7 +14,12 @@ CUDA_ANY(cudaSetDevice) CUDA_ANY(cudaGetDevice) CUDA_ANY(cudaGetDeviceProperties
 CUDA_ANY(cudaDeviceSynchronize) CUDA_ANY(cudaEventCreate) CUDA_ANY(cudaEventDestroy) CUDA_ANY(cudaEventRecord)
 CUDA_ANY(cudaEventElapsedTime) CUDA_ANY(cudaMemcpyToSymbol) CUDA_ANY(cudaFuncSetAttribute) CUDA_ANY(cudaMallocHost)
 CUDA_ANY(cudaFreeHost) CUDA_ANY(cudaHostRegister) CUDA_ANY(cudaStreamWaitEvent) CUDA_ANY(cudaEventSynchronize)
-CUDA_ANY(cudaDeviceGetAttribute) CUDA_ANY(cudaOccupancyMaxActiveBlocksPerMultiprocessor) CUDA_ANY(cudaEventCreateWithFlags)
+CUDA_ANY(cudaDeviceSetLimit) CUDA_ANY(cudaStreamSetAttribute) CUDA_ANY(cudaDeviceGetAttribute) CUDA_ANY(cudaOccupancyMaxActiveBlocksPerMultiprocessor) CUDA_ANY(cudaEventCreateWithFlags)
+enum cudaLimit { cudaLimitPersistingL2CacheSize = 6 };
+enum cudaAccessProperty { cudaAccessPropertyNormal = 0, cudaAccessPropertyStreaming = 1, cudaAccessPropertyPersisting = 2 };
+struct cudaAccessPolicyWindow { void* base_ptr; std::size_t num_bytes; float hitRatio; cudaAccessProperty hitProp, missProp; };
+union cudaStreamAttrValue { cudaAccessPolicyWindow accessPolicyWindow; };
+enum cudaStreamAttrID { cudaStreamAttributeAccessPolicyWindow = 1 };
 inline cudaError_t cudaGetLastError() { return 0; }
 inline const char* cudaGetErrorString(cudaError_t) { return ""; }
 struct dim3 { unsigned x, y, z; dim3(unsigned a=1,unsigned b=1,unsigned c=1):x(a),y(b),z(c){} };
