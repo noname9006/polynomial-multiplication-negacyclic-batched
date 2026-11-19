@@ -170,7 +170,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // TC36: fused_high + inv_low as one persistent kernel with an L2 rc ring.
 // R8: inv_low fused into fused_high through a 16-CTA cluster (DSMEM).
 #ifndef R8_CLUSTER
-#define R8_CLUSTER 1
+#define R8_CLUSTER 0
 #endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
