@@ -165,6 +165,16 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef OC28_EPICONF
 #define OC28_EPICONF 1
 #endif
+#ifndef OC29_DITSHFL
+#define OC29_DITSHFL 1
+#endif
+// OC29 (parallel branch, agent A): DIT entirely in registers.  One warp owns
+// one prime; the 256-point row is held as 8 values per lane at position
+// p = lane + 32*e.  Stages 0..4 are lane-xor shfl (partner p^(1<<s)), stages
+// 5..7 are an in-thread radix-8 over e (positions differ by 32, 64, 128).
+// sT is only the epilogue->DIT handoff (one barrier) and, at the end, the
+// DIT->store coalesced write; no shared round trips or barriers between DIT
+// stages.  Flag 0 restores the original 3-pass / 3-barrier shared DIT.
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -2611,6 +2621,65 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
         __syncthreads();
         TCP_T(g3);
+#if OC29_DITSHFL
+        // OC29: one warp per prime; the 256-point row lives in 8 registers per
+        // lane at position p = lane + 32*e (coalesced: bank = (lane+e)%32).
+        // Stages 0..4 are lane-xor shfl; stages 5..7 are an in-thread radix-8
+        // over e.  No shared round trips / barriers between DIT stages; the
+        // epilogue->DIT handoff barrier above is the only one.  Store goes
+        // straight from registers to global in coalesced 128B segments.
+        {
+            const unsigned q = warp;
+            const unsigned kk = nt0 * 2 + q;
+#if TC30_CPA && TC32_PW
+            const gpu31::Prime pr = sP[q];
+#else
+            const gpu31::Prime pr = primes[kk < K ? kk : 0];
+#endif
+            const u32* tw = sR[q];
+            u32 v[8];
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) v[e] = sT[q][padw(lane + 32 * e)];
+
+#pragma unroll
+            for (unsigned s = 0; s < 5; ++s) {
+                const unsigned Hb = 1u << s;
+                const u32 wt = tw[TWI(s, lane & (Hb - 1))];
+                const bool upper = (lane & Hb) != 0;
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) {
+                    const u32 other = __shfl_xor_sync(0xffffffffu, v[e], Hb);
+                    // bf(lower,upper): lower' = lower+mont(upper), upper'=lower-mont(upper)
+                    if (!upper) {
+                        const u32 u = v[e], t = gpu31::mont(other, wt, pr);
+                        v[e] = gpu31::add(u, t, pr.p);
+                    } else {
+                        const u32 u = other, t = gpu31::mont(v[e], wt, pr);
+                        v[e] = gpu31::sub(u, t, pr.p);
+                    }
+                }
+            }
+
+#pragma unroll
+            for (unsigned st = 0; st < 3; ++st) {
+                const unsigned span = 1u << st;
+                const unsigned stage = 5 + st;
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) {
+                    if (e & span) continue;
+                    const unsigned jtw = lane + (e & (span - 1)) * 32;
+                    gpu31::butterfly(v[e], v[e + span], tw[TWI(stage, jtw)], pr);
+                }
+            }
+
+            if (kk < K) {
+                const u64 base_out = rbase + u64(kk) * n + start;
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e)
+                    dst[base_out + lane + 32 * e] = v[e];
+            }
+        }
+#else
         // DIT stages 0..7: radix-8 (0-2), radix-8 (3-5): 8 primes x 32 groups
         // = 256 groups, one per thread; radix-4 (6-7): 8 x 64 groups, 2/thread.
         {
@@ -2666,13 +2735,16 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
         }
         __syncthreads();
+#endif
         TCP_T(g4);
+#if !OC29_DITSHFL
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, pos = idx % E2_ROWS;
             const unsigned kk = nt0 * 2 + q;
             if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
         }
         __syncthreads();
+#endif
         TCP_T(g5);
         pe[0] += g1 - g0; pe[1] += g2 - g1; pe[2] += g3 - g2; pe[3] += g4 - g3; pe[4] += g5 - g4;
     }
