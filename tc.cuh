@@ -169,7 +169,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // Re-test of TC17 now that fused_high/inv_low are DRAM-bound.
 // TC36: fused_high + inv_low as one persistent kernel with an L2 rc ring.
 #ifndef TC36_FHINV
-#define TC36_FHINV 1
+#define TC36_FHINV 0
 #endif
 #ifndef TC35_TAIL
 #define TC35_TAIL 0
