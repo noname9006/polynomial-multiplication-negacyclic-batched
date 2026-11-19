@@ -2104,7 +2104,7 @@ inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restr
 // Dependencies only point to smaller tickets (R > D), so no deadlock.
 // ctr: [0] ticket, [1..P] fh_done, [1+P..2P] inv_done (zeroed per launch).
 // ---------------------------------------------------------------------------
-constexpr unsigned TC36_R = 16, TC36_D = 6;
+constexpr unsigned TC36_R = 64, TC36_D = 32;   // D > CTAs-in-flight/32 steps, R > D + in-flight
 constexpr unsigned TC36_IG = 8;   // inv_low tiles per task (same task count as fh)
 __device__ __forceinline__ void tc36_wait(const unsigned* x, unsigned target) {
     if (threadIdx.x == 0 && threadIdx.y == 0) {
