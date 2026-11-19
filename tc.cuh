@@ -154,6 +154,17 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC28_PFA
 #define TC28_PFA 1
 #endif
+// OC28 (parallel branch, agent A): conflict-free sT row stride in
+// encode_fwdlow256's epilogue.  With the original stride E2_PT = 264 (== 8 mod
+// 32) a warp writing q=0 and q=1 rows hits each shared bank twice (padw(rl+8)
+// == padw(rl)+8), costing one extra shared transaction on every epilogue
+// write.  Padding rows to 272 (== 16 mod 32) makes padw(rl+8) == padw(rl)+17
+// -- an odd bank offset -- so the two primes' rows land in disjoint banks.
+// Row contents / padw(pos) / DIT / store indices are unchanged; only the
+// spacing between rows changes.  Flag 0 restores the original stride.
+#ifndef OC28_EPICONF
+#define OC28_EPICONF 1
+#endif
 #ifndef TC16_R4
 #define TC16_R4 1
 #endif
@@ -1940,7 +1951,9 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 // grid (n/256, 2, B), block 256, static smem ~23.8 KB.
 // ---------------------------------------------------------------------------
 constexpr unsigned E2_ROWS = 256;
-constexpr unsigned E2_PT = E2_ROWS + E2_ROWS / 32;
+// OC28_EPICONF: 272 (== 16 mod 32) removes the epilogue's 2-way bank conflict
+// on the q=0/q=1 sT rows; 0 restores the original 264 (== 8 mod 32).
+constexpr unsigned E2_PT = OC28_EPICONF ? (E2_ROWS + E2_ROWS / 16) : (E2_ROWS + E2_ROWS / 32);
 __global__ void __launch_bounds__(256, 2)
 encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  u32* __restrict__ ra, u32* __restrict__ rb,
