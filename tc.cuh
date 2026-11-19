@@ -248,7 +248,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // Montgomery per (prime, coefficient).  inv_low is DRAM-bound, so the extra
 // arithmetic there is nearly free.  0 = exact old path.
 #ifndef OC32_PREWEIGHT
-#define OC32_PREWEIGHT 1
+#define OC32_PREWEIGHT 0
 #endif
 #ifndef OC12_IO
 #define OC12_IO 1
