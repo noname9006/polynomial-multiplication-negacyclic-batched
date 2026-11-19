@@ -221,6 +221,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC31_S32
 #define TC31_S32 1
 #endif
+// TC32: primes/weights of the group by cp.async into shared (encode256).
+#ifndef TC32_PW
+#define TC32_PW 1
+#endif
 #ifndef TC30_CPA
 #define TC30_CPA 1
 #endif
@@ -1900,6 +1904,8 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #if TC30_CPA
     __shared__ __align__(16) u32 sRb[2][EF_PR][E2_ROWS];
     __shared__ __align__(16) uint2 sBb[2][EF_NTB * ENC_KS_MAX * 32];
+    __shared__ __align__(16) gpu31::Prime sPb[2][EF_PR];    // TC32
+    __shared__ __align__(16) gpu31::Weight sWb[2][EF_PR];
 #else
     __shared__ u32 sR[EF_PR][E2_ROWS];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
@@ -1977,6 +1983,24 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned sa = unsigned(__cvta_generic_to_shared(&sBb[buf][idx]));
             asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
         }
+#if TC32_PW
+        if (tid < 2 * EF_PR) {
+            // TC32: this group's primes and first-limb weights ride along,
+            // so the epilogue/DIT read them from shared, not global.
+            const unsigned q = tid & (EF_PR - 1);
+            const unsigned kk = nb * 2 + q;
+            const bool ok = kk < K;
+            if (tid < EF_PR) {
+                const gpu31::Prime* gp = primes + (ok ? kk : 0);
+                const unsigned sa = unsigned(__cvta_generic_to_shared(&sPb[buf][q]));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 16 : 0) : "memory");
+            } else {
+                const gpu31::Weight* gp = weights + (ok ? std::size_t(kk) * l : 0);
+                const unsigned sa = unsigned(__cvta_generic_to_shared(&sWb[buf][q]));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
+            }
+        }
+#endif
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
     issue(0, 0);
@@ -1987,6 +2011,10 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         const unsigned cb = (nt0 / EF_NTB) & 1;
         u32 (*sR)[E2_ROWS] = sRb[cb];
         uint2* sB = sBb[cb];
+#if TC32_PW
+        const gpu31::Prime* sP = sPb[cb];
+        const gpu31::Weight* sW = sWb[cb];
+#endif
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         if (nt0 + EF_NTB < NT) issue(nt0 + EF_NTB, cb ^ 1);
@@ -2030,7 +2058,11 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned k = (nt0 + j) * 2 + (t >> 1);
             gpu31::Prime p{};
             gpu31::Weight w0{};
+#if TC30_CPA && TC32_PW
+            if (k < K) { p = sP[j * 2 + (t >> 1)]; w0 = sW[j * 2 + (t >> 1)]; }
+#else
             if (k < K) { p = primes[k]; w0 = weights[std::size_t(k) * l]; }
+#endif
 #pragma unroll
             for (unsigned mt = 0; mt < 2; ++mt) {
                 const u64 pg = (u64(u32(acc[mt][j][0])) << sh) + (u64(u32(acc[mt][j][1])) << (sh + 8));
@@ -2056,7 +2088,11 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         {
             const unsigned q = tid >> 5, gi = tid & 31;
             const unsigned kk = nt0 * 2 + q;
+#if TC30_CPA && TC32_PW
+            const gpu31::Prime pr8 = sP[q];
+#else
             const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
+#endif
             u32* row = sT[q];
             const u32* tw8 = sR[q];
 #pragma unroll
@@ -2086,7 +2122,11 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         for (unsigned rep = 0; rep < 2; ++rep) {
             const unsigned q = (tid >> 6) + rep * 4, w = tid & 63;   // H = 64, x0 = w
             const unsigned kk = nt0 * 2 + q;
+#if TC30_CPA && TC32_PW
+            const gpu31::Prime pr4 = sP[q];
+#else
             const gpu31::Prime pr4 = primes[kk < K ? kk : 0];
+#endif
             u32* row = sT[q];
             const unsigned i0 = padw(w), i1 = padw(w + 64), i2 = padw(w + 128), i3 = padw(w + 192);
             u32 v0 = row[i0], v1 = row[i1], v2 = row[i2], v3 = row[i3];
