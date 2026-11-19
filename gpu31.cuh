@@ -1246,7 +1246,8 @@ struct Device {
             }
             if (part == 1) return cudaGetLastError();
 #if TC36_FHINV
-            if (tc_fhinv && OC31_TILE_RC && d_ring && d_ctr && fhinv_grid && !tc_invcrt) {
+            if (tc_fhinv && OC31_TILE_RC && d_ring && d_ctr && fhinv_grid && !tc_invcrt &&
+                (n / tc::NT_TILE) % tc::TC36_IG == 0) {
                 // TC36: fused_high + inv_low persistent, rc in an L2 ring.
                 const unsigned P = B * k;
                 // ra is still being read by later fused_high tasks while

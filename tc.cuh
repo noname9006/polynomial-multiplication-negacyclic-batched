@@ -2027,8 +2027,9 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 __device__ __forceinline__ void
 inv_low_dev(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K,
-        unsigned bx, unsigned by, unsigned bz, u64 coff, unsigned t, bool cg) {
-    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[TC_LT];
+        unsigned bx, unsigned by, unsigned bz, u64 coff, unsigned t, bool cg,
+        u32* __restrict__ sa, u32* __restrict__ sr) {
+    // sa: NT_TILE + NT_TILE/32 words, sr: TC_LT words (caller-provided shared)
     const u64 base = coff + u64(bx) * NT_TILE;
     const gpu31::Prime p = primes[by];
     for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(by) * TC_LT + x];
@@ -2089,8 +2090,9 @@ inv_low_dev(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __r
 __global__ void __launch_bounds__(256)
 inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K) {
+    __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[TC_LT];
     inv_low_dev(c, dst2, primes, packed, n, K, blockIdx.x, blockIdx.y, blockIdx.z,
-                (u64(blockIdx.z) * K + blockIdx.y) * n, threadIdx.x, false);
+                (u64(blockIdx.z) * K + blockIdx.y) * n, threadIdx.x, false, sa, sr);
 }
 
 // ---------------------------------------------------------------------------
@@ -2103,6 +2105,7 @@ inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restr
 // ctr: [0] ticket, [1..P] fh_done, [1+P..2P] inv_done (zeroed per launch).
 // ---------------------------------------------------------------------------
 constexpr unsigned TC36_R = 16, TC36_D = 6;
+constexpr unsigned TC36_IG = 8;   // inv_low tiles per task (same task count as fh)
 __device__ __forceinline__ void tc36_wait(const unsigned* x, unsigned target) {
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         while (atomicAdd(const_cast<unsigned*>(x), 0u) < target) __nanosleep(64);
@@ -2122,7 +2125,8 @@ fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__
        unsigned logH, const u32* __restrict__ pkf, unsigned ef256,
        const u32* __restrict__ pki, unsigned* __restrict__ ctr, unsigned P) {
     __shared__ unsigned s_task;
-    const unsigned FT = NT_TILE / NT_COLS, IT = n / NT_TILE, ST = FT + IT;
+    extern __shared__ u32 sm[];   // fused_high's dynamic buffer, reused by inv tasks
+    const unsigned FT = NT_TILE / NT_COLS, IT = n / NT_TILE, IG = IT / TC36_IG, ST = FT + IG;
     const unsigned total = (P + TC36_D) * ST;
     unsigned* fh_done = ctr + 1;
     unsigned* inv_done = ctr + 1 + P;
@@ -2137,7 +2141,7 @@ fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__
         if (r < FT) {
             const unsigned q = st;
             if (q >= P) continue;
-            if (q >= TC36_R) tc36_wait(inv_done + (q - TC36_R), IT);
+            if (q >= TC36_R) tc36_wait(inv_done + (q - TC36_R), IG);
             fused_high_dev(ra, rb, ring, primes, twf, twi, n, K, logH, pkf, ef256,
                            r, q % K, q / K, u64(q % TC36_R) * n);
             tc36_signal(fh_done + q);
@@ -2146,8 +2150,11 @@ fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__
             const unsigned q = st - TC36_D;
             if (q >= P) continue;
             tc36_wait(fh_done + q, FT);
-            inv_low_dev(ring, dst2, primes, pki, n, K, r - FT, q % K, q / K,
-                        u64(q % TC36_R) * n, tid, true);
+            for (unsigned g = 0; g < TC36_IG; ++g) {
+                if (g) __syncthreads();
+                inv_low_dev(ring, dst2, primes, pki, n, K, (r - FT) * TC36_IG + g, q % K, q / K,
+                            u64(q % TC36_R) * n, tid, true, sm, sm + (NT_TILE + NT_TILE / 32));
+            }
             tc36_signal(inv_done + q);
         }
     }
