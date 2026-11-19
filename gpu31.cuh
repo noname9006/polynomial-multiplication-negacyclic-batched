@@ -1221,6 +1221,18 @@ struct Device {
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
+#if OC40_R64
+                if (tc::crt2_oc40_ok(crt2_SA, crt_cfg.SX)) {
+                    const std::size_t sh = tc::crt_tc2_oc40_smem(crt2_SA, crt_cfg.SX);
+                    tc::crt_tc2_oc40<<<dim3((n + 63) / 64, 1, B), 128, sh, stream>>>(
+                        crt_args_, OC31_TILE_RC ? pra : prc, pc, d_fcrt, c2,
+                        d_primes, d_untw_slot, logN, d_corr_m,
+                        OC31_TILE_RC ? n / tc::NT_TILE : 0);
+                    if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                    if (prof) cudaEventRecord(ev_[7], stream);
+                    return cudaGetLastError();
+                }
+#endif
 #if OC27_ROWS64
                 if (crt2_r64) {
                     c2.SX = crt2_SX;   // SXH: sX half stride
@@ -1282,6 +1294,16 @@ private:
                 while (s2 % 32 != 4 && s2 % 32 != 28) ++s2;
                 crt2_SA = s2;
                 crt2_shared = tc::crt_tc2_smem(crt2_SA, crt_cfg.SX);
+#if OC40_R64
+                {
+                    const std::size_t sh = tc::crt_tc2_oc40_smem(crt2_SA, crt_cfg.SX);
+                    if (sh > 48 * 1024 &&
+                        cudaFuncSetAttribute(tc::crt_tc2_oc40,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, int(sh)) != cudaSuccess) {
+                        cudaGetLastError();
+                    }
+                }
+#endif
 #if OC27_ROWS64
                 // OC27: prefer the 64-row variant when its split-carry
                 // guards and the 48 KB shared budget hold; else crt_tc2.
