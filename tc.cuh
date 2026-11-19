@@ -214,6 +214,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // The 9th low stage (m=8, pairs low j and j+256) moves into fused_high:
 // lanes 0-15 take columns c, lanes 16-31 columns c+256 and the butterfly is
 // one shfl_xor(16) right after the global load.  Runtime-gated (ef256 arg).
+// TC30: cp.async double buffer for sR/sB in encode_fwdlow256.
+#ifndef TC30_CPA
+#define TC30_CPA 1
+#endif
 #ifndef TC29_EF256
 #define TC29_EF256 1
 #endif
@@ -1887,8 +1891,13 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
                  unsigned logN, unsigned KS, unsigned NT) {
     __shared__ u32 sT[EF_PR][E2_PT];
+#if TC30_CPA
+    __shared__ __align__(16) u32 sRb[2][EF_PR][E2_ROWS];
+    __shared__ __align__(16) uint2 sBb[2][EF_NTB * ENC_KS_MAX * 32];
+#else
     __shared__ u32 sR[EF_PR][E2_ROWS];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
+#endif
     const u32* src = blockIdx.y ? src_b : src_a;
     u32* dst = blockIdx.y ? rb : ra;
     const unsigned pair = blockIdx.z;
@@ -1942,8 +1951,40 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
     }
 #endif
+#if TC30_CPA
+    // TC30: group twiddles/B fragments arrive by cp.async into a double
+    // buffer one group ahead (no registers, overlaps the previous group).
+    auto issue = [&](unsigned nb, unsigned buf) {
+        for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
+            const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
+            const unsigned kk = nb * 2 + q;
+            const bool ok = kk < K;
+            const u32* gp = packed + (ok ? u64(kk) * TC_LT + r : 0);
+            const unsigned sa = unsigned(__cvta_generic_to_shared(&sRb[buf][q][r]));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 4 : 0) : "memory");
+        }
+        for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += 256) {
+            const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+            const unsigned nt = nb + j;
+            const bool ok = nt < NT;
+            const uint2* gp = frag + (ok ? std::size_t(nt) * KS * 32 + rem : 0);
+            const unsigned sa = unsigned(__cvta_generic_to_shared(&sBb[buf][idx]));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    issue(0, 0);
+#endif
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
         TCP_T(g0);
+#if TC30_CPA
+        const unsigned cb = (nt0 / EF_NTB) & 1;
+        u32 (*sR)[E2_ROWS] = sRb[cb];
+        uint2* sB = sBb[cb];
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        if (nt0 + EF_NTB < NT) issue(nt0 + EF_NTB, cb ^ 1);
+#else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
             const unsigned kk = nt0 * 2 + q;
@@ -1955,6 +1996,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
         }
         __syncthreads();
+#endif
         TCP_T(g1);
         int acc[2][EF_NTB][4];
 #pragma unroll
