@@ -171,10 +171,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #define TC35_TAIL 1
 #endif
 #ifndef TC35_STREAMS
-#define TC35_STREAMS 1
+#define TC35_STREAMS 2
 #endif
 #ifndef TC35_PERSIST
-#define TC35_PERSIST 1
+#define TC35_PERSIST 0
 #endif
 #ifndef OC28_EPICONF
 #define OC28_EPICONF 0
