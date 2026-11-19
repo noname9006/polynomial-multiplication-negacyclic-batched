@@ -351,6 +351,12 @@ __host__ __device__ inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntile
 #ifndef OC32_PREWEIGHT
 #define OC32_PREWEIGHT 1
 #endif
+// OC35: run inv_low + CRT in small batches of pairs so each batch's
+// tile-major rc (~30 MB/pair) stays in L2 between the two kernels.  0 = the
+// original all-pairs tail.
+#ifndef OC35_TAIL_BATCH
+#define OC35_TAIL_BATCH 4
+#endif
 #ifndef OC12_IO
 #define OC12_IO 1
 #endif

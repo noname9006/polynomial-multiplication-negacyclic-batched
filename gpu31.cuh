@@ -1186,6 +1186,34 @@ struct Device {
                 if (prof) for (int e = 5; e <= 7; ++e) cudaEventRecord(ev_[e], stream);
                 return st;
             }
+#if OC35_TAIL_BATCH && OC31_TILE_RC
+            if (tc_crt2 && B > OC35_TAIL_BATCH) {
+                // OC35: pair-batched tail.  inv_low writes tile-major rc into
+                // pra, crt_tc2 reads it back immediately; with 4 pairs the
+                // working set (~120 MB) mostly fits in the 126 MB L2.
+                const unsigned BT = OC35_TAIL_BATCH;
+                for (unsigned p0 = 0; p0 < B; p0 += BT) {
+                    const unsigned bp = (B - p0 < BT) ? (B - p0) : BT;
+                    const std::size_t roff = std::size_t(p0) * k * n;
+                    tc::inv_low<<<dim3(n / tc::NT_TILE, k, bp), 256, 0, stream>>>(
+                        prc + roff, pra + roff, d_primes, d_pk_inv, n, k);
+                    if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                    if (prof && p0 == 0) {
+                        cudaEventRecord(ev_[5], stream);
+                        cudaEventRecord(ev_[6], stream);
+                    }
+                    tc::CrtTc c2 = crt_cfg;
+                    c2.SA = crt2_SA;
+                    tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, bp), 128,
+                                  crt2_shared, stream>>>(crt_args_, pra + roff,
+                                  pc + std::size_t(p0) * n * l, d_fcrt, c2, d_primes,
+                                  d_untw_slot, logN, d_corr_m, n / tc::NT_TILE);
+                    if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                }
+                if (prof) cudaEventRecord(ev_[7], stream);
+                return cudaGetLastError();
+            }
+#endif
             tc::inv_low<<<dim3(n / tc::NT_TILE, k, B), 256, 0, stream>>>(
                 prc, OC31_TILE_RC ? pra : nullptr, d_primes, d_pk_inv, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
