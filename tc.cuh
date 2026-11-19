@@ -167,8 +167,12 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // in two fixed scratch slots (2 x K x N x 4 B ~ 60 MB) under a persisting L2
 // window, so the 15 GB of rc traffic between the tail kernels stays in L2.
 // Re-test of TC17 now that fused_high/inv_low are DRAM-bound.
+// TC36: fused_high + inv_low as one persistent kernel with an L2 rc ring.
+#ifndef TC36_FHINV
+#define TC36_FHINV 1
+#endif
 #ifndef TC35_TAIL
-#define TC35_TAIL 1
+#define TC35_TAIL 0
 #endif
 #ifndef TC35_STREAMS
 #define TC35_STREAMS 2
@@ -1382,11 +1386,12 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
 // forward DIT high stages (a, b) + pointwise + inverse DIF high stages -> c.
 // grid (512/NT_COLS, K, B), block (NT_COLS, 8), smem 2*HC*(NT_COLS+1)*4.
 // tw tables: [k][(HC-1)*512], stage s at offset 512*(2^s-1), [within][low].
-__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
-fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
+__device__ __forceinline__ void
+fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
-           const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0) {
+           const u32* __restrict__ pkf, unsigned ef256,
+           unsigned bx, unsigned by, unsigned bz, u64 rcoff) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
@@ -1404,12 +1409,12 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     u32* sa = sm;
     u32* sb = sm + HC * S;
     const unsigned lane = threadIdx.x, rw = threadIdx.y;
-    const unsigned low = ef256 ? (blockIdx.x * 16 + (lane & 15) + ((lane & 16) << 4))
-                               : blockIdx.x * NT_COLS + lane;
+    const unsigned low = ef256 ? (bx * 16 + (lane & 15) + ((lane & 16) << 4))
+                               : bx * NT_COLS + lane;
     // TC29: twiddle of low stage 8 for pair (j, j+256), j = low & 255
-    const u32 w8 = ef256 ? pkf[u64(blockIdx.y) * TC_LT + TWI(8, low & 255)] : 0u;
-    const unsigned k = blockIdx.y;
-    const u64 plane = (u64(blockIdx.z) * K + k) * n;
+    const u32 w8 = ef256 ? pkf[u64(by) * TC_LT + TWI(8, low & 255)] : 0u;
+    const unsigned k = by;
+    const u64 plane = (u64(bz) * K + k) * n;
     const gpu31::Prime p = primes[k];
     constexpr unsigned TWS = 7 * NT_TILE + 127;
     const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
@@ -1869,7 +1874,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                 // straight to global, skipping the shared write + store read.
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i)
-                    rc[plane + u64(r0 + i * H) * NT_TILE + low] = av[i];
+                    rc[rcoff + u64(r0 + i * H) * NT_TILE + low] = av[i];
             } else
 #endif
             {
@@ -2002,24 +2007,34 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #endif
     {
         for (unsigned h = rw; h < HC; h += 8)
-            rc[plane + u64(h) * NT_TILE + low] = sa[h * S + lane];
+            rc[rcoff + u64(h) * NT_TILE + low] = sa[h * S + lane];
     }
     TCP_T(f5);
     TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
     TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
 }
 
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
+           const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
+           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
+           const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0) {
+    fused_high_dev(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
+                   blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n);
+}
+
 // inverse DIF low stages in 512-tiles (output: bit-reversed slot order).
-__global__ void __launch_bounds__(256)
-inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
-        const u32* __restrict__ packed, unsigned n, unsigned K) {
+__device__ __forceinline__ void
+inv_low_dev(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
+        const u32* __restrict__ packed, unsigned n, unsigned K,
+        unsigned bx, unsigned by, unsigned bz, u64 coff, unsigned t, bool cg) {
     __shared__ u32 sa[NT_TILE + NT_TILE / 32], sr[TC_LT];
-    const unsigned t = threadIdx.x;
-    const u64 base = (u64(blockIdx.z) * K + blockIdx.y) * n + u64(blockIdx.x) * NT_TILE;
-    const gpu31::Prime p = primes[blockIdx.y];
-    for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(blockIdx.y) * TC_LT + x];
-    sa[padw(t)] = c[base + t];
-    sa[padw(t + 256)] = c[base + t + 256];
+    const u64 base = coff + u64(bx) * NT_TILE;
+    const gpu31::Prime p = primes[by];
+    for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(by) * TC_LT + x];
+    // TC36: the ring slot is rewritten by other CTAs -> bypass L1 (ld.cg)
+    sa[padw(t)] = cg ? __ldcg(c + base + t) : c[base + t];
+    sa[padw(t + 256)] = cg ? __ldcg(c + base + t + 256) : c[base + t + 256];
     __syncthreads();
     // TC9: stages m=8..5 are cross-warp -> shared.  Stages m=4..0 pair
     // positions t and t^half inside one warp, so keep both of a thread's
@@ -2053,7 +2068,7 @@ inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restr
     }
 #if OC32_PREWEIGHT
     if (TC22_MERGED) {
-        const u32 cw = c_crt_slotc[blockIdx.y];
+        const u32 cw = c_crt_slotc[by];
         a0 = gpu31::mont(a0, cw, p);
         a1 = gpu31::mont(a1, cw, p);
     }
@@ -2061,8 +2076,8 @@ inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restr
     if (OC31_TILE_RC && dst2) {
         // tile-major: [pair][tile][prime][512].  One CTA writes two
         // contiguous 1 KB blocks (lanes 0..255 and 256..511).
-        const u64 tile = u64(blockIdx.z) * (n / NT_TILE) + blockIdx.x;
-        const u64 ob = (tile * K + blockIdx.y) * NT_TILE;
+        const u64 tile = u64(bz) * (n / NT_TILE) + bx;
+        const u64 ob = (tile * K + by) * NT_TILE;
         dst2[ob + t] = a0;
         dst2[ob + t + 256] = a1;
     } else {
@@ -2071,6 +2086,72 @@ inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restr
     }
 }
 
+__global__ void __launch_bounds__(256)
+inv_low(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
+        const u32* __restrict__ packed, unsigned n, unsigned K) {
+    inv_low_dev(c, dst2, primes, packed, n, K, blockIdx.x, blockIdx.y, blockIdx.z,
+                (u64(blockIdx.z) * K + blockIdx.y) * n, threadIdx.x, false);
+}
+
+// ---------------------------------------------------------------------------
+// TC36: fused_high + inv_low in ONE persistent kernel with an L2-resident rc
+// ring.  Tickets (atomic counter) are taken in order; step s = 16 fused_high
+// tasks of plane s followed by 128 inv_low tasks of plane s-D.  rc of plane q
+// lives in ring slot q % R (R x N x 4 B ~ 4 MB) and is never evicted to DRAM:
+// fused_high's rc store and inv_low's rc load (7.6 GB) become L2 traffic.
+// Dependencies only point to smaller tickets (R > D), so no deadlock.
+// ctr: [0] ticket, [1..P] fh_done, [1+P..2P] inv_done (zeroed per launch).
+// ---------------------------------------------------------------------------
+constexpr unsigned TC36_R = 16, TC36_D = 6;
+__device__ __forceinline__ void tc36_wait(const unsigned* x, unsigned target) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        while (atomicAdd(const_cast<unsigned*>(x), 0u) < target) __nanosleep(64);
+        __threadfence();
+    }
+    __syncthreads();
+}
+__device__ __forceinline__ void tc36_signal(unsigned* x) {
+    __threadfence();   // every thread publishes its ring/dst stores
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) atomicAdd(x, 1u);
+}
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ ring,
+       u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
+       const u32* __restrict__ twf, const u32* __restrict__ twi, unsigned n, unsigned K,
+       unsigned logH, const u32* __restrict__ pkf, unsigned ef256,
+       const u32* __restrict__ pki, unsigned* __restrict__ ctr, unsigned P) {
+    __shared__ unsigned s_task;
+    const unsigned FT = NT_TILE / NT_COLS, IT = n / NT_TILE, ST = FT + IT;
+    const unsigned total = (P + TC36_D) * ST;
+    unsigned* fh_done = ctr + 1;
+    unsigned* inv_done = ctr + 1 + P;
+    const unsigned tid = threadIdx.y * NT_COLS + threadIdx.x;
+    for (;;) {
+        if (tid == 0) s_task = atomicAdd(ctr, 1u);
+        __syncthreads();
+        const unsigned tk = s_task;
+        __syncthreads();
+        if (tk >= total) break;
+        const unsigned st = tk / ST, r = tk - st * ST;
+        if (r < FT) {
+            const unsigned q = st;
+            if (q >= P) continue;
+            if (q >= TC36_R) tc36_wait(inv_done + (q - TC36_R), IT);
+            fused_high_dev(ra, rb, ring, primes, twf, twi, n, K, logH, pkf, ef256,
+                           r, q % K, q / K, u64(q % TC36_R) * n);
+            tc36_signal(fh_done + q);
+        } else {
+            if (st < TC36_D) continue;
+            const unsigned q = st - TC36_D;
+            if (q >= P) continue;
+            tc36_wait(fh_done + q, FT);
+            inv_low_dev(ring, dst2, primes, pki, n, K, r - FT, q % K, q / K,
+                        u64(q % TC36_R) * n, tid, true);
+            tc36_signal(inv_done + q);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TC5: encode + forward DIT low stages in one kernel.  A CTA owns 512

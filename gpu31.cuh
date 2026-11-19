@@ -834,6 +834,10 @@ struct Device {
         cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &a);
         cudaGetLastError();
     }
+    bool tc_fhinv = false;            // TC36 persistent fused_high+inv_low
+    u32* d_ring = nullptr;            // TC36 rc ring (TC36_R planes)
+    unsigned* d_ctr = nullptr;        // TC36 ticket + per-plane counters
+    unsigned fhinv_grid = 0;
     bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
     cudaStream_t cs_[2] = {nullptr, nullptr};
     cudaEvent_t evf_ = nullptr, evj_[2] = {nullptr, nullptr};
@@ -882,6 +886,10 @@ struct Device {
             d_ra = static_cast<u32*>(raw_alloc(residues * sizeof(u32)));
             d_rb = static_cast<u32*>(raw_alloc(residues * sizeof(u32)));
             d_rc = static_cast<u32*>(raw_alloc(residues * sizeof(u32)));
+#if TC36_FHINV
+            d_ring = static_cast<u32*>(raw_alloc(std::size_t(tc::TC36_R) * plan_.N * sizeof(u32)));
+            d_ctr = static_cast<unsigned*>(raw_alloc((1 + 2 * residues / plan_.N) * sizeof(unsigned)));
+#endif
 
             crt_args_.n = plan_.N;
             crt_args_.limbs = plan_.L;
@@ -903,6 +911,16 @@ struct Device {
             if (crt_shared_ > prop.sharedMemPerBlock)
                 throw std::runtime_error("gpu31: CRT tile exceeds shared memory capacity");
             build_tc(prop);
+#if TC36_FHINV
+            {
+                int occ = 0;
+                const std::size_t dyn = 2 * (plan_.N / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+                if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, tc::fh_inv, 256, dyn) == cudaSuccess && occ > 0)
+                    fhinv_grid = unsigned(occ) * unsigned(prop.multiProcessorCount);
+                cudaGetLastError();
+                std::fprintf(stderr, "[TC36] fh_inv occ=%d grid=%u\n", occ, fhinv_grid);
+            }
+#endif
 #if TC35_TAIL && TC35_PERSIST
             // TC35: keep the tail scratch slots (d_rc[0 .. 2*streams)) in L2.
             if (prop.persistingL2CacheMaxSize > 0 && prop.accessPolicyMaxWindowSize > 0) {
@@ -1227,6 +1245,20 @@ struct Device {
             }
             }
             if (part == 1) return cudaGetLastError();
+#if TC36_FHINV
+            if (tc_fhinv && OC31_TILE_RC && d_ring && d_ctr && fhinv_grid && !tc_invcrt) {
+                // TC36: fused_high + inv_low persistent, rc in an L2 ring.
+                const unsigned P = B * k;
+                cudaMemsetAsync(d_ctr, 0, (1 + 2 * std::size_t(P)) * sizeof(unsigned), stream);
+                tc::fh_inv<<<fhinv_grid, dim3(tc::NT_COLS, 8),
+                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
+                    pra, prb, d_ring, pio, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd,
+                    ef256 ? 1u : 0u, d_pk_inv, d_ctr, P);
+                if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                if (prof) { cudaEventRecord(ev_[4], stream); cudaEventRecord(ev_[5], stream);
+                            cudaEventRecord(ev_[6], stream); }
+            } else {
+#endif
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
                 pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, ef256 ? 1u : 0u);
@@ -1255,6 +1287,9 @@ struct Device {
                 prc, OC31_TILE_RC ? pio : nullptr, d_primes, d_pk_inv, n, k);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) { cudaEventRecord(ev_[5], stream); cudaEventRecord(ev_[6], stream); }
+#if TC36_FHINV
+            }
+#endif
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
@@ -1529,6 +1564,9 @@ private:
         if (d_ra) cudaFree(d_ra);
         if (d_rb) cudaFree(d_rb);
         if (d_rc) cudaFree(d_rc);
+        if (d_ring) cudaFree(d_ring);
+        if (d_ctr) cudaFree(d_ctr);
+        d_ring = nullptr; d_ctr = nullptr;
         if (d_fenc) cudaFree(d_fenc);
         if (d_fcrt) cudaFree(d_fcrt);
         if (d_untw_inv) cudaFree(d_untw_inv);

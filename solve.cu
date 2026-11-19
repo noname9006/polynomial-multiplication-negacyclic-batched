@@ -732,6 +732,13 @@ void* fherma_init(const fherma::Point& p) {
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_invcrt = false;
                         std::fprintf(stderr, "[TC] invcrt=%d rows=%u smem=%zu\n", int(d.tc_invcrt), d.invcrt_rows, d.invcrt_shared);
                     }
+#if TC36_FHINV
+                    if (d.tc_ntt && d.tc_crt2 && d.fhinv_grid) {
+                        d.tc_fhinv = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_fhinv = false;
+                        std::fprintf(stderr, "[TC] fhinv=%d grid=%u\n", int(d.tc_fhinv), d.fhinv_grid);
+                    }
+#endif
                     if (TC35_TAIL && d.tc_ntt && d.cs_[0] && p.B > 1) {   // TC35 (was TC17 +2.1 ms when compute-bound)
                         d.tc_tail = true;
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_tail = false;
