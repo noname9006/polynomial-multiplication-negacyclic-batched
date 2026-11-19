@@ -260,14 +260,14 @@ inline bool crt2_r64_ok(unsigned KS, unsigned NT, unsigned SA, unsigned l) {
 #define OC34_CPA 1
 #endif
 constexpr unsigned OC34_CPB = 16;   // primes per cp.async batch/buffer
-inline std::size_t oc34_buf_bytes() {
+__host__ __device__ inline std::size_t oc34_buf_bytes() {
     return std::size_t(2) * OC34_CPB * CRT2_R64_ROWS * 4;   // 8192 at CPB=16
 }
 // eligible when the aliased buffers fit the sX region.  The CONFIG clauses
 // (OC31_TILE_RC/OC32_PREWEIGHT/TC22_MERGED flags, ntiles, slot_logN, K) are
 // checked at the call site inside the kernel — those macros live in the
 // device section below, so this host helper only does the size math.
-inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntiles, unsigned slot_logN) {
+__host__ __device__ inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntiles, unsigned slot_logN) {
     return ntiles != 0 && slot_logN != 0 && K <= 128 &&   // 128 = CRT_KMAX_C
            oc34_buf_bytes() <= std::size_t(CRT2_R64_ROWS) * SXH * 8;
 }
