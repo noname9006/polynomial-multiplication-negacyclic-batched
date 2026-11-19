@@ -2028,14 +2028,23 @@ __device__ __forceinline__ void
 inv_low_dev(u32* __restrict__ c, u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
         const u32* __restrict__ packed, unsigned n, unsigned K,
         unsigned bx, unsigned by, unsigned bz, u64 coff, unsigned t, bool cg,
-        u32* __restrict__ sa, u32* __restrict__ sr) {
+        u32* __restrict__ sa, u32* __restrict__ sr,
+        bool load_sr = true, bool havev = false, u32 v0 = 0, u32 v1 = 0) {
     // sa: NT_TILE + NT_TILE/32 words, sr: TC_LT words (caller-provided shared)
+    // TC36d: load_sr=false reuses the twiddles of the previous tile (same
+    // prime); havev passes the tile's two values already loaded by the caller.
     const u64 base = coff + u64(bx) * NT_TILE;
     const gpu31::Prime p = primes[by];
-    for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(by) * TC_LT + x];
-    // TC36: the ring slot is rewritten by other CTAs -> bypass L1 (ld.cg)
-    sa[padw(t)] = cg ? __ldcg(c + base + t) : c[base + t];
-    sa[padw(t + 256)] = cg ? __ldcg(c + base + t + 256) : c[base + t + 256];
+    if (load_sr)
+        for (unsigned x = t; x < TC_LT; x += 256) sr[x] = packed[u64(by) * TC_LT + x];
+    if (havev) {
+        sa[padw(t)] = v0;
+        sa[padw(t + 256)] = v1;
+    } else {
+        // TC36: the ring slot is rewritten by other CTAs -> bypass L1 (ld.cg)
+        sa[padw(t)] = cg ? __ldcg(c + base + t) : c[base + t];
+        sa[padw(t + 256)] = cg ? __ldcg(c + base + t + 256) : c[base + t + 256];
+    }
     __syncthreads();
     // TC9: stages m=8..5 are cross-warp -> shared.  Stages m=4..0 pair
     // positions t and t^half inside one warp, so keep both of a thread's
@@ -2150,10 +2159,22 @@ fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__
             const unsigned q = st - TC36_D;
             if (q >= P) continue;
             tc36_wait(fh_done + q, FT);
+            // TC36d: one twiddle load per task; next tile prefetched into
+            // registers while the current one is transformed.
+            const u64 coff = u64(q % TC36_R) * n;
+            const unsigned t0 = (r - FT) * TC36_IG;
+            u32 n0 = __ldcg(ring + coff + u64(t0) * NT_TILE + tid);
+            u32 n1 = __ldcg(ring + coff + u64(t0) * NT_TILE + tid + 256);
             for (unsigned g = 0; g < TC36_IG; ++g) {
                 if (g) __syncthreads();
-                inv_low_dev(ring, dst2, primes, pki, n, K, (r - FT) * TC36_IG + g, q % K, q / K,
-                            u64(q % TC36_R) * n, tid, true, sm, sm + (NT_TILE + NT_TILE / 32));
+                const u32 c0 = n0, c1 = n1;
+                if (g + 1 < TC36_IG) {
+                    n0 = __ldcg(ring + coff + u64(t0 + g + 1) * NT_TILE + tid);
+                    n1 = __ldcg(ring + coff + u64(t0 + g + 1) * NT_TILE + tid + 256);
+                }
+                inv_low_dev(ring, dst2, primes, pki, n, K, t0 + g, q % K, q / K,
+                            coff, tid, true, sm, sm + (NT_TILE + NT_TILE / 32),
+                            g == 0, true, c0, c1);
             }
             tc36_signal(inv_done + q);
         }
