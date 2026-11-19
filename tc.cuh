@@ -163,7 +163,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // Row contents / padw(pos) / DIT / store indices are unchanged; only the
 // spacing between rows changes.  Flag 0 restores the original stride.
 #ifndef OC28_EPICONF
-#define OC28_EPICONF 1
+#define OC28_EPICONF 0
 #endif
 #ifndef OC29_DITSHFL
 #define OC29_DITSHFL 0
