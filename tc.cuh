@@ -209,6 +209,14 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // trips in fused_high instead of seven in the original OC8 version.  Active
 // only when n16>0; flag OC12_IO=0 restores the original load/store loops.
 // CPU-validated bit-exact by tools/tc_emul/io_fused_emul.cpp.
+// TC29: encode works on 256-row tiles (8 low DIT stages) with 256 threads,
+// 2 CTAs/SM, so one CTA's barriers/DIT overlap the other's tensor-core MMA.
+// The 9th low stage (m=8, pairs low j and j+256) moves into fused_high:
+// lanes 0-15 take columns c, lanes 16-31 columns c+256 and the butterfly is
+// one shfl_xor(16) right after the global load.  Runtime-gated (ef256 arg).
+#ifndef TC29_EF256
+#define TC29_EF256 1
+#endif
 #ifndef OC12_IO
 #define OC12_IO 1
 #endif
@@ -829,7 +837,8 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
 __global__ void __launch_bounds__(256)
 fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
-           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH) {
+           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
+           const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
@@ -847,7 +856,10 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     u32* sa = sm;
     u32* sb = sm + HC * S;
     const unsigned lane = threadIdx.x, rw = threadIdx.y;
-    const unsigned low = blockIdx.x * NT_COLS + lane;
+    const unsigned low = ef256 ? (blockIdx.x * 16 + (lane & 15) + ((lane & 16) << 4))
+                               : blockIdx.x * NT_COLS + lane;
+    // TC29: twiddle of low stage 8 for pair (j, j+256), j = low & 255
+    const u32 w8 = ef256 ? pkf[u64(blockIdx.y) * TC_LT + TWI(8, low & 255)] : 0u;
     const unsigned k = blockIdx.y;
     const u64 plane = (u64(blockIdx.z) * K + k) * n;
     const gpu31::Prime p = primes[k];
@@ -907,6 +919,22 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                     const unsigned row = r0 + i * H;
                     av[i] = ra[plane + u64(row) * NT_TILE + low];
                     bv[i] = rb[plane + u64(row) * NT_TILE + low];
+                }
+                if (ef256) {
+                    // low stage 8 (DIT): lane j gets u + w*v, lane j+256 gets u - w*v
+                    const bool up = (lane & 16) != 0;
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) {
+                        const u32 xa = __shfl_xor_sync(0xffffffffu, av[i], 16);
+                        const u32 xb = __shfl_xor_sync(0xffffffffu, bv[i], 16);
+                        if (up) {
+                            av[i] = gpu31::sub(xa, gpu31::mont(av[i], w8, p), p.p);
+                            bv[i] = gpu31::sub(xb, gpu31::mont(bv[i], w8, p), p.p);
+                        } else {
+                            av[i] = gpu31::add(av[i], gpu31::mont(xa, w8, p), p.p);
+                            bv[i] = gpu31::add(bv[i], gpu31::mont(xb, w8, p), p.p);
+                        }
+                    }
                 }
             } else
 #endif
@@ -1832,6 +1860,199 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         TCP_T(g4);
         for (unsigned idx = tid; idx < EF_PR * NT_TILE; idx += blockDim.x) {
             const unsigned q = idx / NT_TILE, pos = idx % NT_TILE;
+            const unsigned kk = nt0 * 2 + q;
+            if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
+        }
+        __syncthreads();
+        TCP_T(g5);
+        pe[0] += g1 - g0; pe[1] += g2 - g1; pe[2] += g3 - g2; pe[3] += g4 - g3; pe[4] += g5 - g4;
+    }
+    TCP_ADD(10, 0, pe[0]); TCP_ADD(11, 0, pe[1]); TCP_ADD(12, 0, pe[2]);
+    TCP_ADD(13, 0, pe[3]); TCP_ADD(14, 0, pe[4]);
+}
+
+// ---------------------------------------------------------------------------
+// TC29: encode + forward DIT low stages 0..7 on 256-row tiles, 256 threads,
+// 2 CTAs/SM.  Same per-warp layout as encode_fwdlow (32 rows, 2 m-tiles,
+// A fragments in registers); stage 8 is done by fused_high (ef256).
+// grid (n/256, 2, B), block 256, static smem ~23.8 KB.
+// ---------------------------------------------------------------------------
+constexpr unsigned E2_ROWS = 256;
+constexpr unsigned E2_PT = E2_ROWS + E2_ROWS / 32;
+__global__ void __launch_bounds__(256, 2)
+encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
+                 u32* __restrict__ ra, u32* __restrict__ rb,
+                 const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
+                 const gpu31::Weight* __restrict__ weights,
+                 const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
+                 unsigned logN, unsigned KS, unsigned NT) {
+    __shared__ u32 sT[EF_PR][E2_PT];
+    __shared__ u32 sR[EF_PR][E2_ROWS];
+    __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
+    const u32* src = blockIdx.y ? src_b : src_a;
+    u32* dst = blockIdx.y ? rb : ra;
+    const unsigned pair = blockIdx.z;
+    const unsigned start = blockIdx.x * E2_ROWS;
+    const u64 base = u64(pair) * n * l;
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid >> 5, lane = tid & 31;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const unsigned rowbase = warp * 32;
+    TCP_T(e0);
+    long long pe[5] = {0, 0, 0, 0, 0};
+    u32 a[2][ENC_KS_MAX][4];
+#pragma unroll
+    for (unsigned mt = 0; mt < 2; ++mt) {
+        const unsigned i0 = start + rowbase + mt * 16 + g, i1 = i0 + 8;
+        const u32* r0 = src + base + u64(__brev(i0) >> (32 - logN)) * l;
+        const u32* r1 = src + base + u64(__brev(i1) >> (32 - logN)) * l;
+#pragma unroll
+        for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
+            const unsigned w0 = ks * 8 + t, w1 = w0 + 4;
+            const bool on = ks < KS;
+            a[mt][ks][0] = (on && w0 < l) ? r0[w0] : 0u;
+            a[mt][ks][1] = (on && w0 < l) ? r1[w0] : 0u;
+            a[mt][ks][2] = (on && w1 < l) ? r0[w1] : 0u;
+            a[mt][ks][3] = (on && w1 < l) ? r1[w1] : 0u;
+        }
+    }
+    const bool odd = t & 1;
+    const unsigned sh = (t & 1) * 16;
+    const u64 rbase = u64(pair) * K * n;
+    TCP_T(e1);
+    TCP_ADD(15, e0, e1);
+#if TC28_PFA
+    if (t == 0) {
+        unsigned nsm;
+        asm volatile("mov.u32 %0, %%nsmid;" : "=r"(nsm));
+        const unsigned lin = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+        const unsigned nxt = lin + 2 * nsm;
+        if (nxt < gridDim.x * gridDim.y * gridDim.z) {
+            const unsigned bx = nxt % gridDim.x, rest = nxt / gridDim.x;
+            const unsigned by = rest % gridDim.y, bz = rest / gridDim.y;
+            const u32* psrc = (by ? src_b : src_a) + u64(bz) * n * l;
+#pragma unroll
+            for (unsigned r = 0; r < 4; ++r) {
+                const unsigned i = bx * E2_ROWS + rowbase + (r >> 1) * 16 + g + (r & 1) * 8;
+                const char* rp = reinterpret_cast<const char*>(psrc + u64(__brev(i) >> (32 - logN)) * l);
+                for (unsigned off = 0; off < l * 4u; off += 128u)
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(rp + off));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(rp + l * 4u - 1u));
+            }
+        }
+    }
+#endif
+    for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
+        TCP_T(g0);
+        for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
+            const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
+            const unsigned kk = nt0 * 2 + q;
+            sR[q][r] = kk < K ? packed[u64(kk) * TC_LT + r] : 0u;
+        }
+        for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += 256) {
+            const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+            const unsigned nt = nt0 + j;
+            sB[idx] = nt < NT ? frag[std::size_t(nt) * KS * 32 + rem] : make_uint2(0u, 0u);
+        }
+        __syncthreads();
+        TCP_T(g1);
+        int acc[2][EF_NTB][4];
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (unsigned j = 0; j < EF_NTB; ++j)
+                acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0;
+#pragma unroll
+        for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
+            if (ks < KS) {
+                uint2 b[EF_NTB];
+#pragma unroll
+                for (unsigned j = 0; j < EF_NTB; ++j) b[j] = sB[(j * KS + ks) * 32 + lane];
+#pragma unroll
+                for (unsigned j = 0; j < EF_NTB; ++j)
+                    if (nt0 + j < NT) {
+                        mma_u8(acc[0][j], a[0][ks][0], a[0][ks][1], a[0][ks][2], a[0][ks][3], b[j].x, b[j].y);
+                        mma_u8(acc[1][j], a[1][ks][0], a[1][ks][1], a[1][ks][2], a[1][ks][3], b[j].x, b[j].y);
+                    }
+            }
+        }
+        TCP_T(g2);
+#pragma unroll
+        for (unsigned j = 0; j < EF_NTB; ++j) {
+            const unsigned k = (nt0 + j) * 2 + (t >> 1);
+            gpu31::Prime p{};
+            gpu31::Weight w0{};
+            if (k < K) { p = primes[k]; w0 = weights[std::size_t(k) * l]; }
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const u64 pg = (u64(u32(acc[mt][j][0])) << sh) + (u64(u32(acc[mt][j][1])) << (sh + 8));
+                const u64 pg8 = (u64(u32(acc[mt][j][2])) << sh) + (u64(u32(acc[mt][j][3])) << (sh + 8));
+                const u64 send = odd ? pg : pg8;
+                const u64 mine = odd ? pg8 : pg;
+                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                u32 val = 0;
+                if (k < K) {
+                    const u32 lo = gpu31::canonical_word(u32(tot), p.p);
+                    u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
+                    if (hi >= p.p) hi -= p.p;
+                    val = gpu31::add(lo, hi, p.p);
+                }
+                const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);
+                sT[j * 2 + (t >> 1)][padw(rl)] = val;
+            }
+        }
+        __syncthreads();
+        TCP_T(g3);
+        // DIT stages 0..7: radix-8 (0-2), radix-8 (3-5): 8 primes x 32 groups
+        // = 256 groups, one per thread; radix-4 (6-7): 8 x 64 groups, 2/thread.
+        {
+            const unsigned q = tid >> 5, gi = tid & 31;
+            const unsigned kk = nt0 * 2 + q;
+            const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
+            u32* row = sT[q];
+            const u32* tw8 = sR[q];
+#pragma unroll
+            for (unsigned m = 0; m < 6; m += 3) {
+                const unsigned H = 1u << m;
+                const unsigned w = gi & (H - 1);
+                const unsigned x0 = (gi - w) * 8 + w;
+                u32 v[8];
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) v[e] = row[padw(x0 + e * H)];
+#pragma unroll
+                for (unsigned st = 0; st < 3; ++st) {
+                    const unsigned span = 1u << st;
+#pragma unroll
+                    for (unsigned e = 0; e < 8; ++e) {
+                        if (e & span) continue;
+                        const unsigned j = w + (e & (span - 1)) * H;
+                        gpu31::butterfly(v[e], v[e + span], tw8[TWI(m + st, j)], pr8);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) row[padw(x0 + e * H)] = v[e];
+                __syncthreads();
+            }
+        }
+#pragma unroll
+        for (unsigned rep = 0; rep < 2; ++rep) {
+            const unsigned q = (tid >> 6) + rep * 4, w = tid & 63;   // H = 64, x0 = w
+            const unsigned kk = nt0 * 2 + q;
+            const gpu31::Prime pr4 = primes[kk < K ? kk : 0];
+            u32* row = sT[q];
+            const unsigned i0 = padw(w), i1 = padw(w + 64), i2 = padw(w + 128), i3 = padw(w + 192);
+            u32 v0 = row[i0], v1 = row[i1], v2 = row[i2], v3 = row[i3];
+            const u32 t1 = sR[q][TWI(6, w)];
+            gpu31::butterfly(v0, v1, t1, pr4);
+            gpu31::butterfly(v2, v3, t1, pr4);
+            gpu31::butterfly(v0, v2, sR[q][TWI(7, w)], pr4);
+            gpu31::butterfly(v1, v3, sR[q][TWI(7, w + 64)], pr4);
+            row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
+        }
+        __syncthreads();
+        TCP_T(g4);
+        for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
+            const unsigned q = idx / E2_ROWS, pos = idx % E2_ROWS;
             const unsigned kk = nt0 * 2 + q;
             if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
         }

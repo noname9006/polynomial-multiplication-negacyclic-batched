@@ -1128,8 +1128,18 @@ struct Device {
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
         cudaError_t st = cudaSuccess;
             const unsigned logH = logN - 9;
+            // TC29: 256-row encode tiles + low stage 8 in fused_high (needs the
+            // OC12 radix-16 load path in fused_high, i.e. logH >= 4)
+            const bool ef256 = TC29_EF256 && TC22_MERGED && tc_efl && logH >= 4;
             if (part != 2) {
-            if (tc_efl) {
+            if (tc_efl && ef256) {
+                tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
+                    pa, pb, pra, prb, d_fenc, d_primes, d_weights,
+                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
+                if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
+                                  cudaEventRecord(ev_[3], stream); }
+            } else if (tc_efl) {
                 tc::encode_fwdlow<<<dim3(n / tc::EF_ROWS, 2, B), 512, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights, TC22_MERGED ? nullptr : d_reversed_twist,
                     d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
@@ -1151,7 +1161,7 @@ struct Device {
             if (part == 1) return cudaGetLastError();
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
-                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH);
+                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, ef256 ? 1u : 0u);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) cudaEventRecord(ev_[4], stream);
             if (tc_invcrt) {
