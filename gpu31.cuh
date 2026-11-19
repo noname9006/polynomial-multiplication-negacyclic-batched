@@ -817,6 +817,9 @@ struct Device {
     bool tc_tail = false;  // TC17: per-pair tail on two streams
     unsigned crt2_SA = 0;
     std::size_t crt2_shared = 0;
+    bool crt2_r64 = false;          // OC27: 64-row crt_tc2_r64 variant
+    unsigned crt2_SX = 0;           // cfg.SX for the selected crt2 kernel
+    std::size_t crt2_r64_shared = 0;
     bool tc_chunk = false; // TC8: pair-at-a-time on two streams (L2-resident residues)
     cudaStream_t cs_[2] = {nullptr, nullptr};
     cudaEvent_t evf_ = nullptr, evj_[2] = {nullptr, nullptr};
@@ -1190,6 +1193,15 @@ struct Device {
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
+#if OC27_ROWS64
+                if (crt2_r64) {
+                    c2.SX = crt2_SX;   // SXH: sX half stride
+                    tc::crt_tc2_r64<<<dim3((n + tc::CRT2_R64_ROWS - 1) / tc::CRT2_R64_ROWS, 1, B), 128,
+                                  crt2_shared, stream>>>(crt_args_, OC31_TILE_RC ? pra : prc, pc, d_fcrt, c2,
+                                                         d_primes, d_untw_slot, logN, d_corr_m,
+                                                         OC31_TILE_RC ? n / tc::NT_TILE : 0);
+                } else
+#endif
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
                               crt2_shared, stream>>>(crt_args_, OC31_TILE_RC ? pra : prc, pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
@@ -1242,6 +1254,20 @@ private:
                 while (s2 % 32 != 4 && s2 % 32 != 28) ++s2;
                 crt2_SA = s2;
                 crt2_shared = tc::crt_tc2_smem(crt2_SA, crt_cfg.SX);
+#if OC27_ROWS64
+                // OC27: prefer the 64-row variant when its split-carry
+                // guards and the 48 KB shared budget hold; else crt_tc2.
+                crt2_r64 = tc::crt2_r64_ok(crt_cfg.KS, crt_cfg.NT, crt2_SA, plan_.L);
+                if (crt2_r64) {
+                    crt2_SX = tc::crt2_sxh(crt_cfg.NT);
+                    crt2_r64_shared = tc::crt_tc2_r64_smem(crt2_SA, crt2_SX);
+                    crt2_shared = crt2_r64_shared;
+                } else {
+                    crt2_SX = crt_cfg.SX;
+                }
+#else
+                crt2_SX = crt_cfg.SX;
+#endif
                 // TC27: prefer 32 rows / cluster 16 (non-portable), else 64 / 8
                 invcrt_shared = 0;
                 {

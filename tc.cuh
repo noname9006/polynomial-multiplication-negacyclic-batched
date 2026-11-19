@@ -182,6 +182,49 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #define OC26_CARRY 1
 #endif
 
+// OC27 (agent B): 64 rows per CTA in the crt_tc2 slot (kernel crt_tc2_r64).
+// Each B fragment feeds 4 m-tiles instead of 2, halving the per-run global/L2
+// B traffic (~28 GB -> ~14 GB: NT*KS*32*8 B per CTA, CTA count 262144 ->
+// 131072).  Shared budget (combat KS=15, NT=28): sA keeps the crt_tc2 stride
+// SA=132 for all 64 rows (33792 B; %32==4 keeps the u32 A loads conflict-free
+// and every row base 16 B aligned); sX holds one half of the n-tiles at a
+// time (64*SXH*8 = 14848 B, SXH=29 odd; u64 columns 0..27 = the half's 14
+// n-tiles, column 28 unused pad).  The GEMM runs twice (half 0: nt = warp+4u
+// and warp+14+4u, u=0..2; half 1: nt = warp+28+4u, u=0..2); each pass ends
+// with the OC26 4-thread carry over its columns (two 32-row waves), digits
+// reduced and stored to global out inside the carry phase.  The u64 carry
+// between halves plus the carry scratch live in the dead sA region:
+// cinv 512 B + cout 1024 B + digit window 32*58*4 = 7424 B = 8960 B <= the
+// 33792 B sA region.  Total 48640 B <= 49152 -> 2 CTA/SM without
+// cudaFuncSetAttribute.  Flag 0 keeps the exact crt_tc2 path.
+#ifndef OC27_ROWS64
+#define OC27_ROWS64 1
+#endif
+#if OC27_ROWS64 && !OC26_CARRY
+#error "OC27_ROWS64 requires OC26_CARRY=1 (r64 carry phase builds on it)"
+#endif
+constexpr unsigned CRT2_R64_ROWS = 64;
+// u64 columns per sX half: odd (odd u64 row stride keeps the 2-way bank
+// split of the epilogue stores), >= NT_HALF*2 where NT_HALF = (NT+1)/2.
+inline unsigned crt2_sxh(unsigned NT) { return ((NT + 1) / 2) * 2 + 1; }
+inline std::size_t crt_tc2_r64_smem(unsigned SA, unsigned SXH) {
+    return ((std::size_t(CRT2_R64_ROWS) * SA * 4 + 15) & ~std::size_t(15)) +
+           std::size_t(CRT2_R64_ROWS) * SXH * 8;
+}
+// Host-side eligibility: the r64 carry split needs w0 = 2*NTH <= l (half 0
+// stores low digits only) and the dead-sA scratch must fit:
+// cinv 512 + cout 1024 + digit window 32*DSH*4 bytes <= 64*SA*4.
+inline bool crt2_r64_ok(unsigned KS, unsigned NT, unsigned SA, unsigned l) {
+    const unsigned SXH = crt2_sxh(NT);
+    const unsigned NTH = (SXH - 1) / 2;
+    if (2 * NTH > l) return false;              // half-1 window V fits l2
+    if (2 * SXH < l + 2) return false;          // shifted window covers l2
+    if (KS > CRT_KS_MAX || NT > 2 * NTH) return false;
+    const std::size_t need = 512 + 1024 + std::size_t(32) * (2 * SXH) * 4;
+    return need <= std::size_t(CRT2_R64_ROWS) * SA * 4 &&
+           crt_tc2_r64_smem(SA, SXH) <= 48 * 1024;
+}
+
 // OC8 (parallel branch): radix-8 high stages in fused_high - three DIT/DIF
 // stages per shared round trip (s, s+1, s+2), plus radix-2 tail stages.
 // CPU-validated bit-exact against the radix-2 reference (20 random trials).
@@ -639,6 +682,164 @@ __device__ __forceinline__ void oc26_carry_row(
 }
 #endif // OC26_CARRY
 
+#if OC27_ROWS64
+// OC27: the OC26 carry over 64 rows for one n-tile half, in two 32-row
+// waves (128 threads = 4 per row).  Segment logic is oc26_carry_row's:
+// parallel local scans into a digit window, owner propagates the running
+// delta with early exit, exact serial replay when a segment saw an extreme
+// addend (>= 2^48).  All barriers unconditional.
+//
+// Seam arithmetic.  Full addend stream = A (columns 0..w0-1) then B
+// (columns w0..w0+w1-1); cin0 = sumA >> 32*w0 is half 0's outgoing u64
+// carry.  The single chain's digit at global column w0+j equals
+//   u32( localB_j + (cin0 >> 32*j) )   with upward carry propagation,
+// where localB is half 1's zero-carry chain: folding the little-endian
+// u64 cin0 into half 1's digit window at offset 0 (multi-word ripple,
+// early exit) reproduces the continuation exactly, for any w0.
+//
+// Store split — half 0 keeps the LOW digits only, half 1 carries the seam:
+//  - half 0: tail dg[words..l2) = 0 (NOT cin0), reduce_sum<1>, store l
+//    words.  With w0 = words <= l (combat 28 <= 55) the window's nonzero
+//    part is exactly L_A = sumA mod 2^(32*w0) < 2^896 << q, so the reduce
+//    is a no-op and out = L_A exactly (no mod-q fold of cin0 happens).
+//    cinv[row] is WRITTEN here before half 1 ever reads it (barrier-
+//    separated), so no zero-init pass is needed.
+//  - half 1: tail = local overflow carry, fold cin0 at offset 0 (ripple):
+//    dg[0..l2) = V = sumB + cin0 (needs words+2 <= l2, i.e. words <= l —
+//    host guard).  Shift V UP by w0 columns inside the DSH-word window
+//    (top index w0+words+1 <= DSH-1, nothing dropped), add out = L_A with
+//    ripple: dg[0..l2) = L_A + V*2^(32*w0) mod 2^(32*l2) = total mod
+//    2^(32*l2) — bit-identical to the single chain's window (words >= l2
+//    are discarded there too).  One reduce_sum<1> canonicalises; store.
+// Exactness: L_A + (sumB + cin0)*2^(32*w0) = sumA + sumB = total, since
+// sumA = L_A + cin0*2^(32*w0).  No intermediate mod-q reduce of V (it
+// would still be correct mod q, but the direct window equality is
+// stronger and cheaper).  Configs with words > l are rejected by the
+// host (crt2_r64_ok).  Each out row is touched only by this CTA's owner
+// thread, in order, barrier-separated.
+//
+// Layout of the dead sA region during this phase (u64 units):
+//   cinv[0..63]    handover carries (persists across halves)
+//   cout[0..127]   per-wave segment carries + big flags (tid-indexed)
+//   dg[32][DSH]    per-wave digit window, DSH = 2*SXH u32 words per row
+__device__ __forceinline__ void oc27_carry_half(
+        const u64* __restrict__ xs, unsigned SXH, u64* __restrict__ cinv,
+        u64* __restrict__ cout, u32* __restrict__ dgwin, unsigned DSH,
+        u32* __restrict__ out, u64 obase,
+        unsigned rows, unsigned l, unsigned words, unsigned slot_logN,
+        unsigned start, unsigned tid, unsigned half, unsigned w0,
+        unsigned bits, u32 gap, const u32* __restrict__ q) {
+    const unsigned seg = tid & 3;
+    const unsigned rw = tid >> 2;                    // row within the wave
+    const unsigned base = words >> 2, rem = words & 3;
+    const unsigned a0 = seg * base + (seg < rem ? seg : rem);
+    const unsigned len = base + (seg < rem ? 1u : 0u);
+    const unsigned l2 = l + 2;
+    for (unsigned wave = 0; wave < 2; ++wave) {
+        const unsigned row = wave * 32 + rw;         // 0..63
+        const bool live = row < rows;
+        u32* dg = dgwin + rw * DSH;
+        u64 run = 0, big = 0;
+        if (live) {
+            const u64* x = xs + row * SXH;
+            for (unsigned j = 0; j < len; ++j) {
+                const u64 v = x[a0 + j];
+                const u64 t = run + v;
+                dg[a0 + j] = u32(t);
+                run = t >> 32;
+                big |= v >> 48;
+            }
+        }
+        cout[tid] = run | (big ? (u64(1) << 63) : u64(0));
+        __syncthreads();
+        if (live && seg == 0) {
+            const u64* x = xs + row * SXH;
+            u64 cin = 0;
+            bool replay = false;
+            for (unsigned s = 0; s < 4; ++s)
+                replay |= (cout[rw * 4 + s] >> 63) != 0;
+            if (replay) {
+                u64 carry = 0;
+                for (unsigned w = 0; w < words; ++w) {
+                    carry += x[w];
+                    dg[w] = u32(carry);
+                    carry >>= 32;
+                }
+                cin = carry;
+            } else {
+                for (unsigned s = 0; s < 4; ++s) {
+                    const unsigned a = s * base + (s < rem ? s : rem);
+                    u64 delta = cin;
+                    if (delta) {
+                        for (unsigned j = 0; j < base + (s < rem ? 1u : 0u) && delta; ++j) {
+                            const u64 sum = u64(dg[a + j]) + u32(delta);
+                            dg[a + j] = u32(sum);
+                            delta = (delta >> 32) + (sum >> 32);
+                        }
+                    }
+                    cin = cout[rw * 4 + s] + delta;
+                }
+            }
+            u64 ob;
+            if (slot_logN == 0) {
+                ob = obase + u64(row) * l;
+            } else {
+                const unsigned pos = __brev(start + row) >> (32 - slot_logN);
+                ob = obase + u64(pos) * l;
+            }
+            if (half == 0) {
+                cinv[row] = cin;                     // handover to half 1
+                // LOW digits only: zero the tail so cin0 is not folded mod
+                // q here (half 1's shifted add carries it exactly once).
+                for (unsigned w = words; w < l2; ++w) dg[w] = 0;
+                gpu31::reduce_sum<1>(dg, l, bits, gap, q);
+                for (unsigned cc = 0; cc < l; ++cc) out[ob + cc] = dg[cc];
+            } else {
+                // tail = local overflow carry, then fold cin0 at offset 0:
+                // dg[0..l2) becomes V = sumB + cin0 (word count <= words+2
+                // <= l+2 by the host guard words <= l).
+                u64 tail = cin;
+                for (unsigned w = words; w < l2; ++w) {
+                    dg[w] = u32(tail);
+                    tail >>= 32;
+                }
+                u64 add = cinv[row];
+                for (unsigned w = 0; w < l2 && add; ++w) {
+                    const u64 sum = u64(dg[w]) + u32(add);
+                    dg[w] = u32(sum);
+                    add = (add >> 32) + (sum >> 32);
+                }
+                // shift V UP by w0 columns in place (high to low, DSH-word
+                // window; V's top word index <= words+1, so w0+words+1 <=
+                // 2*words+1 = DSH-1: nothing dropped).  Words >= l2 of the
+                // old window are stale — the shift overwrites every slot.
+                for (unsigned j = DSH; j-- > w0;)
+                    dg[j] = (j - w0 < l2) ? dg[j - w0] : 0u;
+                for (unsigned j = 0; j < w0; ++j) dg[j] = 0;
+                // add out (= L_A, half 0's low digits) with ripple
+                u64 carry = 0;
+                for (unsigned cc = 0; cc < l; ++cc) {
+                    const u64 v = u64(dg[cc]) + u64(out[ob + cc]) + carry;
+                    dg[cc] = u32(v);
+                    carry = v >> 32;
+                }
+                for (unsigned w = l; w < DSH && carry; ++w) {
+                    const u64 v = u64(dg[w]) + carry;
+                    dg[w] = u32(v);
+                    carry = v >> 32;
+                }
+                // dg[0..l2) now equals the single chain's 57-word window
+                // (total mod 2^(32*l2)); words >= l2 are ignored by the
+                // reduce, exactly like crt_tc2's discarded high carry.
+                gpu31::reduce_sum<1>(dg, l, bits, gap, q);
+                for (unsigned cc = 0; cc < l; ++cc) out[ob + cc] = dg[cc];
+            }
+        }
+        __syncthreads();
+    }
+}
+#endif // OC27_ROWS64
+
 // TC15 CRT variant: 32 rows/CTA, warps split n-tiles, B reused by 2 m-tiles.
 __global__ void __launch_bounds__(128, 3)
 crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
@@ -844,6 +1045,187 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2); TCP_ADD(2, t2, t3);
     TCP_ADD(3, t3, t4); TCP_ADD(4, t4, t5);
 }
+
+#if OC27_ROWS64
+// OC27 CRT variant: 64 rows/CTA, warps split n-tiles, B reused by 4 m-tiles.
+// Two n-half passes share the same sX (SXH u64 columns); carry+reduce+store
+// run per half via oc27_carry_half (two 32-row waves; the digit window never
+// exceeds 32 rows).  launch_bounds(128,2): 2 CTA/SM is the smem ceiling
+// anyway (48640 B each at KS=15/NT=28); the 256-reg cap leaves acc[4][2][4]
+// = 32 regs + staging 16 + working set far below the limit.  All
+// __syncthreads are unconditional.  Profiling: slots keep their crt_tc2
+// meaning (0 staging, 1 setup, 2 mma+epilogue summed over both halves,
+// 3 carry+reduce+store summed over both halves, 4 unused: the store moved
+// into slot 3).
+__global__ void __launch_bounds__(128, 2)
+crt_tc2_r64(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    u32* sA = reinterpret_cast<u32*>(smem_raw);
+    const std::size_t abytes =
+        (std::size_t(CRT2_R64_ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15);
+    u64* sX = reinterpret_cast<u64*>(smem_raw + abytes);
+    constexpr unsigned NG = 128 / CRT2_R64_ROWS;   // = 2 staging groups/row
+
+    const unsigned n = pl.n, l = pl.limbs, K = pl.count;
+    const unsigned pair = blockIdx.z, start = blockIdx.x * CRT2_R64_ROWS;
+    const unsigned tid = threadIdx.x;
+    const unsigned c = tid & (CRT2_R64_ROWS - 1), jg = tid / CRT2_R64_ROWS;
+    const unsigned i = start + c;
+    const bool active = i < n;
+    const u64 rbase = u64(pair) * K * n;
+    // OC31: tile-major rc written by inv_low into the dead pra buffer.
+    // CRT2_R64_ROWS (64) divides NT_TILE (512), so a CTA never straddles
+    // tiles — same RC lambda as crt_tc2.
+    const u64 rbase2 = (OC31_TILE_RC && ntiles)
+        ? (u64(pair) * ntiles + (start >> 9)) * K : 0ull;
+    auto RC = [&](unsigned j, unsigned coeff) -> u32 {
+        return (OC31_TILE_RC && ntiles)
+            ? residues[(rbase2 + j) * 512u + (coeff & 511u)]
+            : residues[rbase + u64(j) * n + coeff];
+    };
+    const unsigned W = cfg.KS * 8;
+    const unsigned SXH = cfg.SX;    // host passes crt2_sxh(NT) in cfg.SX
+    const unsigned NTH = (SXH - 1) / 2;            // n-tiles per half (14)
+    const unsigned UP = (NTH + 3) / 4;             // u iterations per warp (4)
+
+    TCP_T(t0);
+    // 1. staging — identical to crt_tc2 (TC11 batched path + OC31 RC +
+    // OC32 preweight), NG=2: each thread handles K/2 primes; warp lanes =
+    // 32 consecutive rows.
+    u64 fsum = 0;
+    if (untw_inv && K <= CRT_KMAX_C) {
+#pragma unroll 1
+        for (unsigned j0 = jg; j0 < K; j0 += 8 * NG) {
+            u32 r[8], u[8];
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) {
+                const unsigned j = j0 + NG * q;
+                r[q] = (j < K && active) ? RC(j, i) : 0u;
+                u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
+            }
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) {
+                const unsigned j = j0 + NG * q;
+                if (j < K) {
+                    const u32 term = (OC32_PREWEIGHT && TC22_MERGED && slot_logN)
+                        ? r[q]
+                        : gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
+                    sA[c * cfg.SA + j] = term;
+                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                }
+            }
+        }
+    } else {
+#pragma unroll 4
+    for (unsigned j = jg; j < K; j += NG) {
+        u32 term = 0;
+        if (active) {
+            const u32 r = RC(j, i);
+            if (OC32_PREWEIGHT && TC22_MERGED && slot_logN && untw_inv)
+                term = r;
+            else if (untw_inv)
+                term = gpu31::mont(r, untw_inv[u64(j) * n + i], primes[j]);
+            else
+                term = gpu31::weight_residue(r, pl.primes[j]);
+        }
+        sA[c * cfg.SA + j] = term;
+        fsum += (u64(term) * corr_m[j]) >> 30;
+    }
+    }
+    for (unsigned j = K + 1 + jg; j < W; j += NG) sA[c * cfg.SA + j] = 0;
+    sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
+    sA[c * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
+    __syncthreads();
+    if (jg == 0) {
+        const u32* rw = sA + c * cfg.SA + W;
+        u64 s = 0;
+#pragma unroll
+        for (unsigned q = 0; q < NG; ++q) s += u64(rw[2 * q]) | (u64(rw[2 * q + 1]) << 32);
+        sA[c * cfg.SA + K] = u32((s + (u64(1) << 31)) >> 32);
+    }
+    __syncthreads();
+
+    TCP_T(t1);
+    const unsigned warp = tid >> 5, lane = tid & 31;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const bool odd = t & 1;
+    const unsigned sh = (t & 1) * 16;
+    // dead-sA scratch for the carry phase (layout: see oc27_carry_half)
+    u64* cinv = reinterpret_cast<u64*>(sA);          // 64 u64 = 512 B
+    u64* cout = cinv + CRT2_R64_ROWS;                // 128 u64 = 1024 B
+    u32* dgwin = reinterpret_cast<u32*>(cout + 128); // 32 rows * DSH u32
+    const unsigned DSH = 2 * SXH;
+    TCP_T(t2);
+    const unsigned rows = (n - start < CRT2_R64_ROWS) ? (n - start) : CRT2_R64_ROWS;
+    const u64 obase = u64(pair) * n * l;
+    long long mma_cyc = 0, carry_cyc = 0;
+    for (unsigned half = 0; half < 2; ++half) {
+        const long long tm0 = (TC_PROF && tid == 0) ? (long long)clock64() : 0;
+        // 2-3. GEMM over this half's n-tiles.  Warp w covers ntA = w+4u and
+        // ntB = ntA+8 (u = 0..UP-1), filtered to the half's [0,NTH) range:
+        // the union over warps and both streams is every tile exactly once
+        // (NTH=14: warp0 {0,4,8,12}, warp1 {1,5,9,13}, warp2 {2,6,10},
+        // warp3 {3,7,11}).
+#pragma unroll 1
+        for (unsigned u = 0; u < UP; ++u) {
+            const unsigned ntA = half * NTH + warp + 4 * u;
+            const unsigned ntB = ntA + 8;
+            const bool hasA = (warp + 4 * u) < NTH && ntA < cfg.NT;
+            const bool hasB = (warp + 4 * u + 8) < NTH && ntB < cfg.NT;
+            if (!hasA && !hasB) continue;             // warp-uniform
+            int acc[4][2][4];
+#pragma unroll
+            for (unsigned mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (unsigned q = 0; q < 2; ++q) acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
+#pragma unroll 3
+            for (unsigned ks = 0; ks < cfg.KS; ++ks) {
+                const uint2 b0 = hasA ? frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
+                const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
+#pragma unroll
+                for (unsigned mt = 0; mt < 4; ++mt) {
+                    const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
+                    const u32* r1 = r0 + 8 * cfg.SA;
+                    const u32 x0 = r0[0], x1 = r1[0], x2 = r0[4], x3 = r1[4];
+                    if (hasA) mma_u8(acc[mt][0], x0, x1, x2, x3, b0.x, b0.y);
+                    if (hasB) mma_u8(acc[mt][1], x0, x1, x2, x3, b1.x, b1.y);
+                }
+            }
+#pragma unroll
+            for (unsigned mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (unsigned q = 0; q < 2; ++q) {
+                    const unsigned nt = q ? ntB : ntA;
+                    if (!(q ? hasB : hasA)) continue;
+                    const u64 pg = (u64(u32(acc[mt][q][0])) << sh) + (u64(u32(acc[mt][q][1])) << (sh + 8));
+                    const u64 pg8 = (u64(u32(acc[mt][q][2])) << sh) + (u64(u32(acc[mt][q][3])) << (sh + 8));
+                    const u64 send = odd ? pg : pg8;
+                    const u64 mine = odd ? pg8 : pg;
+                    const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                    const unsigned row = mt * 16 + g + (odd ? 8 : 0);
+                    sX[row * SXH + (nt - half * NTH) * 2 + (t >> 1)] = tot;
+                }
+        }
+        __syncthreads();
+        const long long tm1 = (TC_PROF && tid == 0) ? (long long)clock64() : 0;
+        // 4. carry + reduce + store for this half (two 32-row waves).
+        oc27_carry_half(sX, SXH, cinv, cout, dgwin, DSH, out, obase,
+                        rows, l, NTH * 2, slot_logN, start, tid,
+                        half, half * NTH * 2,
+                        pl.bits, pl.gap, pl.q);
+        const long long tm2 = (TC_PROF && tid == 0) ? (long long)clock64() : 0;
+        mma_cyc += tm1 - tm0; carry_cyc += tm2 - tm1;
+    }
+    TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2);
+    if (TC_PROF && tid == 0) {
+        atomicAdd(&g_tcprof[2], (unsigned long long)mma_cyc);
+        atomicAdd(&g_tcprof[3], (unsigned long long)carry_cyc);
+    }
+}
+#endif // OC27_ROWS64
 
 
 // ---------------------------------------------------------------------------
