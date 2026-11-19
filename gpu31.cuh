@@ -1209,7 +1209,7 @@ struct Device {
     cudaError_t tc_pipeline(const u32* pa, const u32* pb, u32* pc, u32* pra, u32* prb, u32* prc,
                             u32 B, cudaStream_t stream, bool prof, int part = 0,
                             u32* pinv = nullptr) {
-        u32* const pio = pinv ? pinv : pra;   // TC35: inv_low output slot
+        u32* pio = pinv ? pinv : pra;   // TC35: inv_low output slot
         // part 0: whole pipeline, 1: encode (+fwd low) only, 2: tail only
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
         cudaError_t st = cudaSuccess;
@@ -1249,6 +1249,10 @@ struct Device {
             if (tc_fhinv && OC31_TILE_RC && d_ring && d_ctr && fhinv_grid && !tc_invcrt) {
                 // TC36: fused_high + inv_low persistent, rc in an L2 ring.
                 const unsigned P = B * k;
+                // ra is still being read by later fused_high tasks while
+                // inv_low tasks run, so the tile-major output goes to prc
+                // (rc itself lives in the ring) and CRT reads it from there.
+                pio = prc;
                 cudaMemsetAsync(d_ctr, 0, (1 + 2 * std::size_t(P)) * sizeof(unsigned), stream);
                 tc::fh_inv<<<fhinv_grid, dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
