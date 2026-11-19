@@ -1160,7 +1160,7 @@ struct Device {
             }
             if (part == 1) return cudaGetLastError();
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
-                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + 1) * sizeof(u32), stream>>>(
+                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
                 pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, ef256 ? 1u : 0u);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) cudaEventRecord(ev_[4], stream);

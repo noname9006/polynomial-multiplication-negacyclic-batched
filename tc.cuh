@@ -215,6 +215,12 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // lanes 0-15 take columns c, lanes 16-31 columns c+256 and the butterfly is
 // one shfl_xor(16) right after the global load.  Runtime-gated (ef256 arg).
 // TC30: cp.async double buffer for sR/sB in encode_fwdlow256.
+// TC31: fused_high shared row stride 33 -> 32.  Every access is row*S+lane
+// (one row per warp), so stride 32 is already conflict-free; smem 33.8 ->
+// 32.8 KB per CTA lets 3 CTAs fit per SM instead of 2.
+#ifndef TC31_S32
+#define TC31_S32 1
+#endif
 #ifndef TC30_CPA
 #define TC30_CPA 1
 #endif
@@ -846,7 +852,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
-    constexpr unsigned S = NT_COLS + 1;
+    constexpr unsigned S = TC31_S32 ? NT_COLS : NT_COLS + 1;   // all accesses are row*S+lane
     const unsigned HC = 1u << logH;
 #if OC10_R16
     // Stage partition: n16 radix-16 groups (4 stages), n8 radix-8 groups
