@@ -222,6 +222,11 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #define TC31_S32 1
 #endif
 // TC32: primes/weights of the group by cp.async into shared (encode256).
+// TC33: fused_high __launch_bounds__(256,3): cap registers at 85 so the 3
+// CTAs/SM that TC31's 32.8 KB smem allows are not blocked by registers.
+#ifndef TC33_FH3
+#define TC33_FH3 1
+#endif
 #ifndef TC32_PW
 #define TC32_PW 1
 #endif
@@ -848,7 +853,7 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
 // forward DIT high stages (a, b) + pointwise + inverse DIF high stages -> c.
 // grid (512/NT_COLS, K, B), block (NT_COLS, 8), smem 2*HC*(NT_COLS+1)*4.
 // tw tables: [k][(HC-1)*512], stage s at offset 512*(2^s-1), [within][low].
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
 fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
