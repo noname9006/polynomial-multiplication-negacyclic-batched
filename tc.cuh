@@ -225,6 +225,43 @@ inline bool crt2_r64_ok(unsigned KS, unsigned NT, unsigned SA, unsigned l) {
            crt_tc2_r64_smem(SA, SXH) <= 48 * 1024;
 }
 
+// OC34 (agent B): cp.async double-buffered residue staging in crt_tc2_r64.
+// The staging phase (~34% of CRT) reads residues synchronously, then mounts
+// them; TC30 showed the same overlap trick in encode is worth -1.4 ms.  Here
+// the residues of prime batch b+1 are copied by cp.async (4 B per thread,
+// zero-fill src-size for out-of-range primes/rows) into a second shared
+// buffer while batch b's preweight/Montgomery + sA stores run.  Only the
+// TC11 constant path with OC31 tile-major + OC32 preweight + merged slot
+// order is pipelined (the combat config); every other config keeps the
+// exact synchronous staging.
+//
+// Shared budget (exact): r64 base = sA 33792 + sX 14848 = 48640 B; headroom
+// to 49152 is only 512 B, so a full second residue buffer cannot be added.
+// Instead the two staging buffers are ALIASED ONTO THE DEAD sX REGION during
+// staging (sX is first written by the GEMM epilogue, which starts after
+// staging's final wait_group + __syncthreads):
+//   buf[2][CPB][64] u32 = 2 * CPB * 64 * 4 B;  CPB=16 -> 8192 B <= 14848 B.
+// ZERO extra shared bytes: total stays 48640 B <= 49152, 2 CTA/SM.
+// Batch layout: batch b covers primes [b*CPB, (b+1)*CPB); thread tid copies
+// prime b*CPB + tid/64, row tid%64 (one 4 B cp.async per thread per batch;
+// 128 threads = 2 primes x 64 rows per issue round, CPB/2 = 8 rounds).
+// K=114 -> 8 batches (last has 2 valid primes, zero-filled).
+#ifndef OC34_CPA
+#define OC34_CPA 1
+#endif
+constexpr unsigned OC34_CPB = 16;   // primes per cp.async batch/buffer
+inline std::size_t oc34_buf_bytes() {
+    return std::size_t(2) * OC34_CPB * CRT2_R64_ROWS * 4;   // 8192 at CPB=16
+}
+// eligible when the aliased buffers fit the sX region.  The CONFIG clauses
+// (OC31_TILE_RC/OC32_PREWEIGHT/TC22_MERGED flags, ntiles, slot_logN, K) are
+// checked at the call site inside the kernel — those macros live in the
+// device section below, so this host helper only does the size math.
+inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntiles, unsigned slot_logN) {
+    return ntiles != 0 && slot_logN != 0 && K <= 128 &&   // 128 = CRT_KMAX_C
+           oc34_buf_bytes() <= std::size_t(CRT2_R64_ROWS) * SXH * 8;
+}
+
 // OC8 (parallel branch): radix-8 high stages in fused_high - three DIT/DIF
 // stages per shared round trip (s, s+1, s+2), plus radix-2 tail stages.
 // CPU-validated bit-exact against the radix-2 reference (20 random trials).
@@ -1096,6 +1133,54 @@ crt_tc2_r64(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict
     // OC32 preweight), NG=2: each thread handles K/2 primes; warp lanes =
     // 32 consecutive rows.
     u64 fsum = 0;
+#if OC34_CPA
+    // OC34: cp.async double-buffered residue staging for the combat config
+    // (constant primes + tile-major rc + preweight + merged slots).  The
+    // buffers alias the dead sX region (see oc34_ok); batch b+1's residues
+    // fly in while batch b is mounted into sA.  term = residue (preweight),
+    // so the compute per batch is just the fsum multiply-add + sA stores.
+    if (OC31_TILE_RC && OC32_PREWEIGHT && TC22_MERGED &&
+        oc34_ok(SXH, K, ntiles, slot_logN) && untw_inv) {
+        u32* rbuf = reinterpret_cast<u32*>(sX);      // [2][CPB][64]
+        const unsigned NB = (K + OC34_CPB - 1) / OC34_CPB;
+        const unsigned cq = tid >> 6, cr = tid & 63; // prime-in-pair, row
+        const bool ract = (start + cr) < n;
+        auto issue = [&](unsigned b, unsigned buf) {
+            u32* dst = rbuf + buf * (OC34_CPB * CRT2_R64_ROWS);
+#pragma unroll
+            for (unsigned p = 0; p < OC34_CPB / 2; ++p) {
+                const unsigned j = b * OC34_CPB + p * 2 + cq;
+                const bool ok = j < K && ract;
+                const u32* gp = residues + (ok ? (rbase2 + j) * 512u + ((start + cr) & 511u) : 0);
+                const unsigned sa = unsigned(__cvta_generic_to_shared(dst + (p * 2 + cq) * CRT2_R64_ROWS + cr));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;"
+                             :: "r"(sa), "l"(gp), "r"(ok ? 4 : 0) : "memory");
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        };
+        issue(0, 0);
+        for (unsigned b = 0; b < NB; ++b) {
+            const unsigned buf = b & 1;
+            if (b + 1 < NB) issue(b + 1, buf ^ 1);
+            // wait until only the just-issued next batch is in flight
+            if (b + 1 < NB) asm volatile("cp.async.wait_group 1;" ::: "memory");
+            else            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+            const u32* src = rbuf + buf * (OC34_CPB * CRT2_R64_ROWS);
+            // each thread mounts its NG=2 prime streams for row c
+#pragma unroll 1
+            for (unsigned p = 0; p < OC34_CPB; ++p) {
+                const unsigned j = b * OC34_CPB + p;
+                if (j < K && j % NG == jg) {
+                    const u32 term = src[p * CRT2_R64_ROWS + c];
+                    sA[c * cfg.SA + j] = term;
+                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                }
+            }
+            __syncthreads();   // all reads of buf done before it is reused
+        }
+    } else
+#endif
     if (untw_inv && K <= CRT_KMAX_C) {
 #pragma unroll 1
         for (unsigned j0 = jg; j0 < K; j0 += 8 * NG) {

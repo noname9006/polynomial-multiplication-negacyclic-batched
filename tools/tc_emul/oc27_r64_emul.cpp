@@ -255,6 +255,54 @@ static void ref_row(const u32* terms, const u32* W, unsigned pitch,
     for (unsigned i = 0; i < L; ++i) out[i] = acc[i];
 }
 
+// ---------------------------------------------------------------------------
+// OC34 staging mirror: cp.async double-buffered residue loads, batched by
+// OC34_CPB primes, buffers aliased on the dead sX region.  Emulates the
+// issue/wait/mount order per batch (the copies themselves are synchronous
+// here — what is validated is the indexing, the zero-fill predicates, the
+// j%NG==jg mount split, and that every (row, prime) term lands in sA exactly
+// as the synchronous path produces it).  Returns the staged sA terms.
+static void stage34(const u32* rc, u64 rbase2, unsigned start, unsigned n,
+                    unsigned K, unsigned SA, unsigned SXH,
+                    std::vector<u32>& sA /* rows*SA */) {
+    const unsigned CPB = OC34_CPB;
+    const unsigned NB = (K + CPB - 1) / CPB;
+    // buffer fit check identical to oc34_ok's shared-size clause
+    if (std::size_t(2) * CPB * 64 * 4 > std::size_t(64) * SXH * 8) {
+        std::printf("OC34 BUFFER FIT FAIL\n");
+        std::exit(2);
+    }
+    std::vector<u32> rbuf(std::size_t(2) * CPB * 64, 0xdeadbeefu);
+    auto issue = [&](unsigned b, unsigned buf) {
+        for (unsigned tid = 0; tid < 128; ++tid) {
+            const unsigned cq = tid >> 6, cr = tid & 63;
+            const bool ract = (start + cr) < n;
+            for (unsigned p = 0; p < CPB / 2; ++p) {
+                const unsigned j = b * CPB + p * 2 + cq;
+                const bool ok = j < K && ract;
+                const u32 v = ok ? rc[(rbase2 + j) * 512u + ((start + cr) & 511u)] : 0u;
+                rbuf[std::size_t(buf) * CPB * 64 + (p * 2 + cq) * 64 + cr] = v;
+            }
+        }
+    };
+    issue(0, 0);
+    for (unsigned b = 0; b < NB; ++b) {
+        const unsigned buf = b & 1;
+        if (b + 1 < NB) issue(b + 1, buf ^ 1);
+        // mount: thread tid (c = tid&63, jg = tid>>6) takes primes j%2==jg
+        for (unsigned tid = 0; tid < 128; ++tid) {
+            const unsigned c = tid & 63, jg = tid >> 6;
+            for (unsigned p = 0; p < CPB; ++p) {
+                const unsigned j = b * CPB + p;
+                if (j < K && j % 2 == jg) {
+                    const u32 term = rbuf[std::size_t(buf) * CPB * 64 + p * 64 + c];
+                    sA[std::size_t(c) * SA + j] = term;
+                }
+            }
+        }
+    }
+}
+
 // one full test: rows x terms x weights -> P32 vs P64 vs REF.
 // tile_rc: emulate the OC31 tile-major residue layout [pair][tile][prime][512]
 // (terms are packed into that layout and read back through the same RC index
@@ -327,6 +375,41 @@ static int run_shape(const Shape& sh, unsigned rows, unsigned mode,
         for (unsigned r = 0; r < rows; ++r)
             for (unsigned j = 0; j < pitch; ++j)
                 T[r * SA + j] = RC((r / 64) * 64, j, r);
+
+        // OC34: validate the cp.async double-buffer staging mirror against
+        // the synchronous RC staging, per 64-row CTA (incl. partial CTAs).
+        // terms == residues here (OC32 preweight: term = r directly).
+        // The kernel stages K = pitch-1 primes (column K is the fsum
+        // correction, written later by the reducer — NOT staged).
+        const unsigned Kst = pitch - 1;
+        for (unsigned cta = 0; cta * 64 < rows; cta++) {
+            const unsigned start = cta * 64;
+            const unsigned nr = (rows - start < 64) ? rows - start : 64;
+            std::vector<u32> sA34(std::size_t(64) * SA, 0);
+            stage34(rc.data(), u64(start >> 9) * pitch, start, rows,
+                    Kst, SA, SXH, sA34);
+            for (unsigned r = 0; r < nr; ++r)
+                for (unsigned j = 0; j < Kst; ++j) {
+                    if (sA34[r * SA + j] != T[(start + r) * SA + j]) {
+                        std::printf("OC34 STAGE MISMATCH cta=%u r=%u j=%u got=%08x want=%08x\n",
+                                    cta, r, j, sA34[r * SA + j], T[(start + r) * SA + j]);
+                        return 1;
+                    }
+                }
+            // column K must NOT be staged (reducer writes it from fsum)
+            for (unsigned r = 0; r < 64; ++r)
+                if (sA34[r * SA + Kst] != 0) {
+                    std::printf("OC34 COL-K STAGED FAIL cta=%u r=%u\n", cta, r);
+                    return 1;
+                }
+            // inactive rows (partial CTA) must be zero-filled
+            for (unsigned r = nr; r < 64; ++r)
+                for (unsigned j = 0; j < Kst; ++j)
+                    if (sA34[r * SA + j] != 0) {
+                        std::printf("OC34 ZERO-FILL FAIL cta=%u r=%u j=%u\n", cta, r, j);
+                        return 1;
+                    }
+        }
     }
 
     // ---- P32: 32-row CTAs, single chain ----
