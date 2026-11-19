@@ -166,7 +166,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #define OC28_EPICONF 1
 #endif
 #ifndef OC29_DITSHFL
-#define OC29_DITSHFL 1
+#define OC29_DITSHFL 0
 #endif
 // OC29 (parallel branch, agent A): DIT entirely in registers.  One warp owns
 // one prime; the 256-point row is held as 8 values per lane at position
