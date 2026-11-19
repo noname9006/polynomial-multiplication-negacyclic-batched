@@ -236,6 +236,13 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef TC29_EF256
 #define TC29_EF256 1
 #endif
+// OC33: fused_high owns two contiguous 32-column segments per CTA
+// (grid.x 16 -> 8), both coalesced 128 B/warp.  Low stage 8 becomes an
+// in-shared butterfly between the segments; the two segments are then
+// processed sequentially through the same NTT pipeline.  0 = TC29 path.
+#ifndef OC33_COAL
+#define OC33_COAL 1
+#endif
 #ifndef OC12_IO
 #define OC12_IO 1
 #endif
@@ -874,11 +881,20 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #endif
     u32* sa = sm;
     u32* sb = sm + HC * S;
+#if OC33_COAL
+    u32* sc = sm + 2 * HC * S;   // segment 1 (columns low+256)
+    u32* sd = sm + 3 * HC * S;
+#endif
     const unsigned lane = threadIdx.x, rw = threadIdx.y;
+#if OC33_COAL
+    const unsigned low = blockIdx.x * NT_COLS + lane;
+    const u32 w8 = pkf[u64(blockIdx.y) * TC_LT + TWI(8, low)];
+#else
     const unsigned low = ef256 ? (blockIdx.x * 16 + (lane & 15) + ((lane & 16) << 4))
                                : blockIdx.x * NT_COLS + lane;
     // TC29: twiddle of low stage 8 for pair (j, j+256), j = low & 255
     const u32 w8 = ef256 ? pkf[u64(blockIdx.y) * TC_LT + TWI(8, low & 255)] : 0u;
+#endif
     const unsigned k = blockIdx.y;
     const u64 plane = (u64(blockIdx.z) * K + k) * n;
     const gpu31::Prime p = primes[k];
@@ -893,19 +909,46 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 
     TCP_T(f0);
-#if OC10_R16 && OC12_IO
+#if OC10_R16 && OC12_IO && !OC33_COAL
     if (n16 == 0) {
 #endif
         for (unsigned h = rw; h < HC; h += 8) {
             sa[h * S + lane] = ra[plane + u64(h) * NT_TILE + low];
             sb[h * S + lane] = rb[plane + u64(h) * NT_TILE + low];
+#if OC33_COAL
+            sc[h * S + lane] = ra[plane + u64(h) * NT_TILE + low + 256];
+            sd[h * S + lane] = rb[plane + u64(h) * NT_TILE + low + 256];
+#endif
         }
         __syncthreads();
-#if OC10_R16 && OC12_IO
+#if OC33_COAL
+        // Low stage 8: rows h of segment 0 (column low) and segment 1
+        // (column low+256).  Twiddle depends only on the low column index.
+        for (unsigned h = rw; h < HC; h += 8) {
+            u32 ua = sa[h * S + lane], ub = sc[h * S + lane];
+            u32 va = sb[h * S + lane], vb = sd[h * S + lane];
+            sc[h * S + lane] = gpu31::sub(ua, gpu31::mont(ub, w8, p), p.p);
+            sa[h * S + lane] = gpu31::add(ua, gpu31::mont(ub, w8, p), p.p);
+            sd[h * S + lane] = gpu31::sub(va, gpu31::mont(vb, w8, p), p.p);
+            sb[h * S + lane] = gpu31::add(va, gpu31::mont(vb, w8, p), p.p);
+        }
+        __syncthreads();
+#endif
+#if OC10_R16 && OC12_IO && !OC33_COAL
     }
     // OC12: with n16>0 the first radix-16 DIT group loads ra/rb directly
     // into its register arrays, so no shared write/read/barrier is needed.
 #endif
+#if OC33_COAL
+    for (unsigned seg = 0; seg < 2; ++seg) {
+        u32* sA = seg ? sc : sa;
+        u32* sB = seg ? sd : sb;
+        const unsigned lo = low + seg * 256;
+#pragma unroll
+        for (unsigned q = 0; q < 7; ++q) {
+            waf[q] = q < logH ? twf[u64(k) * TWS + q * NT_TILE + lo] : 0u;
+            wai[q] = q < logH ? twi[u64(k) * TWS + q * NT_TILE + lo] : 0u;
+        }
     TCP_T(f1);
 #if OC10_R16
     // OC10: four DIT stages per shared round trip.  A group is rows
@@ -931,7 +974,581 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 #pragma unroll
             for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
             u32 av[16], bv[16];
-#if OC10_R16 && OC12_IO
+#if OC10_R16 && OC12_IO && !OC33_COAL
+            if (q == 0) {
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) {
+                    const unsigned row = r0 + i * H;
+                    av[i] = ra[plane + u64(row) * NT_TILE + lo];
+                    bv[i] = rb[plane + u64(row) * NT_TILE + lo];
+                }
+                if (ef256) {
+                    // lo stage 8 (DIT): lane j gets u + w*v, lane j+256 gets u - w*v
+                    const bool up = (lane & 16) != 0;
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) {
+                        const u32 xa = __shfl_xor_sync(0xffffffffu, av[i], 16);
+                        const u32 xb = __shfl_xor_sync(0xffffffffu, bv[i], 16);
+                        if (up) {
+                            av[i] = gpu31::sub(xa, gpu31::mont(av[i], w8, p), p.p);
+                            bv[i] = gpu31::sub(xb, gpu31::mont(bv[i], w8, p), p.p);
+                        } else {
+                            av[i] = gpu31::add(av[i], gpu31::mont(xa, w8, p), p.p);
+                            bv[i] = gpu31::add(bv[i], gpu31::mont(xb, w8, p), p.p);
+                        }
+                    }
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) { av[i] = sA[ix[i]]; bv[i] = sB[ix[i]]; }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 16; i += 2) {
+                gpu31::butterfly(av[i], av[i+1], t1, p);
+                gpu31::butterfly(bv[i], bv[i+1], t1, p);
+            }
+#pragma unroll
+            for (unsigned k = 0; k < 2; ++k) {
+#pragma unroll
+                for (unsigned i = k; i < 16; i += 4) {
+                    gpu31::butterfly(av[i], av[i+2], t2[k], p);
+                    gpu31::butterfly(bv[i], bv[i+2], t2[k], p);
+                }
+            }
+#pragma unroll
+            for (unsigned k = 0; k < 4; ++k) {
+#pragma unroll
+                for (unsigned i = k; i < 16; i += 8) {
+                    gpu31::butterfly(av[i], av[i+4], t4[k], p);
+                    gpu31::butterfly(bv[i], bv[i+4], t4[k], p);
+                }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                gpu31::butterfly(av[i], av[i+8], t8[i], p);
+                gpu31::butterfly(bv[i], bv[i+8], t8[i], p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) { sA[ix[i]] = av[i]; sB[ix[i]] = bv[i]; }
+        }
+        __syncthreads();
+    }
+    // radix-8 for the next min(3, logH-rs) stages, then radix-2 tail.
+#pragma unroll
+    for (unsigned q = 0; q < 2; ++q) {
+        if (q >= n8) break;
+        const unsigned s = rs + q * 3, H = 1u << s;
+        for (unsigned g = rw; g < HC / 8; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 8 + w;
+            unsigned ix[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
+            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t2a = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w], p);
+            const u32 t2b = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + H], p);
+            u32 t4[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i)
+                t4[i] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + i * H], p);
+            u32 av[8], bv[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) { av[i] = sA[ix[i]]; bv[i] = sB[ix[i]]; }
+#pragma unroll
+            for (unsigned i = 0; i < 8; i += 2) {
+                gpu31::butterfly(av[i], av[i+1], t1, p);
+                gpu31::butterfly(bv[i], bv[i+1], t1, p);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
+                const u32 tw = (i & 1) ? t2b : t2a;
+                gpu31::butterfly(av[i], av[i+2], tw, p);
+                gpu31::butterfly(bv[i], bv[i+2], tw, p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                gpu31::butterfly(av[i], av[i+4], t4[i], p);
+                gpu31::butterfly(bv[i], bv[i+4], t4[i], p);
+            }
+#if OC10_R16 && OC11_FUSE
+            if (oc11_fuse && q + 1 == n8) {
+                // OC11: 8 final DIT values of a and b are in registers.  Do the
+                // pointwise product here and the whole inverse radix-8 group
+                // (stages s+2,s+1,s) before the single shared write.  This is
+                // the exact inverse of the three DIT butterflies above, so the
+                // group's data never needs the separate pointwise/DIF passes.
+#pragma unroll
+                for (unsigned i = 0; i < 8; ++i) av[i] = gpu31::mont(av[i], bv[i], p);
+                u32 q4[4];
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i)
+                    q4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
+                const u32 q2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
+                const u32 q2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
+                const u32 q1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    const u32 u = av[i], v = av[i+4];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), q4[i], p);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < 4; ++j) {
+                    const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
+                    const u32 tw = (i & 1) ? q2b : q2a;
+                    const u32 u = av[i], v = av[i+2];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+                }
+#pragma unroll
+                for (unsigned i = 0; i < 8; i += 2) {
+                    const u32 u = av[i], v = av[i+1];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), q1, p);
+                }
+#pragma unroll
+                for (unsigned i = 0; i < 8; ++i) sA[ix[i]] = av[i];
+            } else
+#endif
+            {
+#pragma unroll
+                for (unsigned i = 0; i < 8; ++i) { sA[ix[i]] = av[i]; sB[ix[i]] = bv[i]; }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned k = 0; k < 3; ++k) {
+        if (k >= logH - s8) break;
+        const unsigned s = s8 + k, H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
+            gpu31::butterfly(sA[first * S + lane], sA[second * S + lane], w, p);
+            gpu31::butterfly(sB[first * S + lane], sB[second * S + lane], w, p);
+        }
+        __syncthreads();
+    }
+#elif OC8_R8
+    // OC8: three DIT stages per shared round trip.  Group rows are
+    // r0 + i*H (i=0..7, H=2^s).  Stage s pairs (0,1),(2,3),(4,5),(6,7);
+    // stage s+1 pairs (0,2),(1,3),(4,6),(5,7); stage s+2 pairs (0,4)..(3,7).
+#pragma unroll
+    for (unsigned s = 0; s + 2 < 7; s += 3) {
+        if (s + 2 >= logH) break;
+        const unsigned H = 1u << s;
+        for (unsigned g = rw; g < HC / 8; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 8 + w;
+            unsigned ix[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
+            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t2a = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
+            const u32 t2b = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
+            u32 t4[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i)
+                t4[i] = gpu31::mont(waf[s + 2], tfB[(4 * H - 1) + w + i * H], p);
+            u32 av[8], bv[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) { av[i] = sA[ix[i]]; bv[i] = sB[ix[i]]; }
+#pragma unroll
+            for (unsigned i = 0; i < 8; i += 2) {
+                gpu31::butterfly(av[i], av[i + 1], t1, p);
+                gpu31::butterfly(bv[i], bv[i + 1], t1, p);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
+                const u32 tw = (i & 1) ? t2b : t2a;
+                gpu31::butterfly(av[i], av[i + 2], tw, p);
+                gpu31::butterfly(bv[i], bv[i + 2], tw, p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                gpu31::butterfly(av[i], av[i + 4], t4[i], p);
+                gpu31::butterfly(bv[i], bv[i + 4], t4[i], p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) { sA[ix[i]] = av[i]; sB[ix[i]] = bv[i]; }
+        }
+        __syncthreads();
+    }
+    // radix-2 tail for the remaining stages (logH % 3 of them)
+#pragma unroll
+    for (unsigned k = 0; k < 3; ++k) {
+        if (k >= logH % 3) break;
+        const unsigned s = logH - (logH % 3) + k, H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
+            gpu31::butterfly(sA[first * S + lane], sA[second * S + lane], w, p);
+            gpu31::butterfly(sB[first * S + lane], sB[second * S + lane], w, p);
+        }
+        __syncthreads();
+    }
+#elif TC12_R4
+    // TC12: radix-4 = two DIT stages (s, s+1) per shared round trip.  A group
+    // is rows r, r+H, r+2H, r+3H (r = blk*4H + w): stage s pairs (0,1),(2,3)
+    // with within w; stage s+1 pairs (0,2) within w and (1,3) within w+H.
+#pragma unroll
+    for (unsigned s = 0; s + 1 < 7; s += 2) {
+        if (s + 1 >= logH) break;
+        const unsigned H = 1u << s;
+        for (unsigned g = rw; g < HC / 4; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 4 + w;
+            const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
+                           i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
+            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t2 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
+            const u32 t3 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
+            u32 a0 = sA[i0], a1 = sA[i1], a2 = sA[i2], a3 = sA[i3];
+            u32 b0 = sB[i0], b1 = sB[i1], b2 = sB[i2], b3 = sB[i3];
+            gpu31::butterfly(a0, a1, t1, p); gpu31::butterfly(a2, a3, t1, p);
+            gpu31::butterfly(b0, b1, t1, p); gpu31::butterfly(b2, b3, t1, p);
+            gpu31::butterfly(a0, a2, t2, p); gpu31::butterfly(a1, a3, t3, p);
+            gpu31::butterfly(b0, b2, t2, p); gpu31::butterfly(b1, b3, t3, p);
+            sA[i0] = a0; sA[i1] = a1; sA[i2] = a2; sA[i3] = a3;
+            sB[i0] = b0; sB[i1] = b1; sB[i2] = b2; sB[i3] = b3;
+        }
+        __syncthreads();
+    }
+    if (logH & 1) {
+        const unsigned s = logH - 1, H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 wa = (s == 6 ? waf[6] : (s == 4 ? waf[4] : (s == 2 ? waf[2] : waf[0])));
+            const u32 w = gpu31::mont(wa, tfB[(H - 1) + within], p);
+            gpu31::butterfly(sA[first * S + lane], sA[second * S + lane], w, p);
+            gpu31::butterfly(sB[first * S + lane], sB[second * S + lane], w, p);
+        }
+        __syncthreads();
+    }
+#else
+#pragma unroll
+    for (unsigned s = 0; s < 7; ++s) {
+        if (s >= logH) break;
+        const unsigned H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
+            gpu31::butterfly(sA[first * S + lane], sA[second * S + lane], w, p);
+            gpu31::butterfly(sB[first * S + lane], sB[second * S + lane], w, p);
+        }
+        __syncthreads();
+    }
+#endif
+    TCP_T(f2);
+#if OC10_R16 && OC11_FUSE
+    if (!oc11_fuse)
+#endif
+    {
+        for (unsigned h = rw; h < HC; h += 8)
+            sA[h * S + lane] = gpu31::mont(sA[h * S + lane], sB[h * S + lane], p);
+        __syncthreads();
+    }
+    TCP_T(f3);
+#if OC10_R16
+    // OC10 inverse: radix-2 tail (highest stages) first, then radix-8 and
+    // radix-16 groups in descending stage order.
+#pragma unroll
+    for (unsigned k = 0; k < 3; ++k) {
+        if (k >= logH - s8) break;
+        const unsigned s = logH - 1 - k, H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 u = sA[first * S + lane], v = sA[second * S + lane];
+            sA[first * S + lane] = gpu31::add(u, v, p.p);
+            sA[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned q = 0; q < 2; ++q) {
+#if OC10_R16 && OC11_FUSE
+        if (oc11_fuse && q == 0) continue;   // already done in the fused DIT pass
+#endif
+        if (q >= n8) break;
+        const unsigned s = s8 - 3 * (q + 1), H = 1u << s;
+        for (unsigned g = rw; g < HC / 8; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 8 + w;
+            unsigned ix[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
+            u32 t4[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i)
+                t4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
+            const u32 t2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
+            const u32 t2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
+            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            u32 av[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) av[i] = sA[ix[i]];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                const u32 u = av[i], v = av[i+4];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[i], p);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
+                const u32 tw = (i & 1) ? t2b : t2a;
+                const u32 u = av[i], v = av[i+2];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 8; i += 2) {
+                const u32 u = av[i], v = av[i+1];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) sA[ix[i]] = av[i];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned q = 0; q < 4; ++q) {
+        if (q >= n16) break;
+        const unsigned s = (n16 - 1 - q) << 2, H = 1u << s;
+        for (unsigned g = rw; g < HC / 16; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 16 + w;
+            unsigned ix[16];
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
+            u32 t2[2], t4[4], t8[8];
+#pragma unroll
+            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + k * H], p);
+#pragma unroll
+            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + k * H], p);
+#pragma unroll
+            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(wai[s+3], tiB[(8 * H - 1) + w + k * H], p);
+            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            u32 av[16];
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) av[i] = sA[ix[i]];
+            // stage s+3: pairs (i,i+8)
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                const u32 u = av[i], v = av[i+8];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i+8] = gpu31::mont(gpu31::sub(u, v, p.p), t8[i], p);
+            }
+            // stage s+2: pairs (i,i+4), i mod 4 = k
+#pragma unroll
+            for (unsigned k = 0; k < 4; ++k) {
+#pragma unroll
+                for (unsigned i = k; i < 16; i += 8) {
+                    const u32 u = av[i], v = av[i+4];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[k], p);
+                }
+            }
+            // stage s+1: pairs (i,i+2), i mod 2 = k
+#pragma unroll
+            for (unsigned k = 0; k < 2; ++k) {
+#pragma unroll
+                for (unsigned i = k; i < 16; i += 4) {
+                    const u32 u = av[i], v = av[i+2];
+                    av[i] = gpu31::add(u, v, p.p);
+                    av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), t2[k], p);
+                }
+            }
+            // stage s: pairs (i,i+1)
+#pragma unroll
+            for (unsigned i = 0; i < 16; i += 2) {
+                const u32 u = av[i], v = av[i+1];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            }
+#if OC10_R16 && OC12_IO && !OC33_COAL
+            if (q + 1 == n16) {
+                // OC12: last inverse group writes the finished coefficients
+                // straight to global, skipping the shared write + store read.
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i)
+                    rc[plane + u64(r0 + i * H) * NT_TILE + lo] = av[i];
+            } else
+#endif
+            {
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) sA[ix[i]] = av[i];
+            }
+        }
+        __syncthreads();
+    }
+#elif OC8_R8
+    // radix-2 DIF tail first (highest stages, reverse order)
+#pragma unroll
+    for (unsigned k = 0; k < 3; ++k) {
+        if (k >= logH % 3) break;
+        const unsigned s = logH - 1 - k, H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 u = sA[first * S + lane], v = sA[second * S + lane];
+            sA[first * S + lane] = gpu31::add(u, v, p.p);
+            sA[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+        }
+        __syncthreads();
+    }
+    // radix-8 DIF: stages s+2, s+1, s (descending groups)
+#pragma unroll
+    for (int s = int((logH / 3) * 3) - 3; s >= 0; s -= 3) {
+        const unsigned H = 1u << s;
+        for (unsigned g = rw; g < HC / 8; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 8 + w;
+            unsigned ix[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
+            u32 t4[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i)
+                t4[i] = gpu31::mont(wai[s + 2], tiB[(4 * H - 1) + w + i * H], p);
+            const u32 t2a = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
+            const u32 t2b = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
+            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            u32 av[8];
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) av[i] = sA[ix[i]];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                const u32 u = av[i], v = av[i + 4];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i + 4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[i], p);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
+                const u32 tw = (i & 1) ? t2b : t2a;
+                const u32 u = av[i], v = av[i + 2];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i + 2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 8; i += 2) {
+                const u32 u = av[i], v = av[i + 1];
+                av[i] = gpu31::add(u, v, p.p);
+                av[i + 1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) sA[ix[i]] = av[i];
+        }
+        __syncthreads();
+    }
+#elif TC12_R4
+    if (logH & 1) {
+        const unsigned s = logH - 1, H = 1u << s;
+        const u32 wa = (s == 6 ? wai[6] : (s == 4 ? wai[4] : (s == 2 ? wai[2] : wai[0])));
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(wa, tiB[(H - 1) + within], p);
+            const u32 u = sA[first * S + lane], v = sA[second * S + lane];
+            sA[first * S + lane] = gpu31::add(u, v, p.p);
+            sA[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+        }
+        __syncthreads();
+    }
+    // DIF pairs (s+1, s) from the top: stage s+1 on (0,2),(1,3), then s on (0,1),(2,3).
+#pragma unroll
+    for (int s = 4; s >= 0; s -= 2) {
+        if (unsigned(s) + 2 > logH - (logH & 1)) continue;
+        const unsigned H = 1u << s;
+        for (unsigned g = rw; g < HC / 4; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 4 + w;
+            const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
+                           i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
+            const u32 t2 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
+            const u32 t3 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
+            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            u32 x0 = sA[i0], x1 = sA[i1], x2 = sA[i2], x3 = sA[i3];
+            u32 u = x0, v = x2;
+            x0 = gpu31::add(u, v, p.p); x2 = gpu31::mont(gpu31::sub(u, v, p.p), t2, p);
+            u = x1; v = x3;
+            x1 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t3, p);
+            u = x0; v = x1;
+            x0 = gpu31::add(u, v, p.p); x1 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            u = x2; v = x3;
+            x2 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            sA[i0] = x0; sA[i1] = x1; sA[i2] = x2; sA[i3] = x3;
+        }
+        __syncthreads();
+    }
+#else
+#pragma unroll
+    for (int s = 6; s >= 0; --s) {
+        if (unsigned(s) >= logH) continue;
+        const unsigned H = 1u << s;
+        for (unsigned h = rw; h < HC / 2; h += 8) {
+            const unsigned within = h & (H - 1);
+            const unsigned first = 2 * (h - within) + within, second = first + H;
+            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 u = sA[first * S + lane], v = sA[second * S + lane];
+            sA[first * S + lane] = gpu31::add(u, v, p.p);
+            sA[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+        }
+        __syncthreads();
+    }
+#endif
+    TCP_T(f4);
+#if OC10_R16 && OC12_IO && !OC33_COAL
+    if (n16 == 0)
+#endif
+    {
+        for (unsigned h = rw; h < HC; h += 8)
+            rc[plane + u64(h) * NT_TILE + lo] = sA[h * S + lane];
+    }
+    TCP_T(f5);
+    TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
+    TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
+    }
+#else
+    TCP_T(f1);
+#if OC10_R16
+    // OC10: four DIT stages per shared round trip.  A group is rows
+    // r0 + i*H (i=0..15, H=2^s).  Stage s pairs (i,i+1) with within w;
+    // s+1 pairs (i,i+2) with within w+(i&1)*H; s+2 pairs (i,i+4) with
+    // within w+(i&3)*H; s+3 pairs (i,i+8) with within w+(i&7)*H.
+#pragma unroll
+    for (unsigned q = 0; q < 4; ++q) {
+        if (q >= n16) break;
+        const unsigned s = q << 2, H = 1u << s;
+        for (unsigned g = rw; g < HC / 16; g += 8) {
+            const unsigned w = g & (H - 1);
+            const unsigned r0 = (g - w) * 16 + w;
+            unsigned ix[16];
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
+            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
+            u32 t2[2], t4[4], t8[8];
+#pragma unroll
+            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + k * H], p);
+#pragma unroll
+            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + k * H], p);
+#pragma unroll
+            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
+            u32 av[16], bv[16];
+#if OC10_R16 && OC12_IO && !OC33_COAL
             if (q == 0) {
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i) {
@@ -1334,7 +1951,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                 av[i] = gpu31::add(u, v, p.p);
                 av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
             }
-#if OC10_R16 && OC12_IO
+#if OC10_R16 && OC12_IO && !OC33_COAL
             if (q + 1 == n16) {
                 // OC12: last inverse group writes the finished coefficients
                 // straight to global, skipping the shared write + store read.
@@ -1468,7 +2085,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     }
 #endif
     TCP_T(f4);
-#if OC10_R16 && OC12_IO
+#if OC10_R16 && OC12_IO && !OC33_COAL
     if (n16 == 0)
 #endif
     {
@@ -1478,6 +2095,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
     TCP_T(f5);
     TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
     TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
+#endif
 }
 
 // inverse DIF low stages in 512-tiles (output: bit-reversed slot order).

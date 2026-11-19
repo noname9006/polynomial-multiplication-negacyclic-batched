@@ -1159,8 +1159,10 @@ struct Device {
             }
             }
             if (part == 1) return cudaGetLastError();
-            tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
-                             2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
+            tc::fused_high<<<dim3(tc::NT_TILE / (OC33_COAL ? 2 * tc::NT_COLS : tc::NT_COLS), k, B),
+                             dim3(tc::NT_COLS, 8),
+                             (OC33_COAL ? 4u : 2u) * (n / tc::NT_TILE) *
+                                 (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
                 pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, ef256 ? 1u : 0u);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) cudaEventRecord(ev_[4], stream);
@@ -1275,6 +1277,17 @@ private:
                     return;
                 }
             }
+#if OC33_COAL
+            {
+                const std::size_t fsh = 4 * std::size_t(plan_.N / tc::NT_TILE) *
+                                        (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+                if (cudaFuncSetAttribute(tc::fused_high,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, int(fsh)) != cudaSuccess) {
+                    cudaGetLastError();
+                    return;
+                }
+            }
+#endif
             upload_words(d_fcrt, f);
             tc_crt_ready = d_fcrt != nullptr;
             // fused decode table: decode(r) = r*u*R^-2, term = decode(r)*inv
