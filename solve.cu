@@ -732,6 +732,13 @@ void* fherma_init(const fherma::Point& p) {
                         if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_invcrt = false;
                         std::fprintf(stderr, "[TC] invcrt=%d rows=%u smem=%zu\n", int(d.tc_invcrt), d.invcrt_rows, d.invcrt_shared);
                     }
+#if R8_CLUSTER
+                    if (d.tc_ntt && d.tc_crt2 && d.r8_ready) {
+                        d.tc_r8 = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_r8 = false;
+                        std::fprintf(stderr, "[TC] r8=%d\n", int(d.tc_r8));
+                    }
+#endif
 #if TC36_FHINV
                     if (d.tc_ntt && d.tc_crt2 && d.fhinv_grid) {
                         d.tc_fhinv = true;

@@ -168,6 +168,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // window, so the 15 GB of rc traffic between the tail kernels stays in L2.
 // Re-test of TC17 now that fused_high/inv_low are DRAM-bound.
 // TC36: fused_high + inv_low as one persistent kernel with an L2 rc ring.
+// R8: inv_low fused into fused_high through a 16-CTA cluster (DSMEM).
+#ifndef R8_CLUSTER
+#define R8_CLUSTER 1
+#endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
 #endif
@@ -1386,12 +1390,24 @@ fwd_low(u32* __restrict__ a, u32* __restrict__ b, const gpu31::Prime* __restrict
 // forward DIT high stages (a, b) + pointwise + inverse DIF high stages -> c.
 // grid (512/NT_COLS, K, B), block (NT_COLS, 8), smem 2*HC*(NT_COLS+1)*4.
 // tw tables: [k][(HC-1)*512], stage s at offset 512*(2^s-1), [within][low].
+// R8: DSMEM helpers (cluster of the 16 fused_high CTAs of one plane).
+__device__ __forceinline__ void r8_cl_sync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+__device__ __forceinline__ u32 r8_ld_cluster(const u32* local, unsigned rank) {
+    const u32 ad = u32(__cvta_generic_to_shared(local));
+    u32 ra, v;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(ad), "r"(rank));
+    asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(ra) : "memory");
+    return v;
+}
 __device__ __forceinline__ void
 fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
            const u32* __restrict__ pkf, unsigned ef256,
-           unsigned bx, unsigned by, unsigned bz, u64 rcoff) {
+           unsigned bx, unsigned by, unsigned bz, u64 rcoff,
+           const u32* __restrict__ pki = nullptr, u32* __restrict__ r8out = nullptr) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
@@ -1869,7 +1885,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
             }
 #if OC10_R16 && OC12_IO
-            if (q + 1 == n16) {
+            if (q + 1 == n16 && !r8out) {
                 // OC12: last inverse group writes the finished coefficients
                 // straight to global, skipping the shared write + store read.
 #pragma unroll
@@ -2005,9 +2021,65 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #if OC10_R16 && OC12_IO
     if (n16 == 0)
 #endif
-    {
+    if (!r8out) {
         for (unsigned h = rw; h < HC; h += 8)
             rc[rcoff + u64(h) * NT_TILE + low] = sa[h * S + lane];
+    }
+    if (r8out) {
+        // R8: inv_low fused here.  The 16 CTAs of this plane form a cluster;
+        // together their shared buffers hold the whole plane (128 rows x 512
+        // columns).  Warp rw of CTA bx takes row h = bx*8+rw (= one 512-tile),
+        // gathers its 512 columns over DSMEM (lane owns positions lane+32i),
+        // runs the 9 inverse DIF low stages in registers and writes the
+        // tile-major [pair][tile][prime][512] output that crt_tc2 reads.
+        r8_cl_sync();
+        const unsigned h = bx * 8 + rw;
+        u32 v[16];
+#pragma unroll
+        for (unsigned i = 0; i < 16; ++i) {
+            const unsigned pos = lane + 32 * i;
+            const unsigned owner = ef256 ? ((pos & 255) >> 4) : (pos >> 5);
+            const unsigned ln = ef256 ? ((pos & 15) | ((pos >> 8) << 4)) : (pos & 31);
+            v[i] = r8_ld_cluster(&sa[h * S + ln], owner);
+        }
+        r8_cl_sync();   // every remote read is done before any CTA may exit
+        const u32* tw = pki + u64(k) * TC_LT;
+#pragma unroll
+        for (int m = 8; m >= 5; --m) {
+            const unsigned half = 1u << m, dd = half >> 5;
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) {
+                if (i & dd) continue;
+                const unsigned j = (lane + 32 * i) & (half - 1);
+                const u32 w = __ldg(tw + TWI(m, j));
+                const u32 u = v[i], x = v[i + dd];
+                v[i] = gpu31::add(u, x, p.p);
+                v[i + dd] = gpu31::mont(gpu31::sub(u, x, p.p), w, p);
+            }
+        }
+#pragma unroll
+        for (int m = 4; m >= 0; --m) {
+            const unsigned half = 1u << m;
+            const unsigned j = lane & (half - 1);
+            const u32 w = __ldg(tw + TWI(m, j));
+            const bool hi = (lane & half) != 0;
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) {
+                const u32 x = __shfl_xor_sync(0xffffffffu, v[i], half);
+                v[i] = hi ? gpu31::mont(gpu31::sub(x, v[i], p.p), w, p) : gpu31::add(v[i], x, p.p);
+            }
+        }
+#if OC32_PREWEIGHT
+        if (TC22_MERGED) {
+            const u32 cw = c_crt_slotc[k];
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) v[i] = gpu31::mont(v[i], cw, p);
+        }
+#endif
+        const u64 tile = u64(bz) * (n / NT_TILE) + h;
+        const u64 ob = (tile * K + k) * NT_TILE;
+#pragma unroll
+        for (unsigned i = 0; i < 16; ++i) r8out[ob + lane + 32 * i] = v[i];
     }
     TCP_T(f5);
     TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
@@ -2021,6 +2093,18 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
            const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0) {
     fused_high_dev(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
                    blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n);
+}
+
+// R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
+// grid (16, K, B), block (32, 8); requires logH == 7 (one row per warp) and
+// the OC31 tile-major output.  out must not alias ra (read by other CTAs).
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+fused_high_r8(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ out,
+              const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
+              const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
+              const u32* __restrict__ pkf, unsigned ef256, const u32* __restrict__ pki) {
+    fused_high_dev(ra, rb, nullptr, primes, twf, twi, n, K, logH, pkf, ef256,
+                   blockIdx.x, blockIdx.y, blockIdx.z, 0, pki, out);
 }
 
 // inverse DIF low stages in 512-tiles (output: bit-reversed slot order).

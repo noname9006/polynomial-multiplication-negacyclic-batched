@@ -834,6 +834,7 @@ struct Device {
         cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &a);
         cudaGetLastError();
     }
+    bool tc_r8 = false, r8_ready = false;   // R8: fused_high_r8 (cluster 16)
     bool tc_fhinv = false;            // TC36 persistent fused_high+inv_low
     u32* d_ring = nullptr;            // TC36 rc ring (TC36_R planes)
     unsigned* d_ctr = nullptr;        // TC36 ticket + per-plane counters
@@ -1245,6 +1246,31 @@ struct Device {
             }
             }
             if (part == 1) return cudaGetLastError();
+            bool fh_done = false;
+#if R8_CLUSTER
+            if (tc_r8 && r8_ready && OC31_TILE_RC && ef256 && logH == 7 && !tc_invcrt) {
+                // R8: fused_high + inv_low in one kernel (cluster of 16 = one
+                // plane, DSMEM).  Output tile-major into prc (pra is still
+                // being read by other clusters), CRT reads prc.
+                pio = prc;
+                cudaLaunchConfig_t cf = {};
+                cudaLaunchAttribute at[1];
+                at[0].id = cudaLaunchAttributeClusterDimension;
+                at[0].val.clusterDim.x = tc::NT_TILE / tc::NT_COLS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+                cf.gridDim = dim3(tc::NT_TILE / tc::NT_COLS, k, B); cf.blockDim = dim3(tc::NT_COLS, 8, 1);
+                cf.dynamicSmemBytes = 2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+                cf.stream = stream; cf.attrs = at; cf.numAttrs = 1;
+                st = cudaLaunchKernelEx(&cf, tc::fused_high_r8, (const u32*)pra, (const u32*)prb, prc,
+                                        (const gpu31::Prime*)d_primes, (const u32*)d_twf, (const u32*)d_twi,
+                                        n, k, logH, (const u32*)d_pk_fwd, 1u, (const u32*)d_pk_inv);
+                if (st == cudaSuccess) st = cudaGetLastError();
+                if (st != cudaSuccess) return st;
+                if (prof) { cudaEventRecord(ev_[4], stream); cudaEventRecord(ev_[5], stream);
+                            cudaEventRecord(ev_[6], stream); }
+                fh_done = true;
+            }
+#endif
+            if (!fh_done) {
 #if TC36_FHINV
             if (tc_fhinv && OC31_TILE_RC && d_ring && d_ctr && fhinv_grid && !tc_invcrt &&
                 (n / tc::NT_TILE) % tc::TC36_IG == 0) {
@@ -1295,6 +1321,7 @@ struct Device {
 #if TC36_FHINV
             }
 #endif
+            }   // !fh_done
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
@@ -1372,6 +1399,27 @@ private:
                 }
 #else
                 crt2_SX = crt_cfg.SX;
+#endif
+#if R8_CLUSTER
+                {
+                    // R8: fused_high_r8 needs a 16-CTA cluster of (32x8)-thread
+                    // CTAs with the fused_high dynamic smem.
+                    const std::size_t dyn = 2 * (plan_.N / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+                    bool ok = cudaFuncSetAttribute(tc::fused_high_r8, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) == cudaSuccess;
+                    int ncl = 0;
+                    if (ok) {
+                        cudaLaunchConfig_t cf = {};
+                        cudaLaunchAttribute at[1];
+                        at[0].id = cudaLaunchAttributeClusterDimension;
+                        at[0].val.clusterDim.x = tc::NT_TILE / tc::NT_COLS; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+                        cf.gridDim = dim3(tc::NT_TILE / tc::NT_COLS, plan_.K, 1); cf.blockDim = dim3(tc::NT_COLS, 8, 1);
+                        cf.dynamicSmemBytes = dyn; cf.attrs = at; cf.numAttrs = 1;
+                        ok = cudaOccupancyMaxActiveClusters(&ncl, tc::fused_high_r8, &cf) == cudaSuccess && ncl > 0;
+                    }
+                    cudaGetLastError();
+                    r8_ready = ok && plan_.logN == 16;
+                    std::fprintf(stderr, "[R8] ready=%d clusters=%d\n", int(r8_ready), ncl);
+                }
 #endif
                 // TC27: prefer 32 rows / cluster 16 (non-portable), else 64 / 8
                 invcrt_shared = 0;
