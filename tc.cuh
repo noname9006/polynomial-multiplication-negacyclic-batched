@@ -912,13 +912,18 @@ __device__ __forceinline__ void oc47_carry_half(
     }
     // swap outgoing carries (full warp: all 32 lanes arrive)
     const u64 other = __shfl_xor_sync(0xffffffffu, mycarry, 1);
+    // t47 fix: every lane must take part in the full-mask shuffles, so they
+    // run BEFORE the non-owner lanes return (was: shfl after return -> hang).
+    u32 od[14];
+#pragma unroll
+    for (unsigned w = 0; w < 14; ++w) od[w] = __shfl_xor_sync(0xffffffffu, dg[w], 1);
     if (!live || seg != 0) return;               // the owner finishes the row
     // receive seg 1's digits, one word per shfl (register exchange only)
     u32 full[60];
     for (unsigned w = 0; w < HW; ++w) full[w] = dg[w];
 #pragma unroll
     for (unsigned w = 0; w < 14; ++w)
-        full[HW + w] = __shfl_xor_sync(0xffffffffu, dg[w], 1);
+        full[HW + w] = od[w];
     // stitch: propagate mycarry into seg 1's digits with early exit
     u64 delta = mycarry;
     for (unsigned w = 0; w < HW && delta; ++w) {
