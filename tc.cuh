@@ -375,6 +375,13 @@ __host__ __device__ inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntile
 #ifndef TC30_CPA
 #define TC30_CPA 1
 #endif
+// OC43: triple-buffer sR/sP/sW in encode_fwdlow256.  The next-next group's
+// twiddles/prime/weight are issued at the END of the current group, so the
+// cp.async wait at g0 overlaps a full group of mma/epi/DIT work.
+// Flag 0 = exact copy of master.  Static shared 47,936 B <= 49,152.
+#ifndef OC43_ENCGEMM
+#define OC43_ENCGEMM 1
+#endif
 #ifndef TC29_EF256
 #define TC29_EF256 1
 #endif
@@ -2791,7 +2798,12 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     __shared__ u32 sT[EF_PR][E2_PT];
     // R8F: operand b uses the CRT-weight-scaled table (term = residue in CRT)
     if (blockIdx.y && frag_b) frag = frag_b;
-#if TC30_CPA
+#if OC43_ENCGEMM
+    __shared__ __align__(16) u32 sR3[3][EF_PR][E2_ROWS];
+    __shared__ __align__(16) uint2 sB2[2][EF_NTB * ENC_KS_MAX * 32];
+    __shared__ __align__(16) gpu31::Prime sP3[3][EF_PR];
+    __shared__ __align__(16) gpu31::Weight sW3[3][EF_PR];
+#elif TC30_CPA
     __shared__ __align__(16) u32 sRb[2][EF_PR][E2_ROWS];
     __shared__ __align__(16) uint2 sBb[2][EF_NTB * ENC_KS_MAX * 32];
     __shared__ __align__(16) gpu31::Prime sPb[2][EF_PR];    // TC32
@@ -2853,7 +2865,50 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
     }
 #endif
-#if TC30_CPA
+#if OC43_ENCGEMM
+    // OC43: twiddles/prime/weight (rp) go into 3 buffers; B fragments stay
+    // double-buffered.  rp for group g+2 is issued at the end of group g.
+    auto issue_rp = [&](unsigned ng, unsigned buf) {
+        for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
+            const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
+            const unsigned kk = ng * 2 + q;
+            const bool ok = kk < K;
+            const u32* gp = packed + (ok ? u64(kk) * TC_LT + r : 0);
+            const unsigned sa = unsigned(__cvta_generic_to_shared(&sR3[buf][q][r]));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 4 : 0) : "memory");
+        }
+        if (tid < 2 * EF_PR) {
+            const unsigned q = tid & (EF_PR - 1);
+            const unsigned kk = ng * 2 + q;
+            const bool ok = kk < K;
+            if (tid < EF_PR) {
+                const gpu31::Prime* gp = primes + (ok ? kk : 0);
+                const unsigned sa = unsigned(__cvta_generic_to_shared(&sP3[buf][q]));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 16 : 0) : "memory");
+            } else {
+                const gpu31::Weight* gp = weights + (ok ? std::size_t(kk) * l : 0);
+                const unsigned sa = unsigned(__cvta_generic_to_shared(&sW3[buf][q]));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    auto issue_b = [&](unsigned ng) {
+        uint2* dstb = sB2[ng & 1u];
+        for (unsigned idx = tid; idx < EF_NTB * KS * 32; idx += 256) {
+            const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+            const unsigned nt = ng * EF_NTB + j;
+            const bool ok = nt < NT;
+            const uint2* gp = frag + (ok ? std::size_t(nt) * KS * 32 + rem : 0);
+            const unsigned sa = unsigned(__cvta_generic_to_shared(&dstb[idx]));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    issue_rp(0, 0);
+    issue_rp(1, 1);
+    issue_b(0);
+#elif TC30_CPA
     // TC30: group twiddles/B fragments arrive by cp.async into a double
     // buffer one group ahead (no registers, overlaps the previous group).
     auto issue = [&](unsigned nb, unsigned buf) {
@@ -2897,7 +2952,16 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
         TCP_T(g0);
-#if TC30_CPA
+#if OC43_ENCGEMM
+        const unsigned gid = nt0 / EF_NTB;
+        u32 (*sR)[E2_ROWS] = sR3[gid % 3];
+        uint2* sB = sB2[gid & 1u];
+        const gpu31::Prime* sP = sP3[gid % 3];
+        const gpu31::Weight* sW = sW3[gid % 3];
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        if (nt0 + EF_NTB < NT) issue_b(gid + 1);
+#elif TC30_CPA
         const unsigned cb = (nt0 / EF_NTB) & 1;
         u32 (*sR)[E2_ROWS] = sRb[cb];
         uint2* sB = sBb[cb];
@@ -3114,6 +3178,9 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         __syncthreads();
 #endif
         TCP_T(g5);
+#if OC43_ENCGEMM
+        if (gid + 2 < (NT + EF_NTB - 1) / EF_NTB) issue_rp(gid + 2, (gid + 2) % 3);
+#endif
         pe[0] += g1 - g0; pe[1] += g2 - g1; pe[2] += g3 - g2; pe[3] += g4 - g3; pe[4] += g5 - g4;
     }
     TCP_ADD(10, 0, pe[0]); TCP_ADD(11, 0, pe[1]); TCP_ADD(12, 0, pe[2]);
