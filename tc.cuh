@@ -200,6 +200,15 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef OC42_FWD567
 #define OC42_FWD567 1
 #endif
+// OC44 (agent A): forward low stages 6,7 in fused_high by register exchange
+// (as R8F v6 does for stage 8).  Swap lane bit lb=1<<(m-4) with register bit
+// rb=1<<(m-5) (one shfl per register pair), run whole DIT butterflies on
+// (r, r|rb) -- one mont per pair instead of two -- then exchange back.  The
+// exchanges cannot be fused: their register bits overlap (2,4,8), so each
+// stage restores the layout.  Flag 0 restores fbf2745 exactly.
+#ifndef OC44_XCHG67
+#define OC44_XCHG67 1
+#endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
 #endif
@@ -1571,7 +1580,50 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 }
 #if OC42_FWD567
                 if (r8f && ef256) {
-                    // OC42: forward low stages 6,7 (stage 8 is just below).
+#if OC44_XCHG67
+                    // OC44: forward stages 6,7 by register exchange, same
+                    // scheme as R8F v6's stage 8.  One mont per register pair
+                    // (whole butterfly) instead of two with plain shfl.
+                    // stages 6:(lb=4,rb=2), 7:(lb=8,rb=4).  The exchanges
+                    // are NOT fusible (rb overlap), so restore each stage.
+#pragma unroll
+                    for (unsigned q = 0; q < 2; ++q) {
+                        const unsigned m = 6 + q;
+                        const unsigned lb = 1u << (m - 4), rb = 1u << (m - 5);
+                        const bool up = (lane & lb) != 0;
+                        const u32 w = pkf[u64(by) * TC_LT + TWI(m, low & ((1u << m) - 1))];
+                        // exchange: swap lane bit lb with register bit rb
+#pragma unroll
+                        for (unsigned r = 0; r < 16; ++r) {
+                            if (r & rb) continue;
+                            u32 sa_ = up ? av[r] : av[r | rb];
+                            u32 sb_ = up ? bv[r] : bv[r | rb];
+                            sa_ = __shfl_xor_sync(0xffffffffu, sa_, lb);
+                            sb_ = __shfl_xor_sync(0xffffffffu, sb_, lb);
+                            if (up) { av[r] = sa_; bv[r] = sb_; }
+                            else    { av[r | rb] = sa_; bv[r | rb] = sb_; }
+                        }
+                        // whole butterflies: one mont per pair per operand
+#pragma unroll
+                        for (unsigned r = 0; r < 16; ++r) {
+                            if (r & rb) continue;
+                            gpu31::butterfly(av[r], av[r | rb], w, p);
+                            gpu31::butterfly(bv[r], bv[r | rb], w, p);
+                        }
+                        // exchange back (restore row-in-register layout)
+#pragma unroll
+                        for (unsigned r = 0; r < 16; ++r) {
+                            if (r & rb) continue;
+                            u32 sa_ = up ? av[r] : av[r | rb];
+                            u32 sb_ = up ? bv[r] : bv[r | rb];
+                            sa_ = __shfl_xor_sync(0xffffffffu, sa_, lb);
+                            sb_ = __shfl_xor_sync(0xffffffffu, sb_, lb);
+                            if (up) { av[r] = sa_; bv[r] = sb_; }
+                            else    { av[r | rb] = sa_; bv[r | rb] = sb_; }
+                        }
+                    }
+#else
+                    // OC42 (base fbf2745): plain shfl stages 6,7.
                     // low bit m == lane bit (m-4); a plain shfl on that bit
                     // reaches the partner.  No transpose, layout preserved.
 #pragma unroll
@@ -1593,6 +1645,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                             }
                         }
                     }
+#endif
                 }
 #endif
                 if (ef256 && R8F_XCHG) {
