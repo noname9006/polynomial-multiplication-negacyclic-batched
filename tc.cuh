@@ -200,6 +200,14 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef OC45_FHTW
 #define OC45_FHTW 1
 #endif
+// OC46 (agent A): forward DIT stages 0..4 directly in the encode epilogue
+// registers; stages 5..7 then need only ONE shared pass/barrier instead of
+// three.  Plain lane shfl for stages 0..3 (2 mont per butterfly), stage 4
+// in-thread.  Flag default is set BEFORE the first #if OC46_EPIDIT (lesson
+// from agent B's OC47: a default inside its own #if never compiles).
+#ifndef OC46_EPIDIT
+#define OC46_EPIDIT 1
+#endif
 #ifndef OC45_FTS
 #define OC45_FTS (127 * 32)   // per (k,bx): sum_s 2^s = 127 bidx rows x 32 lanes
 #endif
@@ -3003,6 +3011,55 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #else
             if (k < K) { p = primes[k]; w0 = weights[std::size_t(k) * l]; }
 #endif
+#if OC46_EPIDIT
+            u32 v46[2];
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const u64 pg = (u64(u32(acc[mt][j][0])) << sh) + (u64(u32(acc[mt][j][1])) << (sh + 8));
+                const u64 pg8 = (u64(u32(acc[mt][j][2])) << sh) + (u64(u32(acc[mt][j][3])) << (sh + 8));
+                const u64 send = odd ? pg : pg8;
+                const u64 mine = odd ? pg8 : pg;
+                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                u32 val = 0;
+                if (k < K) {
+                    const u32 lo = gpu31::canonical_word(u32(tot), p.p);
+                    u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
+                    if (hi >= p.p) hi -= p.p;
+                    val = gpu31::add(lo, hi, p.p);
+                }
+                v46[mt] = val;
+            }
+            const unsigned q46 = j * 2 + (t >> 1);
+            {
+#if TC30_CPA && TC32_PW
+                const gpu31::Prime pr46 = sP[q46];
+#else
+                const gpu31::Prime pr46 = primes[(nt0 * 2 + q46) < K ? (nt0 * 2 + q46) : 0];
+#endif
+                const u32* tw46 = sR[q46];
+                const unsigned rbase46 = rowbase + g + (odd ? 8 : 0);
+#pragma unroll
+                for (unsigned s = 0; s < 4; ++s) {
+                    const unsigned lb = (s == 3) ? 1u : (1u << (s + 2)); // lane^4,^8,^16,^1
+                    const bool up = (lane & lb) != 0;
+#pragma unroll
+                    for (unsigned mt = 0; mt < 2; ++mt) {
+                        const unsigned rl = rbase46 + mt * 16;
+                        const u32 other = __shfl_xor_sync(0xffffffffu, v46[mt], lb);
+                        const u32 w = tw46[TWI(s, rl & ((1u << s) - 1))];
+                        v46[mt] = up ? gpu31::sub(other, gpu31::mont(v46[mt], w, pr46), pr46.p)
+                                     : gpu31::add(v46[mt], gpu31::mont(other, w, pr46), pr46.p);
+                    }
+                }
+                const u32 w4 = tw46[TWI(4, rbase46 & 15)];
+                gpu31::butterfly(v46[0], v46[1], w4, pr46);
+            }
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);
+                sT[q46][padw(rl)] = v46[mt];
+            }
+#else
 #pragma unroll
             for (unsigned mt = 0; mt < 2; ++mt) {
                 const u64 pg = (u64(u32(acc[mt][j][0])) << sh) + (u64(u32(acc[mt][j][1])) << (sh + 8));
@@ -3020,6 +3077,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);
                 sT[j * 2 + (t >> 1)][padw(rl)] = val;
             }
+#endif
         }
         __syncthreads();
         TCP_T(g3);
@@ -3082,6 +3140,41 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             }
         }
 #else
+#if OC46_EPIDIT
+        // OC46: stages 0..4 already done in the epilogue; stages 5,6,7 are
+        // a single radix-8 pass over sT (one shared round trip + barrier,
+        // instead of three).  Stage m pairs positions x and x+2^m; the 8
+        // values of one group live in registers of one thread.
+        {
+            const unsigned q = tid >> 5, gi = tid & 31;
+            const unsigned kk = nt0 * 2 + q;
+#if TC30_CPA && TC32_PW
+            const gpu31::Prime pr8 = sP[q];
+#else
+            const gpu31::Prime pr8 = primes[kk < K ? kk : 0];
+#endif
+            u32* row = sT[q];
+            const u32* tw8 = sR[q];
+            const unsigned H = 8, w = gi & 7;
+            const unsigned x0 = (gi - w) * 8 + w;
+            u32 v[8];
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) v[e] = row[padw(x0 + e * H)];
+#pragma unroll
+            for (unsigned st = 0; st < 3; ++st) {
+                const unsigned span = 1u << st;
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) {
+                    if (e & span) continue;
+                    const unsigned j = w + (e & (span - 1)) * H;
+                    gpu31::butterfly(v[e], v[e + span], tw8[TWI(5 + st, j)], pr8);
+                }
+            }
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) row[padw(x0 + e * H)] = v[e];
+        }
+        __syncthreads();
+#else
         // DIT stages 0..7: radix-8 (0-2), radix-8 (3-5): 8 primes x 32 groups
         // = 256 groups, one per thread; radix-4 (6-7): 8 x 64 groups, 2/thread.
         {
@@ -3137,6 +3230,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
         }
         __syncthreads();
+#endif
 #endif
         TCP_T(g4);
 #if !OC29_DITSHFL
