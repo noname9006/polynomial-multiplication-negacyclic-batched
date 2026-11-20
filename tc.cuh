@@ -191,6 +191,15 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef R8F_XCHG
 #define R8F_XCHG 1
 #endif
+// OC42 (agent A): move encode's forward low stages 5..7 (and stage 8) into
+// fused_high.  In the r8f layout low bit m == lane bit (m-4) for m=5..8, so
+// each stage is a plain lane-xor shfl over the 16 registers held per lane;
+// no register transpose is needed and the row-in-register layout that the
+// radix-16 high stages expect is preserved.  Encode then runs only stages 0..4.
+// Flag 0 restores the exact base path.  Twiddles come from pkf[TWI(m,low&2^m-1)].
+#ifndef OC42_FWD567
+#define OC42_FWD567 1
+#endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
 #endif
@@ -1560,6 +1569,32 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                     av[i] = ra[ad];
                     bv[i] = rb[ad];
                 }
+#if OC42_FWD567
+                if (r8f && ef256) {
+                    // OC42: forward low stages 5..7 (stage 8 is just below).
+                    // low bit m == lane bit (m-4); a plain shfl on that bit
+                    // reaches the partner.  No transpose, layout preserved.
+#pragma unroll
+                    for (unsigned q = 0; q < 3; ++q) {
+                        const unsigned m = 5 + q;
+                        const unsigned lb = 1u << q;          // lane^1,^2,^4
+                        const bool up = (lane & lb) != 0;
+                        const u32 w = pkf[u64(by) * TC_LT + TWI(m, low & ((1u << m) - 1))];
+#pragma unroll
+                        for (unsigned i = 0; i < 16; ++i) {
+                            const u32 xa = __shfl_xor_sync(0xffffffffu, av[i], lb);
+                            const u32 xb = __shfl_xor_sync(0xffffffffu, bv[i], lb);
+                            if (up) {
+                                av[i] = gpu31::sub(xa, gpu31::mont(av[i], w, p), p.p);
+                                bv[i] = gpu31::sub(xb, gpu31::mont(bv[i], w, p), p.p);
+                            } else {
+                                av[i] = gpu31::add(av[i], gpu31::mont(xa, w, p), p.p);
+                                bv[i] = gpu31::add(bv[i], gpu31::mont(xb, w, p), p.p);
+                            }
+                        }
+                    }
+                }
+#endif
                 if (ef256 && R8F_XCHG) {
                     // R8F v6: stage 8 by register exchange (lane bit 4 <-> reg
                     // bit 3), whole DIT butterflies, exchange back: 8 mont per
@@ -3044,8 +3079,15 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
             u32* row = sT[q];
             const u32* tw8 = sR[q];
+            // OC42: when enabled, encode stops after stage 4; stages 5..7
+            // (and 8) move into fused_high via the existing r8f lane-exchange.
+#if OC42_FWD567
+            const unsigned d8lim = r8f ? 3u : 6u;
+#else
+            const unsigned d8lim = 6u;
+#endif
 #pragma unroll
-            for (unsigned m = 0; m < 6; m += 3) {
+            for (unsigned m = 0; m < d8lim; m += 3) {
                 const unsigned H = 1u << m;
                 const unsigned w = gi & (H - 1);
                 const unsigned x0 = (gi - w) * 8 + w;
@@ -3067,6 +3109,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 __syncthreads();
             }
         }
+#if !OC42_FWD567
 #pragma unroll
         for (unsigned rep = 0; rep < 2; ++rep) {
             const unsigned q = (tid >> 6) + rep * 4, w = tid & 63;   // H = 64, x0 = w
@@ -3087,6 +3130,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
         }
         __syncthreads();
+#endif
 #endif
         TCP_T(g4);
 #if !OC29_DITSHFL
