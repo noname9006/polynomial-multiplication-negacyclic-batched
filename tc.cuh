@@ -961,7 +961,45 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_T(t0);
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
     u64 fsum = 0;
-    if (untw_inv && K <= CRT_KMAX_C) {
+    if (r8f) {
+        // R8F (v2): thread = limb.  Its 32 residues of this 32-run are one
+        // contiguous 128 B block -> 8 uint4 loads; the 32-point inverse
+        // (DIF stages 4..0) runs in registers (80 butterflies, no shfl), then
+        // the n^-1*inv weight and one sA column write.  The row correction
+        // sums are taken from sA after the barrier.
+        if (tid < K) {
+            const unsigned j = tid;
+            const gpu31::Prime pj = c_crt_prime[j];
+            const uint4* src = reinterpret_cast<const uint4*>(residues + ((rbase2 + j) << 5));
+            const uint4* twp = reinterpret_cast<const uint4*>(pki + u64(j) * TC_LT);
+            u32 v[32], tw[32];
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const uint4 x = __ldcs(src + e);
+                v[4 * e] = x.x; v[4 * e + 1] = x.y; v[4 * e + 2] = x.z; v[4 * e + 3] = x.w;
+                const uint4 y = __ldg(twp + e);
+                tw[4 * e] = y.x; tw[4 * e + 1] = y.y; tw[4 * e + 2] = y.z; tw[4 * e + 3] = y.w;
+            }
+#pragma unroll
+            for (int m = 4; m >= 0; --m) {
+                const unsigned half = 1u << m;
+#pragma unroll
+                for (unsigned i = 0; i < 32; ++i) {
+                    if (i & half) continue;
+                    const u32 u = v[i], x = v[i + half];
+                    v[i] = gpu31::add(u, x, pj.p);
+                    v[i + half] = gpu31::mont(gpu31::sub(u, x, pj.p), tw[(half - 1) + (i & (half - 1))], pj);
+                }
+            }
+            const u32 cw = c_crt_slotc[j];
+#pragma unroll
+            for (unsigned r = 0; r < 32; ++r) sA[r * cfg.SA + j] = gpu31::mont(v[r], cw, pj);
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (unsigned j = jg; j < K; j += NG)
+            fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> 30;
+    } else if (untw_inv && K <= CRT_KMAX_C) {
         // TC11: batched loads (8 independent residue+untwist pairs in flight),
         // prime and correction constants from __constant__ (warp-uniform j).
 #pragma unroll 1
@@ -972,24 +1010,6 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                 const unsigned j = j0 + NG * q;
                 r[q] = (j < K && active) ? RC(j, i) : 0u;
                 u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
-            }
-            if (r8f) {
-                // R8F: inverse low stages 4..0; lane c = row = x & 31, the
-                // limb j is warp-uniform (one 32-run per CTA).
-#pragma unroll
-                for (unsigned q = 0; q < 8; ++q) {
-                    const unsigned j = j0 + NG * q;
-                    const unsigned jj = j < K ? j : 0u;
-                    const gpu31::Prime pj = c_crt_prime[jj];
-                    const u32* tw = pki + u64(jj) * TC_LT;
-#pragma unroll
-                    for (int m = 4; m >= 0; --m) {
-                        const unsigned half = 1u << m;
-                        const u32 w = __ldg(tw + TWI(m, c & (half - 1)));
-                        const u32 x = __shfl_xor_sync(0xffffffffu, r[q], half);
-                        r[q] = (c & half) ? gpu31::mont(gpu31::sub(x, r[q], pj.p), w, pj) : gpu31::add(r[q], x, pj.p);
-                    }
-                }
             }
 #pragma unroll
             for (unsigned q = 0; q < 8; ++q) {

@@ -152,3 +152,20 @@ bad = int((res != RC).sum())
 print("mismatches:", bad, "of", N)
 assert bad == 0
 print("R8F emulation OK")
+
+# --- crt_tc2 (r8f v2): thread = limb, 32-point DIF stages 4..0 in registers
+res2 = np.zeros(N, dtype=np.int64)
+for blk in range(N // 32):
+    v = [int(t) for t in out[blk * 32:(blk + 1) * 32]]
+    tw = [int(iw(m, jj)) for m in range(5) for jj in range(1 << m)]  # (half-1)+jj
+    for m in range(4, -1, -1):
+        half = 1 << m
+        for i in range(32):
+            if i & half:
+                continue
+            u, x = v[i], v[i + half]
+            v[i] = (u + x) % p
+            v[i + half] = (u - x) * tw[(half - 1) + (i & (half - 1))] % p
+    res2[blk * 32:(blk + 1) * 32] = v
+assert (res2 == RC).all()
+print("R8F v2 (thread=limb) OK")

@@ -29,6 +29,7 @@ inline unsigned long long atomicAdd(unsigned long long* a, unsigned long long v)
 #define __cluster_dims__(...)
 inline unsigned __cvta_generic_to_shared(const void*){return 0;}
 template<class T> inline T __ldcg(const T* p){return *p;}
+template<class T> inline T __ldcs(const T* p){return *p;}
 inline unsigned atomicAdd(unsigned* a, unsigned v){unsigned o=*a;*a+=v;return o;}
 inline void __nanosleep(unsigned){}
 inline void __threadfence(){}
