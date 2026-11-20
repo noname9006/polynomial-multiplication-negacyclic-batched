@@ -201,8 +201,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #define OC50_FHLOCAL 1
 #endif
 #if OC50_FHLOCAL
-#define OC50_WAF(X) ((unsigned)(X) < logH ? twf[u64(k) * TWS + (unsigned)(X) * NT_TILE + low] : 0u)
-#define OC50_WAI(X) ((unsigned)(X) < logH ? twi[u64(k) * TWS + (unsigned)(X) * NT_TILE + low] : 0u)
+// Base pointers are captured once (oc50_tf/oc50_ti) because the use sites sit
+// inside loops `for (unsigned k ...)` that shadow the prime index k.
+#define OC50_WAF(X) ((unsigned)(X) < logH ? oc50_tf[(unsigned)(X) * NT_TILE] : 0u)
+#define OC50_WAI(X) ((unsigned)(X) < logH ? oc50_ti[(unsigned)(X) * NT_TILE] : 0u)
 #else
 #define OC50_WAF(X) waf[X]
 #define OC50_WAI(X) wai[X]
@@ -1520,7 +1522,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
     constexpr unsigned TWS = 7 * NT_TILE + 127;
     const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
     const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
-#if !OC50_FHLOCAL
+#if OC50_FHLOCAL
+    const u32* oc50_tf = twf + u64(k) * TWS + low;
+    const u32* oc50_ti = twi + u64(k) * TWS + low;
+#else
     u32 waf[7], wai[7];
 #pragma unroll
     for (unsigned q = 0; q < 7; ++q) {
