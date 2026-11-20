@@ -198,7 +198,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // glue monts and the 56 B of local memory (waf[7]+wai[7] indexed by runtime s).
 // Flag 0 restores 6b149ce exactly.
 #ifndef OC45_FHTW
-#define OC45_FHTW 1
+#define OC45_FHTW 0   // t46c: off (t48: fh 12.8 ms vs 9.07 master)
 #endif
 // OC46 (agent A): forward DIT stages 0..4 directly in the encode epilogue
 // registers; stages 5..7 then need only ONE shared pass/barrier instead of
