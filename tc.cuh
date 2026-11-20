@@ -187,6 +187,10 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef R8F_FULL
 #define R8F_FULL 1
 #endif
+// R8F v4: fh inverse low stages by register transposition (half mont/shfl).
+#ifndef R8F_XCHG
+#define R8F_XCHG 1
+#endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
 #endif
@@ -1956,6 +1960,35 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 // R8F: inverse low stages 8..5 (low^256..^32 = lane^16..^2),
                 // then [pair][x>>5][K][32] with x&31 = 2*bx + (lane&1).
                 const u32* tw = pki + u64(k) * TC_LT;
+#if R8F_XCHG
+                // R8F v4: register transposition.  Stage m swaps lane bit
+                // lb=2^(m-4) with register bit rb=2^(m-5) (one shfl per register
+                // pair), then each lane runs whole butterflies on (r, r|rb):
+                // half the mont/shfl of the per-lane form.  Afterwards lane L,
+                // register r holds row r0+((L>>1)&15) of lane' = (r<<1)|(L&1),
+                // i.e. the 32-run (r0+((L>>1)&15))*16 + r.
+#pragma unroll
+                for (int m = 8; m >= 5; --m) {
+                    const unsigned half = 1u << m, lb = 1u << (m - 4), rb = 1u << (m - 5);
+                    const u32 w = __ldg(tw + TWI(m, low & (half - 1)));
+                    const bool hi = (lane & lb) != 0;
+#pragma unroll
+                    for (unsigned r = 0; r < 16; ++r) {
+                        if (r & rb) continue;
+                        const u32 snd = hi ? av[r] : av[r | rb];
+                        const u32 rcv = __shfl_xor_sync(0xffffffffu, snd, lb);
+                        if (hi) av[r] = rcv; else av[r | rb] = rcv;
+                        const u32 u = av[r], x = av[r | rb];
+                        av[r] = gpu31::add(u, x, p.p);
+                        av[r | rb] = gpu31::mont(gpu31::sub(u, x, p.p), w, p);
+                    }
+                }
+                const unsigned inner = (bx << 1) | (lane & 1);
+                const u64 tb = u64(bz) * (n >> 5) + u64(r0 + ((lane >> 1) & 15)) * 16;
+#pragma unroll
+                for (unsigned r = 0; r < 16; ++r)
+                    rc[((tb + r) * K + k) * 32 + inner] = av[r];
+#else
 #pragma unroll
                 for (int m = 8; m >= 5; --m) {
                     const unsigned half = 1u << m, lb = 1u << (m - 4);
@@ -1973,6 +2006,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                     const unsigned xx = (r0 + i * H) * NT_TILE + low;
                     rc[((u64(bz) * (n >> 5) + (xx >> 5)) * K + k) * 32 + inner] = av[i];
                 }
+#endif
             } else if (q + 1 == n16 && !r8out) {
                 // OC12: last inverse group writes the finished coefficients
                 // straight to global, skipping the shared write + store read.
