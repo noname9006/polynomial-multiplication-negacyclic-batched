@@ -765,7 +765,7 @@ void* fherma_init(const fherma::Point& p) {
                     std::fprintf(stderr, "[TC] selfcheck enc=%d crt=%d fuse_decode=%d ntt=%d efl=%d chunk=%d\n",
                                  int(d.tc_enc), int(d.tc_crt), int(d.tc_fuse_decode), int(d.tc_ntt),
                                  int(d.tc_efl), int(d.tc_chunk));
-                    if (d.tc_ntt && d.tc_r8f) d.p0_probe(); if (d.tc_ntt && d.tc_r8f) d.p1_probe(); if (d.tc_ntt && d.tc_r8f) d.p2_probe();   // P0: setup-time probe, outside timing
+                    if (d.tc_ntt && d.tc_r8f) d.p0_probe(); if (d.tc_ntt && d.tc_r8f) d.p1_probe(); if (d.tc_ntt && d.tc_r8f) d.p2_probe(); if (d.tc_ntt && d.tc_r8f) d.p3_probe();   // P0: setup-time probe, outside timing
                 }
 
                 // Try the conflict-free CRT, keeping it only if bit-identical to

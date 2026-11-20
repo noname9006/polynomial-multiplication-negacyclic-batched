@@ -2822,7 +2822,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  const gpu31::Weight* __restrict__ weights,
                  const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
                  unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0,
-                 const uint2* __restrict__ frag_b = nullptr) {
+                 const uint2* __restrict__ frag_b = nullptr, unsigned pmask = 0) {
     __shared__ u32 sT[EF_PR][E2_PT];
     // R8F: operand b uses the CRT-weight-scaled table (term = residue in CRT)
     if (blockIdx.y && frag_b) frag = frag_b;
@@ -2933,7 +2933,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
         TCP_T(g0);
 #if TC30_CPA
-        const unsigned cb = (nt0 / EF_NTB) & 1;
+        const unsigned cb = (pmask & 4) ? 0u : ((nt0 / EF_NTB) & 1);   // P3 bit2: no table reload
         u32 (*sR)[E2_ROWS] = sRb[cb];
         uint2* sB = sBb[cb];
 #if TC32_PW
@@ -2942,7 +2942,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
-        if (nt0 + EF_NTB < NT) issue(nt0 + EF_NTB, cb ^ 1);
+        if (nt0 + EF_NTB < NT && !(pmask & 4)) issue(nt0 + EF_NTB, cb ^ 1);
 #else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
@@ -2965,7 +2965,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0;
 #pragma unroll
         for (unsigned ks = 0; ks < ENC_KS_MAX; ++ks) {
-            if (ks < KS) {
+            if (ks < KS && !(pmask & 8)) {   // P3 bit3: no mma
                 uint2 b[EF_NTB];
 #pragma unroll
                 for (unsigned j = 0; j < EF_NTB; ++j) b[j] = sB[(j * KS + ks) * 32 + lane];
@@ -2996,7 +2996,8 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const u64 mine = odd ? pg8 : pg;
                 const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
                 u32 val = 0;
-                if (k < K) {
+                if (k < K && (pmask & 16)) val = u32(tot);   // P3 bit4: no epilogue math
+                else if (k < K) {
                     const u32 lo = gpu31::canonical_word(u32(tot), p.p);
                     u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
                     if (hi >= p.p) hi -= p.p;
@@ -3069,7 +3070,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #else
         // DIT stages 0..7: radix-8 (0-2), radix-8 (3-5): 8 primes x 32 groups
         // = 256 groups, one per thread; radix-4 (6-7): 8 x 64 groups, 2/thread.
-        {
+        if (!(pmask & 1)) {   // P3 bit0: no DIT
             const unsigned q = tid >> 5, gi = tid & 31;
             const unsigned kk = nt0 * 2 + q;
 #if TC30_CPA && TC32_PW
@@ -3105,7 +3106,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             }
         }
         // OC42: with r8f, stages 6,7 (this radix-4 pass) move into fused_high.
-        if (!(OC42_FWD567 && r8f)) {
+        if (!(OC42_FWD567 && r8f) && !(pmask & 1)) {
 #pragma unroll
         for (unsigned rep = 0; rep < 2; ++rep) {
             const unsigned q = (tid >> 6) + rep * 4, w = tid & 63;   // H = 64, x0 = w
@@ -3130,7 +3131,8 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
         TCP_T(g4);
 #if !OC29_DITSHFL
-        if (r8f) {
+        if (pmask & 2) {   // P3 bit1: no store
+        } else if (r8f) {
             // R8F: x = row*512 + low -> [k][bx][row][lane] (fh CTA-contiguous),
             // bx = (low>>1)&15, lane = (low>>6)<<2 | ((low>>5)&1)<<1 | (low&1).
             // idx = q | bx(4) | l4(4): 16 consecutive idx = one 64 B run.

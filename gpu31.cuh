@@ -1326,7 +1326,7 @@ struct Device {
 
 
 #ifndef P2_PROBE
-#define P2_PROBE 1
+#define P2_PROBE 0
 #endif
     // P2 (2026-11-20): chunked L2 pipeline on the master kernels.  Setup only.
     //  [P2] hot C : per-pair stage time when the same C-pair residue slot is
@@ -1421,6 +1421,50 @@ struct Device {
 #endif
     }
 
+
+#ifndef P3_PROBE
+#define P3_PROBE 1
+#endif
+    unsigned enc_pmask_ = 0;   // P3: encode256 phase-skip mask (0 = normal)
+    // P3 (2026-11-20): cost of each encode256 phase by removal, B pairs scaled to 128.
+    //  bit0 no DIT | bit1 no store | bit2 no per-group table reload | bit3 no mma | bit4 no epilogue math
+    void p3_probe() {
+#if P3_PROBE
+        if (!tc_r8f) return;
+        const unsigned B = capacity_ < 128 ? capacity_ : 128;
+        const std::size_t ins = std::size_t(plan_.N) * plan_.L;
+        u32 *d_a = nullptr, *d_b = nullptr;
+        if (cudaMalloc(&d_a, B * ins * 4) != cudaSuccess || cudaMalloc(&d_b, B * ins * 4) != cudaSuccess) {
+            cudaGetLastError(); if (d_a) cudaFree(d_a); if (d_b) cudaFree(d_b);
+            std::fprintf(stderr, "[P3] alloc failed\n"); return;
+        }
+        cudaMemset(d_a, 0x37, B * ins * 4); cudaMemset(d_b, 0x29, B * ins * 4);
+        u32* d_c = d_rc;
+        cudaStream_t s = cs_[0] ? cs_[0] : 0;
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const unsigned masks[] = {0u, 1u, 2u, 4u, 8u, 16u, 3u, 19u, 23u, 31u, 15u};
+        std::fprintf(stderr, "[P3] encode256 B=%u x128 ms:", B);
+        for (unsigned m : masks) {
+            enc_pmask_ = m;
+            float best = 1e9f;
+            for (int rep = 0; rep < 4; ++rep) {
+                cudaEventRecord(e0, s);
+                tc_pipeline(d_a, d_b, d_c, d_ra, d_rb, d_rc, B, s, false, 1);
+                cudaEventRecord(e1, s);
+                cudaEventSynchronize(e1);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (rep > 0 && t < best) best = t;
+            }
+            std::fprintf(stderr, " m%u=%.3f", m, best * 128.f / float(B));
+        }
+        enc_pmask_ = 0;
+        std::fprintf(stderr, " | err=%d\n", int(cudaGetLastError()));
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaFree(d_a); cudaFree(d_b);
+#endif
+    }
+
     // Read and print the stage times. Call after the stream has synchronised.
     void report_profile() const {
         if (!profiling_) return;
@@ -1494,7 +1538,7 @@ struct Device {
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
                     d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,
-                    r8f ? d_fenc_b : nullptr);
+                    r8f ? d_fenc_b : nullptr, enc_pmask_);
                 if ((st = cudaGetLastError()) != cudaSuccess) return st;
                 if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
                                   cudaEventRecord(ev_[3], stream); }
