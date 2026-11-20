@@ -3155,8 +3155,10 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
             u32* row = sT[q];
             const u32* tw8 = sR[q];
-            const unsigned H = 8, w = gi & 7;
-            const unsigned x0 = (gi - w) * 8 + w;
+            // stages 5..7 pair x, x+32/64/128: stride H = 32, one group
+            // per gi (x0 = gi).  (Was H = 8 from the old stages 3..5 pass.)
+            const unsigned H = 32, w = gi;
+            const unsigned x0 = gi;
             u32 v[8];
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) v[e] = row[padw(x0 + e * H)];
