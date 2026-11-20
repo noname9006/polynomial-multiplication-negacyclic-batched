@@ -809,6 +809,14 @@ struct Device {
     // TC3 fused NTT pipeline tables
     u32 *d_pk_fwd = nullptr, *d_pk_inv = nullptr, *d_twf = nullptr, *d_twi = nullptr,
         *d_untw_slot = nullptr;
+#if OC45_FHTW
+    u32 *d_ftw = nullptr, *d_fti = nullptr;   // OC45: glued high twiddles [k][bx][s*512+bidx][L]
+#define OC45_LAUNCH , d_ftw, d_fti
+#define OC45_LAUNCH0 , nullptr, 0u, d_ftw, d_fti
+#else
+#define OC45_LAUNCH
+#define OC45_LAUNCH0
+#endif
     bool tc_ntt_ready = false, tc_ntt = false;
     bool tc_efl = false;   // TC5: encode fused with fwd low stages
     bool tc_crt2 = false;  // TC15 CRT variant
@@ -1160,6 +1168,10 @@ struct Device {
         return cudaGetLastError();
     }
 
+// OC45: on the platform build, enable print_attrs() from t4441 (gpu31.cuh):
+//   cudaFuncAttributes a; cudaFuncGetAttributes(&a, tc::fused_high);
+//   a.numRegs / a.localSizeBytes / occupancy at __launch_bounds__(256,3).
+// It is omitted here because the CPU nvsyntax shim has no cudaFuncAttributes.
     // Read and print the stage times. Call after the stream has synchronised.
     void report_profile() const {
         if (!profiling_) return;
@@ -1262,7 +1274,7 @@ struct Device {
                 // [pair][x>>5][K][32] into prc; crt_tc2 does stages 4..0.
                 tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                                  2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
-                    pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, 1u, d_pk_inv, 1u);
+                    pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, 1u, d_pk_inv, 1u OC45_LAUNCH);
                 if ((st = cudaGetLastError()) != cudaSuccess) return st;
                 if (prof) { cudaEventRecord(ev_[4], stream); cudaEventRecord(ev_[5], stream);
                             cudaEventRecord(ev_[6], stream); }
@@ -1313,7 +1325,7 @@ struct Device {
 #endif
             tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                              2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
-                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, ef256 ? 1u : 0u);
+                pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, ef256 ? 1u : 0u OC45_LAUNCH0);
             if ((st = cudaGetLastError()) != cudaSuccess) return st;
             if (prof) cudaEventRecord(ev_[4], stream);
             if (tc_invcrt) {
@@ -1612,6 +1624,43 @@ private:
         upload_u32(d_pk_inv, pi);
         upload_u32(d_twf, tf);
         upload_u32(d_twi, ti);
+#if OC45_FHTW
+        {
+            // OC45: precompute glued twiddles in r8f lane order:
+            //   G[d][k][bx][s*512+bidx][L] = mont(A_s[low], B_s[bidx])
+            // with low = r8f_low(bx,L), bidx = (1<<s)-1+within (0..2^s-1).
+            // = psi^(2^(logN-10-s)*(1+2*(within*512+low))).  Built from the
+            // same twist exponents; no Montgomery multiply at kernel time.
+            const std::size_t FPS = 127 * 32;       // sum_s 2^s bidx rows x 32 lanes
+            std::vector<u32> gf(std::size_t(K) * 16 * FPS, 0u);
+            std::vector<u32> gi(gf.size(), 0u);
+            for (unsigned kk = 0; kk < K; ++kk) {
+                const u32* tw = plan_.twist.data() + std::size_t(kk) * N;
+                const u32 pp = plan_.primes[kk].p;
+                auto fpsi = [&](std::size_t e) { return tw[e]; };
+                auto ipsi = [&](std::size_t e) { return e == 0 ? tw[0] : u32(pp - tw[N - e]); };
+                for (unsigned bx = 0; bx < 16; ++bx) {
+                    for (unsigned s = 0; s < 7; ++s) {
+                        const unsigned d = logN_ - 10 - s;
+                        for (unsigned within = 0; within < (1u << s); ++within) {
+                            const unsigned bidx = (1u << s) - 1 + within;
+                            for (unsigned L = 0; L < 32; ++L) {
+                                const unsigned low = ((L >> 2) << 6) | (((L >> 1) & 1) << 5)
+                                                   | (bx << 1) | (L & 1);
+                                const std::size_t j = 1 + 2 * (std::size_t(within) * 512 + low);
+                                const std::size_t off = (std::size_t(kk) * 16 + bx) * FPS
+                                                      + ((1u << s) - 1u) + bidx;
+                                gf[off * 32 + L] = fpsi((std::size_t(1) << d) * j);
+                                gi[off * 32 + L] = ipsi((std::size_t(1) << d) * j);
+                            }
+                        }
+                    }
+                }
+            }
+            upload_u32(d_ftw, gf);
+            upload_u32(d_fti, gi);
+        }
+#endif
         tc_ntt_ready = d_pk_fwd && d_pk_inv && d_twf && d_twi && d_untw_slot;
     }
     static void upload_words(uint2*& dst, const std::vector<u32>& src) {

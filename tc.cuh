@@ -191,6 +191,25 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef R8F_XCHG
 #define R8F_XCHG 1
 #endif
+// OC45 (agent A): precomputed glued high twiddles for fused_high.  Every glue
+// mont(waf[s], tfB[(1<<s)-1+within]) equals the merged-psi value at exponent
+// 2^(logN-10-s)*(1+2*(within*512+low)), so it can be read from a host-built
+// table [k][bx][s][within][lane] (r8f layout, coalesced).  Removes all 58
+// glue monts and the 56 B of local memory (waf[7]+wai[7] indexed by runtime s).
+// Flag 0 restores 6b149ce exactly.
+#ifndef OC45_FHTW
+#define OC45_FHTW 1
+#endif
+#ifndef OC45_FTS
+#define OC45_FTS (127 * 32)   // per (k,bx): sum_s 2^s = 127 bidx rows x 32 lanes
+#endif
+#if OC45_FHTW
+#define OC45_PARAMS , const u32* __restrict__ ftw = nullptr, const u32* __restrict__ fti = nullptr
+#define OC45_ARGS , ftw, fti
+#else
+#define OC45_PARAMS
+#define OC45_ARGS
+#endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
 #endif
@@ -1468,6 +1487,15 @@ __device__ __forceinline__ u32 r8_ld_cluster(const u32* local, unsigned rank) {
     asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(ra) : "memory");
     return v;
 }
+// OC45: glued twiddle lookup.  At flag 0 both macros expand to the EXACT
+// original mont expressions, so flag 0 stays byte-identical to 6b149ce.
+#if OC45_FHTW
+#define OC45_GF(k, s, bidx, low, bx, lane, r8f, pr)     ((r8f) ? ftw[((u64(k) * 16 + (bx)) * OC45_FTS) + ((((1u << (s)) - 1u) + (bidx)) * 32 + (lane))]            : gpu31::mont(twf[u64(k) * TWS + (s) * NT_TILE + (low)], tfB[(bidx)], p))
+#define OC45_GI(k, s, bidx, low, bx, lane, r8f, pr)     ((r8f) ? fti[((u64(k) * 16 + (bx)) * OC45_FTS) + ((((1u << (s)) - 1u) + (bidx)) * 32 + (lane))]            : gpu31::mont(twi[u64(k) * TWS + (s) * NT_TILE + (low)], tiB[(bidx)], p))
+#else
+#define OC45_GF(k, s, bidx, low, bx, lane, r8f, pr) gpu31::mont(waf[s], tfB[bidx], p)
+#define OC45_GI(k, s, bidx, low, bx, lane, r8f, pr) gpu31::mont(wai[s], tiB[bidx], p)
+#endif
 __device__ __forceinline__ void
 fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
@@ -1475,7 +1503,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
            const u32* __restrict__ pkf, unsigned ef256,
            unsigned bx, unsigned by, unsigned bz, u64 rcoff,
            const u32* __restrict__ pki = nullptr, u32* __restrict__ r8out = nullptr,
-           unsigned r8f = 0) {
+           unsigned r8f = 0 OC45_PARAMS) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
@@ -1504,12 +1532,18 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
     constexpr unsigned TWS = 7 * NT_TILE + 127;
     const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
     const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
+#if !OC45_FHTW
     u32 waf[7], wai[7];
 #pragma unroll
     for (unsigned q = 0; q < 7; ++q) {
         waf[q] = q < logH ? twf[u64(k) * TWS + q * NT_TILE + low] : 0u;
         wai[q] = q < logH ? twi[u64(k) * TWS + q * NT_TILE + low] : 0u;
     }
+#endif
+    // OC45: precomputed glued twiddles.  GLUE_F(s,bidx) returns
+    // mont(waf[s], tfB[bidx]); GLUE_I(s,bidx) returns mont(wai[s], tiB[bidx]).
+    // bidx = (1<<s)-1+within (the index into tfB/tiB).  Value at
+    // exponent 2^(logN-10-s)*(1+2*(within*512+low)).
 
     TCP_T(f0);
 #if OC10_R16 && OC12_IO
@@ -1541,14 +1575,14 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             unsigned ix[16];
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t1 = OC45_GF(k, s, (H - 1) + w, low, bx, lane, r8f, p);
             u32 t2[2], t4[4], t8[8];
 #pragma unroll
-            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 2; ++k) t2[k] = OC45_GF(k, s+1, (2 * H - 1) + w + k * H, low, bx, lane, r8f, p);
 #pragma unroll
-            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 4; ++k) t4[k] = OC45_GF(k, s+2, (4 * H - 1) + w + k * H, low, bx, lane, r8f, p);
 #pragma unroll
-            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 8; ++k) t8[k] = OC45_GF(k, s+3, (8 * H - 1) + w + k * H, low, bx, lane, r8f, p);
             u32 av[16], bv[16];
 #if OC10_R16 && OC12_IO
             if (q == 0) {
@@ -1642,13 +1676,13 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             unsigned ix[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2a = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + H], p);
+            const u32 t1 = OC45_GF(k, s, (H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2a = OC45_GF(k, s+1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2b = OC45_GF(k, s+1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + i * H], p);
+                t4[i] = OC45_GF(k, s+2, (4 * H - 1) + w + i * H, low, bx, lane, r8f, p);
             u32 av[8], bv[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
@@ -1681,10 +1715,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 u32 q4[4];
 #pragma unroll
                 for (unsigned i = 0; i < 4; ++i)
-                    q4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
-                const u32 q2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
-                const u32 q2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
-                const u32 q1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                    q4[i] = OC45_GI(k, s+2, (4 * H - 1) + w + i * H, low, bx, lane, r8f, p);
+                const u32 q2a = OC45_GI(k, s+1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+                const u32 q2b = OC45_GI(k, s+1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
+                const u32 q1 = OC45_GI(k, s, (H - 1) + w, low, bx, lane, r8f, p);
 #pragma unroll
                 for (unsigned i = 0; i < 4; ++i) {
                     const u32 u = av[i], v = av[i+4];
@@ -1723,7 +1757,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
+            const u32 w = OC45_GF(k, s, (H - 1) + within, low, bx, lane, r8f, p);
             gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
             gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
@@ -1743,13 +1777,13 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             unsigned ix[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2a = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
+            const u32 t1 = OC45_GF(k, s, (H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2a = OC45_GF(k, s + 1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2b = OC45_GF(k, s + 1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(waf[s + 2], tfB[(4 * H - 1) + w + i * H], p);
+                t4[i] = OC45_GF(k, s + 2, (4 * H - 1) + w + i * H, low, bx, lane, r8f, p);
             u32 av[8], bv[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
@@ -1783,7 +1817,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
+            const u32 w = OC45_GF(k, s, (H - 1) + within, low, bx, lane, r8f, p);
             gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
             gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
@@ -1802,9 +1836,9 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             const unsigned r0 = (g - w) * 4 + w;
             const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
                            i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
-            const u32 t3 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
+            const u32 t1 = OC45_GF(k, s, (H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2 = OC45_GF(k, s + 1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t3 = OC45_GF(k, s + 1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
             u32 a0 = sa[i0], a1 = sa[i1], a2 = sa[i2], a3 = sa[i3];
             u32 b0 = sb[i0], b1 = sb[i1], b2 = sb[i2], b3 = sb[i3];
             gpu31::butterfly(a0, a1, t1, p); gpu31::butterfly(a2, a3, t1, p);
@@ -1821,8 +1855,12 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
+            #if OC45_FHTW
+            const u32 w = OC45_GF(k, s, (H - 1) + within, low, bx, lane, r8f, p);
+            #else
             const u32 wa = (s == 6 ? waf[6] : (s == 4 ? waf[4] : (s == 2 ? waf[2] : waf[0])));
             const u32 w = gpu31::mont(wa, tfB[(H - 1) + within], p);
+            #endif
             gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
             gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
@@ -1836,7 +1874,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
+            const u32 w = OC45_GF(k, s, (H - 1) + within, low, bx, lane, r8f, p);
             gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
             gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
@@ -1863,7 +1901,11 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
+#if OC45_FHTW
+            const u32 w = OC45_GI(k, s, (H - 1) + within, low, bx, lane, r8f, p);
+#else
             const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+#endif
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
             sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
@@ -1886,10 +1928,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
-            const u32 t2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                t4[i] = OC45_GI(k, s+2, (4 * H - 1) + w + i * H, low, bx, lane, r8f, p);
+            const u32 t2a = OC45_GI(k, s+1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2b = OC45_GI(k, s+1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
+            const u32 t1 = OC45_GI(k, s, (H - 1) + w, low, bx, lane, r8f, p);
             u32 av[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) av[i] = sa[ix[i]];
@@ -1930,12 +1972,12 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
             u32 t2[2], t4[4], t8[8];
 #pragma unroll
-            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 2; ++k) t2[k] = OC45_GI(k, s+1, (2 * H - 1) + w + k * H, low, bx, lane, r8f, p);
 #pragma unroll
-            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 4; ++k) t4[k] = OC45_GI(k, s+2, (4 * H - 1) + w + k * H, low, bx, lane, r8f, p);
 #pragma unroll
-            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(wai[s+3], tiB[(8 * H - 1) + w + k * H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            for (unsigned k = 0; k < 8; ++k) t8[k] = OC45_GI(k, s+3, (8 * H - 1) + w + k * H, low, bx, lane, r8f, p);
+            const u32 t1 = OC45_GI(k, s, (H - 1) + w, low, bx, lane, r8f, p);
             u32 av[16];
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) av[i] = sa[ix[i]];
@@ -2049,7 +2091,11 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
+#if OC45_FHTW
+            const u32 w = OC45_GI(k, s, (H - 1) + within, low, bx, lane, r8f, p);
+#else
             const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+#endif
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
             sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
@@ -2069,10 +2115,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(wai[s + 2], tiB[(4 * H - 1) + w + i * H], p);
-            const u32 t2a = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                t4[i] = OC45_GI(k, s + 2, (4 * H - 1) + w + i * H, low, bx, lane, r8f, p);
+            const u32 t2a = OC45_GI(k, s + 1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t2b = OC45_GI(k, s + 1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
+            const u32 t1 = OC45_GI(k, s, (H - 1) + w, low, bx, lane, r8f, p);
             u32 av[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) av[i] = sa[ix[i]];
@@ -2125,9 +2171,9 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             const unsigned r0 = (g - w) * 4 + w;
             const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
                            i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
-            const u32 t2 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
-            const u32 t3 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            const u32 t2 = OC45_GI(k, s + 1, (2 * H - 1) + w, low, bx, lane, r8f, p);
+            const u32 t3 = OC45_GI(k, s + 1, (2 * H - 1) + w + H, low, bx, lane, r8f, p);
+            const u32 t1 = OC45_GI(k, s, (H - 1) + w, low, bx, lane, r8f, p);
             u32 x0 = sa[i0], x1 = sa[i1], x2 = sa[i2], x3 = sa[i3];
             u32 u = x0, v = x2;
             x0 = gpu31::add(u, v, p.p); x2 = gpu31::mont(gpu31::sub(u, v, p.p), t2, p);
@@ -2149,7 +2195,11 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
+#if OC45_FHTW
+            const u32 w = OC45_GI(k, s, (H - 1) + within, low, bx, lane, r8f, p);
+#else
             const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+#endif
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
             sa[first * S + lane] = gpu31::add(u, v, p.p);
             sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
@@ -2231,10 +2281,10 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
            const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0,
-           const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
+           const u32* __restrict__ pki = nullptr, unsigned r8f = 0 OC45_PARAMS) {
     fused_high_dev(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
                    blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
-                   pki, nullptr, r8f);
+                   pki, nullptr, r8f OC45_ARGS);
 }
 
 // R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
