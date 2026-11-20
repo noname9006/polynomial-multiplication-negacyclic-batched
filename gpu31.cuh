@@ -16,6 +16,11 @@
 // are shared by all pairs and have no pair stride.
 #pragma once
 
+// OC53/P5 probe: default defined BEFORE the first #if (OC47 lesson).
+#ifndef P5_PROBE
+#define P5_PROBE 1
+#endif
+
 #include <cstdint>
 #include <vector>
 #include <stdexcept>
@@ -1718,6 +1723,39 @@ private:
         d_rb = nullptr;
         d_rc = nullptr;
     }
+
+#if P5_PROBE
+    // OC53/P5: phase-mask probe of fused_high ONLY.  Launches tc::fh_probe<PM>
+    // directly (no other kernels), B=128, one warm-up + 3 timed runs per mask.
+    // Input residues are whatever is in d_ra/d_rb (values irrelevant: timing).
+    void p5_probe() {
+        if (!tc_ntt_ready || !d_ra || !d_rb || !d_rc) return;
+        if (capacity_ < 128) return;
+        const unsigned n = plan_.N, k = plan_.K, logH_ = plan_.logN - 9;
+        const unsigned B = 128, gridx = tc::NT_TILE / tc::NT_COLS;
+        const std::size_t sh = 2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+        const unsigned masks[10] = {0u,1u,2u,4u,8u,16u,32u,3u,31u,63u};
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        if (cudaEventCreate(&e0) != cudaSuccess) return;
+        if (cudaEventCreate(&e1) != cudaSuccess) { cudaEventDestroy(e0); return; }
+        float ms[10] = {};
+#define P5_RUN(PM, IDX) do {             st_ = launch_fh<PM>(n, k, logH_, B, gridx, sh);             if (st_ != cudaSuccess) break;             cudaDeviceSynchronize();             for (int rep = 0; rep < 3; ++rep) {                 cudaEventRecord(e0, 0);                 st_ = launch_fh<PM>(n, k, logH_, B, gridx, sh);                 cudaEventRecord(e1, 0);                 if (st_ != cudaSuccess || cudaEventSynchronize(e1) != cudaSuccess) break;                 float t = 0.f; cudaEventElapsedTime(&t, e0, e1); ms[IDX] += t / 3.f;             }         } while (0)
+        cudaError_t st_ = cudaSuccess;
+        P5_RUN(0,0); P5_RUN(1,1); P5_RUN(2,2); P5_RUN(4,3); P5_RUN(8,4);
+        P5_RUN(16,5); P5_RUN(32,6); P5_RUN(3,7); P5_RUN(31,8); P5_RUN(63,9);
+#undef P5_RUN
+        std::printf("[P5] fh B=128 ms: m0=%.3f m1=%.3f m2=%.3f m4=%.3f m8=%.3f m16=%.3f m32=%.3f m3=%.3f m31=%.3f m63=%.3f\n",
+                    ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],ms[7],ms[8],ms[9]);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+    }
+    template <unsigned PM>
+    cudaError_t launch_fh(unsigned n, unsigned k_, unsigned logH_, unsigned B, unsigned gridx, std::size_t sh) {
+        tc::fh_probe<PM><<<dim3(gridx, k_, B), dim3(tc::NT_COLS, 8), sh, 0>>>(
+            d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k_, logH_,
+            d_pk_fwd, 1u, d_pk_inv, 1u);
+        return cudaGetLastError();
+    }
+#endif
 
     template <bool Two>
     cudaError_t transform(u32* a, u32* b, const u32* roots,
