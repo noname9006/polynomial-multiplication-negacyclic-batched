@@ -1164,6 +1164,27 @@ struct Device {
         return cudaGetLastError();
     }
 
+    // P1a: registers / local (spill+stack) bytes / CTAs per SM of the hot kernels.
+    void print_attrs() const {
+        auto attr = [&](const void* f, const char* nm, int threads, std::size_t dyn) {
+            cudaFuncAttributes a{};
+            int occ = -1;
+            if (cudaFuncGetAttributes(&a, f) != cudaSuccess) { cudaGetLastError(); return; }
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, f, threads, dyn) != cudaSuccess) cudaGetLastError();
+            std::fprintf(stderr, "[P1] attr %s regs=%d local=%zu sstat=%zu dyn=%zu occ=%d\n", nm, a.numRegs,
+                         std::size_t(a.localSizeBytes), std::size_t(a.sharedSizeBytes), dyn, occ);
+        };
+        const unsigned n = plan_.N;
+        const std::size_t fh_dyn = 2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+        attr((const void*)tc::fused_high, "fused_high", 256, fh_dyn);
+        attr((const void*)tc::encode_fwdlow256, "encode_fwdlow256", 256, 0);
+        attr((const void*)tc::crt_tc2, "crt_tc2", 128, 0);
+#if OC41_R64
+        attr((const void*)tc::crt_tc2_r64f, "crt_tc2_r64f", 128, crt2_r64f_shared);
+        std::fprintf(stderr, "[P1] crt2_r64f=%d\n", int(crt2_r64f));
+#endif
+    }
+
     // Read and print the stage times. Call after the stream has synchronised.
     void report_profile() const {
         if (!profiling_) return;
