@@ -1324,6 +1324,103 @@ struct Device {
 #endif
     }
 
+
+#ifndef P2_PROBE
+#define P2_PROBE 1
+#endif
+    // P2 (2026-11-20): chunked L2 pipeline on the master kernels.  Setup only.
+    //  [P2] hot C : per-pair stage time when the same C-pair residue slot is
+    //               reused back to back (inputs + residues L2-resident if they fit)
+    //  [P2] bat   : batched B=NP per pair (working set >> L2, i.e. DRAM)
+    //  [P2] e2e   : whole pipeline over NP pairs in chunks of C, S streams,
+    //               chunk i -> stream i%S, residue slot i%S; per pair and x128
+    void p2_probe() {
+#if P2_PROBE
+        if (!cs_[0] || !cs_[1] || !tc_r8f) return;
+        const unsigned n = plan_.N, l = plan_.L, k = plan_.K;
+        const unsigned NP = capacity_ < 32 ? capacity_ : 32;
+        if (NP < 8) return;
+        const std::size_t ins = std::size_t(n) * l, res = std::size_t(k) * n;
+        u32 *a = nullptr, *b = nullptr, *c = nullptr;
+        if (cudaMalloc(&a, NP * ins * 4) != cudaSuccess || cudaMalloc(&b, NP * ins * 4) != cudaSuccess ||
+            cudaMalloc(&c, NP * ins * 4) != cudaSuccess) {
+            cudaGetLastError();
+            if (a) cudaFree(a); if (b) cudaFree(b); if (c) cudaFree(c);
+            std::fprintf(stderr, "[P2] alloc failed\n");
+            return;
+        }
+        cudaStream_t s2 = nullptr;
+        cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+        cudaStream_t ss[3] = {cs_[0], cs_[1], s2};
+        cudaMemsetAsync(a, 0x37, NP * ins * 4, ss[0]);
+        cudaMemsetAsync(b, 0x29, NP * ins * 4, ss[0]);
+        cudaStreamSynchronize(ss[0]);
+        cudaEvent_t e0, e1, ej[3];
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        for (auto& e : ej) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+        // pair j (inputs), C pairs, residue slot offset (in pairs), stream, part
+        auto P = [&](unsigned j, unsigned C, unsigned slot, cudaStream_t st, int part) {
+            return tc_pipeline(a + j * ins, b + j * ins, c + j * ins, d_ra + slot * res, d_rb + slot * res,
+                               d_rc + slot * res, C, st, false, part);
+        };
+        // time fn() on S streams forked from / joined to ss[0]; best of 3 after 1 warm-up
+        auto tm = [&](unsigned S, auto fn) {
+            float best = 1e9f;
+            for (int rep = 0; rep < 4; ++rep) {
+                cudaEventRecord(e0, ss[0]);
+                for (unsigned s = 1; s < S; ++s) cudaStreamWaitEvent(ss[s], e0, 0);
+                fn();
+                for (unsigned s = 1; s < S; ++s) { cudaEventRecord(ej[s], ss[s]); cudaStreamWaitEvent(ss[0], ej[s], 0); }
+                cudaEventRecord(e1, ss[0]);
+                cudaEventSynchronize(e1);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (rep > 0 && t < best) best = t;
+            }
+            return best;
+        };
+        const unsigned R = 8;
+        float hot[3][3];
+        const unsigned Cs[3] = {1, 2, 4};
+        for (unsigned ci = 0; ci < 3; ++ci) {
+            const unsigned C = Cs[ci];
+            const int parts[3] = {1, 3, 4};
+            for (unsigned pi = 0; pi < 3; ++pi)
+                hot[ci][pi] = tm(1, [&] { for (unsigned r = 0; r < R; ++r) P(0, C, 0, ss[0], parts[pi]); }) / float(R * C);
+        }
+        float bat[3];
+        {
+            const int parts[3] = {1, 3, 4};
+            for (unsigned pi = 0; pi < 3; ++pi)
+                bat[pi] = tm(1, [&] { P(0, NP, 0, ss[0], parts[pi]); }) / float(NP);
+        }
+        const float b0 = tm(1, [&] { P(0, NP, 0, ss[0], 0); }) / float(NP);
+        float e2e[2][3];
+        for (unsigned ci = 0; ci < 2; ++ci) {
+            const unsigned C = Cs[ci];
+            for (unsigned S = 1; S <= 3; ++S)
+                e2e[ci][S - 1] = tm(S, [&] {
+                    for (unsigned i = 0; i * C < NP; ++i) P(i * C, C, (i % S) * C, ss[i % S], 0);
+                }) / float(NP);
+        }
+        const cudaError_t err = cudaGetLastError();
+        std::fprintf(stderr, "[P2] NP=%u hot/pair (enc fh crt sum):", NP);
+        for (unsigned ci = 0; ci < 3; ++ci)
+            std::fprintf(stderr, " | C=%u %.4f %.4f %.4f = %.4f", Cs[ci], hot[ci][0], hot[ci][1], hot[ci][2],
+                         hot[ci][0] + hot[ci][1] + hot[ci][2]);
+        std::fprintf(stderr, " | bat %.4f %.4f %.4f = %.4f | whole bat %.4f (x128 %.2f)\n", bat[0], bat[1], bat[2],
+                     bat[0] + bat[1] + bat[2], b0, 128.f * b0);
+        std::fprintf(stderr, "[P2] e2e/pair x128:");
+        for (unsigned ci = 0; ci < 2; ++ci)
+            for (unsigned S = 1; S <= 3; ++S)
+                std::fprintf(stderr, " C=%u S=%u %.2f |", Cs[ci], S, 128.f * e2e[ci][S - 1]);
+        std::fprintf(stderr, " err=%d\n", int(err));
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        for (auto& e : ej) cudaEventDestroy(e);
+        cudaStreamDestroy(s2);
+        cudaFree(a); cudaFree(b); cudaFree(c);
+#endif
+    }
+
     // Read and print the stage times. Call after the stream has synchronised.
     void report_profile() const {
         if (!profiling_) return;

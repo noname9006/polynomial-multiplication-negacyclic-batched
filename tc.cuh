@@ -3385,7 +3385,7 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
 #endif
 
 #ifndef P1_PROBE
-#define P1_PROBE 1
+#define P1_PROBE 0
 #endif
 #if P1_PROBE
 // P1 (2026-11-20): ALU floor of fused_high.  Same grid (16,K,B), block (32,8)
