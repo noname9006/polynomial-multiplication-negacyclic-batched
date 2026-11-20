@@ -56,8 +56,11 @@ inline u32 pack_bytes(const unsigned char b[4]) {
 }
 
 // primes: K values. Returns frag of NT*KS*32*2 words.
+// scale (optional, K values): bake weights 2^32*256^j*scale[k] mod p, so the
+// encoded residue comes out multiplied by scale[k] (R8F: CRT weight in b).
 inline std::vector<u32> bake_encode(const std::vector<u32>& primes, unsigned L,
-                                    unsigned& KS, unsigned& NT) {
+                                    unsigned& KS, unsigned& NT,
+                                    const std::vector<u32>* scale = nullptr) {
     const unsigned K = unsigned(primes.size());
     KS = (L + 7) / 8;
     NT = (K * 4 + 7) / 8;
@@ -66,6 +69,7 @@ inline std::vector<u32> bake_encode(const std::vector<u32>& primes, unsigned L,
     for (unsigned k = 0; k < K; ++k) {
         const u64 p = primes[k];
         u64 f = (u64(1) << 32) % p;              // 2^32 mod p
+        if (scale) f = f * ((*scale)[k] % p) % p;
         for (unsigned j = 0; j < JB; ++j) {
             w[std::size_t(k) * JB + j] = u32(f);
             f = (f << 8) % p;
@@ -991,9 +995,16 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                     v[i + half] = gpu31::mont(gpu31::sub(u, x, pj.p), tw[(half - 1) + (i & (half - 1))], pj);
                 }
             }
-            const u32 cw = c_crt_slotc[j];
+            if (r8f >= 2) {
+                // R8F v3: b was encoded with the CRT weight folded in, so the
+                // inverse output already is the term.
 #pragma unroll
-            for (unsigned r = 0; r < 32; ++r) sA[r * cfg.SA + j] = gpu31::mont(v[r], cw, pj);
+                for (unsigned r = 0; r < 32; ++r) sA[r * cfg.SA + j] = v[r];
+            } else {
+                const u32 cw = c_crt_slotc[j];
+#pragma unroll
+                for (unsigned r = 0; r < 32; ++r) sA[r * cfg.SA + j] = gpu31::mont(v[r], cw, pj);
+            }
         }
         __syncthreads();
 #pragma unroll 4
@@ -2723,8 +2734,11 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
                  const gpu31::Weight* __restrict__ weights,
                  const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
-                 unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0) {
+                 unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0,
+                 const uint2* __restrict__ frag_b = nullptr) {
     __shared__ u32 sT[EF_PR][E2_PT];
+    // R8F: operand b uses the CRT-weight-scaled table (term = residue in CRT)
+    if (blockIdx.y && frag_b) frag = frag_b;
 #if TC30_CPA
     __shared__ __align__(16) u32 sRb[2][EF_PR][E2_ROWS];
     __shared__ __align__(16) uint2 sBb[2][EF_NTB * ENC_KS_MAX * 32];

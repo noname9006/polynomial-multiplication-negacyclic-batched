@@ -802,6 +802,7 @@ struct Device {
     // Tensor-core encode / CRT (tc.cuh).  Built in the constructor when the
     // point fits; enabled by the caller only after a self-check passes.
     uint2 *d_fenc = nullptr, *d_fcrt = nullptr;
+    uint2 *d_fenc_b = nullptr;   // R8F v3: b-encode table with the CRT weight folded in
     u32* d_untw_inv = nullptr;   // mont-form untwist * (P/p)^-1, for fused decode
     u32* d_corr_m = nullptr;     // floor(2^62 / p_k), fixed-point CRT correction
     bool tc_fuse_decode = false;
@@ -1230,7 +1231,8 @@ struct Device {
             if (tc_efl && ef256) {
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
-                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u);
+                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,
+                    r8f ? d_fenc_b : nullptr);
                 if ((st = cudaGetLastError()) != cudaSuccess) return st;
                 if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
                                   cudaEventRecord(ev_[3], stream); }
@@ -1357,7 +1359,7 @@ struct Device {
                               crt2_shared, stream>>>(crt_args_, r8f ? prc : (OC31_TILE_RC ? pio : prc), pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
                                                      r8f ? n / 32 : (OC31_TILE_RC ? n / tc::NT_TILE : 0),
-                                                     d_pk_inv, r8f ? 1u : 0u);
+                                                     d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u);
             } else
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, prc, pc, d_fcrt, crt_cfg,
@@ -1506,6 +1508,20 @@ private:
                 if (K <= tc::CRT_KMAX_C &&
                     cudaMemcpyToSymbol(tc::c_crt_slotc, slotc.data(), K * sizeof(u32)) != cudaSuccess)
                     cudaGetLastError();
+                if (tc_enc_ready) {
+                    // R8F v3: term = mont(r, slotc) = r*slotc*R^-1 -> encode b
+                    // scaled by slotc*R^-1 mod p and CRT uses r as the term.
+                    std::vector<u32> ps2, sc(K);
+                    for (unsigned kk = 0; kk < K; ++kk) {
+                        const u32 pp = plan_.primes[kk].p;
+                        ps2.push_back(pp);
+                        const u64 rinv = host_powmod(u32((u64(1) << 32) % pp), pp - 2, pp);
+                        sc[kk] = u32(u64(slotc[kk]) * rinv % pp);
+                    }
+                    unsigned ks2 = 0, nt2 = 0;
+                    std::vector<u32> fb = tc::bake_encode(ps2, plan_.L, ks2, nt2, &sc);
+                    if (ks2 == enc_KS && nt2 == enc_NT) upload_words(d_fenc_b, fb);
+                }
 #endif
                 if (N >= 1024 && N % tc::NT_TILE == 0 && N / tc::NT_TILE <= 128 && N / tc::NT_TILE >= 2) {
                     upload_u32(d_untw_slot, ts);
@@ -1641,6 +1657,8 @@ private:
         if (d_ctr) cudaFree(d_ctr);
         d_ring = nullptr; d_ctr = nullptr;
         if (d_fenc) cudaFree(d_fenc);
+        if (d_fenc_b) cudaFree(d_fenc_b);
+        d_fenc_b = nullptr;
         if (d_fcrt) cudaFree(d_fcrt);
         if (d_untw_inv) cudaFree(d_untw_inv);
         for (int q = 0; q < 2; ++q) {
