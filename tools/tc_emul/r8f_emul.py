@@ -75,7 +75,7 @@ rb = np.full(N, -1, dtype=np.int64)
 for start in range(0, N, 256):
     row, hi = start >> 9, (start >> 8) & 1
     for r in range(256):
-        bxx, l4 = r >> 4, r & 15
+        bxx, l4 = (r >> 5) + ((r >> 4) & 1) * 8, r & 15
         pos = ((l4 >> 2) << 6) | (((l4 >> 1) & 1) << 5) | (bxx << 1) | (l4 & 1)
         ad = (bxx * (N >> 9) + row) * 32 + (hi << 4) + l4
         assert ra[ad] == -1

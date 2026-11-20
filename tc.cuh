@@ -3031,7 +3031,8 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned row = start >> 9, hi = (start >> 8) & 1;
             for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
                 const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
-                const unsigned bxx = r >> 4, l4 = r & 15;
+                // half-warps take bx and bx+8: their sT banks are disjoint (<=2-way)
+                const unsigned bxx = (r >> 5) + ((r >> 4) & 1) * 8, l4 = r & 15;
                 const unsigned pos = ((l4 >> 2) << 6) | (((l4 >> 1) & 1) << 5) | (bxx << 1) | (l4 & 1);
                 const unsigned kk = nt0 * 2 + q;
                 if (kk < K)
