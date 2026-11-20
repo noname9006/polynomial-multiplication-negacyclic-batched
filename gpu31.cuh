@@ -53,18 +53,39 @@ struct Prime {
     u32 p, neg_inv, r2, one;
 };
 
+// M1: modular add/sub/mont correction as IADD + IMNMX.U32 (2 ops) instead of
+// ISETP + IADD + SEL. Exact for a,b < p < 2^31. 0 = 6b149ce.
+#ifndef M1_MIN
+#define M1_MIN 1
+#endif
+GPU31_FHD inline u32 umin32(u32 x, u32 y) {
+    return x < y ? x : y;   // IMNMX.U32
+}
 GPU31_FHD inline u32 mont(u32 a, u32 b, const Prime& p) {
     const u64 t = u64(a) * b;
     const u32 m = u32(t) * p.neg_inv;              // neg_inv = -p^-1 mod 2^32
     const u32 u = u32((t + u64(m) * p.p) >> 32);
+#if M1_MIN
+    return umin32(u, u - p.p);
+#else
     return u >= p.p ? u - p.p : u;
+#endif
 }
 GPU31_FHD inline u32 add(u32 a, u32 b, u32 p) {
     const u32 s = a + b;
+#if M1_MIN
+    return umin32(s, s - p);   // s < 2p < 2^32: s-p wraps above s iff s < p
+#else
     return s >= p ? s - p : s;
+#endif
 }
 GPU31_FHD inline u32 sub(u32 a, u32 b, u32 p) {
+#if M1_MIN
+    const u32 d = a - b;       // a<b: d wraps to 2^32+a-b > d+p = a-b+p (mod 2^32)
+    return umin32(d, d + p);
+#else
     return a >= b ? a - b : a + p - b;
+#endif
 }
 GPU31_FHD inline u32 reverse_bits(u32 x, unsigned bits) {
     u32 r = 0;
