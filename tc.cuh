@@ -1498,8 +1498,8 @@ __device__ __forceinline__ u32 r8_ld_cluster(const u32* local, unsigned rank) {
 // OC45: glued twiddle lookup.  At flag 0 both macros expand to the EXACT
 // original mont expressions, so flag 0 stays byte-identical to 6b149ce.
 #if OC45_FHTW
-#define OC45_GF(k, s, bidx, low, bx, lane, r8f, pr)     ((r8f) ? ftw[((u64(k) * 16 + (bx)) * OC45_FTS) + ((((1u << (s)) - 1u) + (bidx)) * 32 + (lane))]            : gpu31::mont(twf[u64(k) * TWS + (s) * NT_TILE + (low)], tfB[(bidx)], p))
-#define OC45_GI(k, s, bidx, low, bx, lane, r8f, pr)     ((r8f) ? fti[((u64(k) * 16 + (bx)) * OC45_FTS) + ((((1u << (s)) - 1u) + (bidx)) * 32 + (lane))]            : gpu31::mont(twi[u64(k) * TWS + (s) * NT_TILE + (low)], tiB[(bidx)], p))
+#define OC45_GF(k, s, bidx, low, bx, lane, r8f, pr)     ((r8f) ? ftw[((u64(by) * 16 + (bx)) * OC45_FTS) + ((bidx) * 32 + (lane))]            : gpu31::mont(twf[u64(by) * TWS + (s) * NT_TILE + (low)], tfB[(bidx)], p))
+#define OC45_GI(k, s, bidx, low, bx, lane, r8f, pr)     ((r8f) ? fti[((u64(by) * 16 + (bx)) * OC45_FTS) + ((bidx) * 32 + (lane))]            : gpu31::mont(twi[u64(by) * TWS + (s) * NT_TILE + (low)], tiB[(bidx)], p))
 #else
 #define OC45_GF(k, s, bidx, low, bx, lane, r8f, pr) gpu31::mont(waf[s], tfB[bidx], p)
 #define OC45_GI(k, s, bidx, low, bx, lane, r8f, pr) gpu31::mont(wai[s], tiB[bidx], p)
