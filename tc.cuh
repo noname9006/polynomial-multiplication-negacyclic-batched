@@ -1574,7 +1574,25 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                     av[i] = ra[ad];
                     bv[i] = rb[ad];
                 }
-                if (ef256) {
+                if (ef256 && R8F_XCHG) {
+                    // R8F v6: stage 8 by register exchange (lane bit 4 <-> reg
+                    // bit 3), whole DIT butterflies, exchange back: 8 mont per
+                    // operand instead of 16.
+                    const bool up = (lane & 16) != 0;
+#pragma unroll
+                    for (unsigned r = 0; r < 8; ++r) {
+                        u32 sa_ = up ? av[r] : av[r + 8], sb_ = up ? bv[r] : bv[r + 8];
+                        sa_ = __shfl_xor_sync(0xffffffffu, sa_, 16);
+                        sb_ = __shfl_xor_sync(0xffffffffu, sb_, 16);
+                        if (up) { av[r] = sa_; bv[r] = sb_; } else { av[r + 8] = sa_; bv[r + 8] = sb_; }
+                        gpu31::butterfly(av[r], av[r + 8], w8, p);
+                        gpu31::butterfly(bv[r], bv[r + 8], w8, p);
+                        sa_ = up ? av[r] : av[r + 8]; sb_ = up ? bv[r] : bv[r + 8];
+                        sa_ = __shfl_xor_sync(0xffffffffu, sa_, 16);
+                        sb_ = __shfl_xor_sync(0xffffffffu, sb_, 16);
+                        if (up) { av[r] = sa_; bv[r] = sb_; } else { av[r + 8] = sa_; bv[r + 8] = sb_; }
+                    }
+                } else if (ef256) {
                     // low stage 8 (DIT): lane j gets u + w*v, lane j+256 gets u - w*v
                     const bool up = (lane & 16) != 0;
 #pragma unroll
