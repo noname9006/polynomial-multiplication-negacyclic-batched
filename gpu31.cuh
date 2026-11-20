@@ -131,9 +131,13 @@ GPU31_FHD inline u32 lazy_product(u32 limb, Weight w, u32 p) {
     return limb * w.value - quotient * p;
 }
 GPU31_FHD inline u32 canonical_word(u32 x, u32 p) {
+#if M1_MIN
+    x = umin32(x, x - p); x = umin32(x, x - p); x = umin32(x, x - p);
+#else
     if (x >= p) x -= p;
     if (x >= p) x -= p;
     if (x >= p) x -= p;
+#endif
     return x;
 }
 GPU31_FHD inline u32 finish(u64 sum, Weight radix, u32 p) {
