@@ -172,6 +172,17 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 #ifndef R8_CLUSTER
 #define R8_CLUSTER 0
 #endif
+// R8F (full R8, no cluster): inv_low disappears.  fused_high CTA bx takes the
+// 32 lows {64*(lane>>2) + 32*((lane>>1)&1) + 2*bx + (lane&1)}, closed under
+// low^256/128/64/32 = lane^16/8/4/2, so after the 7 inverse high stages it
+// also runs inverse low stages 8..5 by shfl and writes rc as [pair][x>>5][K][32]
+// (8 B runs, 4 CTAs complete a sector in L2).  crt_tc2 (32 rows = one 32-run)
+// runs inverse stages 4..0 by shfl across its 32 lanes (= rows), then the
+// n^-1*inv weight.  encode256 stores ra/rb fh-CTA-contiguous:
+// [k][bx][row][lane] so fused_high's loads are 128 B rows.
+#ifndef R8F_FULL
+#define R8F_FULL 1
+#endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
 #endif
@@ -914,7 +925,8 @@ __global__ void __launch_bounds__(128, 3)
 crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
-       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0) {
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0,
+       const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
     // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
     // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
     // Shared: one region, used as sA (u32, stride SA) -> sX (u64, stride SX)
@@ -935,11 +947,13 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     const u64 rbase = u64(pair) * K * n;
     // OC31: tile-major rc written by inv_low into the dead pra buffer.
     // CRT2_ROWS (32) divides NT_TILE (512), so a CTA never straddles tiles.
+    // R8F: [pair][x>>5][K][32] from fused_high (ntiles = n/32).
+    const unsigned tsh = r8f ? 5u : 9u;
     const u64 rbase2 = (OC31_TILE_RC && ntiles)
-        ? (u64(pair) * ntiles + (start >> 9)) * K : 0ull;
+        ? (u64(pair) * ntiles + (start >> tsh)) * K : 0ull;
     auto RC = [&](unsigned j, unsigned coeff) -> u32 {
         return (OC31_TILE_RC && ntiles)
-            ? residues[(rbase2 + j) * 512u + (coeff & 511u)]
+            ? residues[((rbase2 + j) << tsh) + (coeff & ((1u << tsh) - 1u))]
             : residues[rbase + u64(j) * n + coeff];
     };
     const unsigned W = cfg.KS * 8;
@@ -959,11 +973,29 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                 r[q] = (j < K && active) ? RC(j, i) : 0u;
                 u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
             }
+            if (r8f) {
+                // R8F: inverse low stages 4..0; lane c = row = x & 31, the
+                // limb j is warp-uniform (one 32-run per CTA).
+#pragma unroll
+                for (unsigned q = 0; q < 8; ++q) {
+                    const unsigned j = j0 + NG * q;
+                    const unsigned jj = j < K ? j : 0u;
+                    const gpu31::Prime pj = c_crt_prime[jj];
+                    const u32* tw = pki + u64(jj) * TC_LT;
+#pragma unroll
+                    for (int m = 4; m >= 0; --m) {
+                        const unsigned half = 1u << m;
+                        const u32 w = __ldg(tw + TWI(m, c & (half - 1)));
+                        const u32 x = __shfl_xor_sync(0xffffffffu, r[q], half);
+                        r[q] = (c & half) ? gpu31::mont(gpu31::sub(x, r[q], pj.p), w, pj) : gpu31::add(r[q], x, pj.p);
+                    }
+                }
+            }
 #pragma unroll
             for (unsigned q = 0; q < 8; ++q) {
                 const unsigned j = j0 + NG * q;
                 if (j < K) {
-                    const u32 term = (OC32_PREWEIGHT && TC22_MERGED && slot_logN)
+                    const u32 term = (OC32_PREWEIGHT && TC22_MERGED && slot_logN && !r8f)
                         ? r[q]
                         : gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
@@ -1407,7 +1439,8 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
            const u32* __restrict__ pkf, unsigned ef256,
            unsigned bx, unsigned by, unsigned bz, u64 rcoff,
-           const u32* __restrict__ pki = nullptr, u32* __restrict__ r8out = nullptr) {
+           const u32* __restrict__ pki = nullptr, u32* __restrict__ r8out = nullptr,
+           unsigned r8f = 0) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
     extern __shared__ u32 sm[];
@@ -1425,7 +1458,8 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
     u32* sa = sm;
     u32* sb = sm + HC * S;
     const unsigned lane = threadIdx.x, rw = threadIdx.y;
-    const unsigned low = ef256 ? (bx * 16 + (lane & 15) + ((lane & 16) << 4))
+    const unsigned low = r8f ? (((lane >> 2) << 6) | (((lane >> 1) & 1) << 5) | (bx << 1) | (lane & 1))
+                       : ef256 ? (bx * 16 + (lane & 15) + ((lane & 16) << 4))
                                : bx * NT_COLS + lane;
     // TC29: twiddle of low stage 8 for pair (j, j+256), j = low & 255
     const u32 w8 = ef256 ? pkf[u64(by) * TC_LT + TWI(8, low & 255)] : 0u;
@@ -1486,8 +1520,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i) {
                     const unsigned row = r0 + i * H;
-                    av[i] = ra[plane + u64(row) * NT_TILE + low];
-                    bv[i] = rb[plane + u64(row) * NT_TILE + low];
+                    const u64 ad = r8f ? plane + (u64(bx) * HC + row) * 32 + lane
+                                       : plane + u64(row) * NT_TILE + low;
+                    av[i] = ra[ad];
+                    bv[i] = rb[ad];
                 }
                 if (ef256) {
                     // low stage 8 (DIT): lane j gets u + w*v, lane j+256 gets u - w*v
@@ -1885,7 +1921,28 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
             }
 #if OC10_R16 && OC12_IO
-            if (q + 1 == n16 && !r8out) {
+            if (q + 1 == n16 && r8f) {
+                // R8F: inverse low stages 8..5 (low^256..^32 = lane^16..^2),
+                // then [pair][x>>5][K][32] with x&31 = 2*bx + (lane&1).
+                const u32* tw = pki + u64(k) * TC_LT;
+#pragma unroll
+                for (int m = 8; m >= 5; --m) {
+                    const unsigned half = 1u << m, lb = 1u << (m - 4);
+                    const u32 w = __ldg(tw + TWI(m, low & (half - 1)));
+                    const bool hi = (lane & lb) != 0;
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) {
+                        const u32 x = __shfl_xor_sync(0xffffffffu, av[i], lb);
+                        av[i] = hi ? gpu31::mont(gpu31::sub(x, av[i], p.p), w, p) : gpu31::add(av[i], x, p.p);
+                    }
+                }
+                const unsigned inner = (bx << 1) | (lane & 1);
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) {
+                    const unsigned xx = (r0 + i * H) * NT_TILE + low;
+                    rc[((u64(bz) * (n >> 5) + (xx >> 5)) * K + k) * 32 + inner] = av[i];
+                }
+            } else if (q + 1 == n16 && !r8out) {
                 // OC12: last inverse group writes the finished coefficients
                 // straight to global, skipping the shared write + store read.
 #pragma unroll
@@ -2090,9 +2147,11 @@ __global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
 fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
-           const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0) {
+           const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0,
+           const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
     fused_high_dev(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
-                   blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n);
+                   blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
+                   pki, nullptr, r8f);
 }
 
 // R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
@@ -2644,7 +2703,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
                  const gpu31::Weight* __restrict__ weights,
                  const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
-                 unsigned logN, unsigned KS, unsigned NT) {
+                 unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0) {
     __shared__ u32 sT[EF_PR][E2_PT];
 #if TC30_CPA
     __shared__ __align__(16) u32 sRb[2][EF_PR][E2_ROWS];
@@ -2945,6 +3004,21 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
         TCP_T(g4);
 #if !OC29_DITSHFL
+        if (r8f) {
+            // R8F: x = row*512 + low -> [k][bx][row][lane] (fh CTA-contiguous),
+            // bx = (low>>1)&15, lane = (low>>6)<<2 | ((low>>5)&1)<<1 | (low&1).
+            // idx = q | bx(4) | l4(4): 16 consecutive idx = one 64 B run.
+            const unsigned row = start >> 9, hi = (start >> 8) & 1;
+            for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
+                const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
+                const unsigned bxx = r >> 4, l4 = r & 15;
+                const unsigned pos = ((l4 >> 2) << 6) | (((l4 >> 1) & 1) << 5) | (bxx << 1) | (l4 & 1);
+                const unsigned kk = nt0 * 2 + q;
+                if (kk < K)
+                    dst[rbase + u64(kk) * n + (u64(bxx) * (n >> 9) + row) * 32 + (hi << 4) + l4] =
+                        sT[q][padw(pos)];
+            }
+        } else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, pos = idx % E2_ROWS;
             const unsigned kk = nt0 * 2 + q;

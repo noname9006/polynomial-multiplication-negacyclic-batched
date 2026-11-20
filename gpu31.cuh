@@ -835,6 +835,7 @@ struct Device {
         cudaGetLastError();
     }
     bool tc_r8 = false, r8_ready = false;   // R8: fused_high_r8 (cluster 16)
+    bool tc_r8f = false;                     // R8F: full R8 (inv_low in fh + CRT)
     bool tc_fhinv = false;            // TC36 persistent fused_high+inv_low
     u32* d_ring = nullptr;            // TC36 rc ring (TC36_R planes)
     unsigned* d_ctr = nullptr;        // TC36 ticket + per-plane counters
@@ -1218,11 +1219,18 @@ struct Device {
             // TC29: 256-row encode tiles + low stage 8 in fused_high (needs the
             // OC12 radix-16 load path in fused_high, i.e. logH >= 4)
             const bool ef256 = TC29_EF256 && TC22_MERGED && tc_efl && logH >= 4;
+#if OC27_ROWS64
+            const bool r8f_r64 = crt2_r64;
+#else
+            const bool r8f_r64 = false;
+#endif
+            const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC && tc_crt2 &&
+                             !r8f_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
             if (part != 2) {
             if (tc_efl && ef256) {
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
-                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT);
+                    d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u);
                 if ((st = cudaGetLastError()) != cudaSuccess) return st;
                 if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
                                   cudaEventRecord(ev_[3], stream); }
@@ -1247,6 +1255,17 @@ struct Device {
             }
             if (part == 1) return cudaGetLastError();
             bool fh_done = false;
+            if (r8f) {
+                // R8F: fused_high runs inverse low stages 8..5 and writes
+                // [pair][x>>5][K][32] into prc; crt_tc2 does stages 4..0.
+                tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
+                                 2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
+                    pra, prb, prc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, 1u, d_pk_inv, 1u);
+                if ((st = cudaGetLastError()) != cudaSuccess) return st;
+                if (prof) { cudaEventRecord(ev_[4], stream); cudaEventRecord(ev_[5], stream);
+                            cudaEventRecord(ev_[6], stream); }
+                fh_done = true;
+            }
 #if R8_CLUSTER
             if (tc_r8 && r8_ready && OC31_TILE_RC && ef256 && logH == 7 && !tc_invcrt) {
                 // R8: fused_high + inv_low in one kernel (cluster of 16 = one
@@ -1335,9 +1354,10 @@ struct Device {
                 } else
 #endif
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
-                              crt2_shared, stream>>>(crt_args_, OC31_TILE_RC ? pio : prc, pc, d_fcrt, c2,
+                              crt2_shared, stream>>>(crt_args_, r8f ? prc : (OC31_TILE_RC ? pio : prc), pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
-                                                     OC31_TILE_RC ? n / tc::NT_TILE : 0);
+                                                     r8f ? n / 32 : (OC31_TILE_RC ? n / tc::NT_TILE : 0),
+                                                     d_pk_inv, r8f ? 1u : 0u);
             } else
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, prc, pc, d_fcrt, crt_cfg,

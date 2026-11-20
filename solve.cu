@@ -739,6 +739,13 @@ void* fherma_init(const fherma::Point& p) {
                         std::fprintf(stderr, "[TC] r8=%d\n", int(d.tc_r8));
                     }
 #endif
+#if R8F_FULL
+                    if (d.tc_ntt && d.tc_efl && d.tc_crt2 && p.N == 65536) {
+                        d.tc_r8f = true;
+                        if (!gpu31_selfcheck(*state, d, p.B < 2 ? p.B : 2)) d.tc_r8f = false;
+                        std::fprintf(stderr, "[TC] r8f=%d\n", int(d.tc_r8f));
+                    }
+#endif
 #if TC36_FHINV
                     if (d.tc_ntt && d.tc_crt2 && d.fhinv_grid) {
                         d.tc_fhinv = true;
