@@ -764,7 +764,7 @@ void* fherma_init(const fherma::Point& p) {
                     }
                     std::fprintf(stderr, "[TC] selfcheck enc=%d crt=%d fuse_decode=%d ntt=%d efl=%d chunk=%d\n",
                                  int(d.tc_enc), int(d.tc_crt), int(d.tc_fuse_decode), int(d.tc_ntt),
-                                 int(d.tc_efl), int(d.tc_chunk));
+                                 int(d.tc_efl), int(d.tc_chunk)); d.print_attrs();
                 }
 
                 // Try the conflict-free CRT, keeping it only if bit-identical to

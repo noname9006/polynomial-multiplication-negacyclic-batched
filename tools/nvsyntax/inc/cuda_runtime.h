@@ -4,6 +4,7 @@ typedef int cudaError_t;
 const cudaError_t cudaSuccess = 0, cudaErrorInvalidValue = 1;
 enum cudaMemcpyKind { cudaMemcpyHostToHost, cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost, cudaMemcpyDeviceToDevice };
 enum cudaFuncAttribute { cudaFuncAttributeMaxDynamicSharedMemorySize, cudaFuncAttributePreferredSharedMemoryCarveout, cudaFuncAttributeNonPortableClusterSizeAllowed };
+struct cudaFuncAttributes { std::size_t sharedSizeBytes, constSizeBytes, localSizeBytes; int maxThreadsPerBlock, numRegs; };
 struct CUstream_st; typedef CUstream_st* cudaStream_t;
 struct CUevent_st; typedef CUevent_st* cudaEvent_t;
 struct cudaDeviceProp { int major, minor; std::size_t sharedMemPerBlock, sharedMemPerBlockOptin; int multiProcessorCount; char name[256]; int persistingL2CacheMaxSize, accessPolicyMaxWindowSize, l2CacheSize; };
@@ -14,7 +15,7 @@ CUDA_ANY(cudaSetDevice) CUDA_ANY(cudaGetDevice) CUDA_ANY(cudaGetDeviceProperties
 CUDA_ANY(cudaDeviceSynchronize) CUDA_ANY(cudaEventCreate) CUDA_ANY(cudaEventDestroy) CUDA_ANY(cudaEventRecord)
 CUDA_ANY(cudaEventElapsedTime) CUDA_ANY(cudaMemcpyToSymbol) CUDA_ANY(cudaFuncSetAttribute) CUDA_ANY(cudaMallocHost)
 CUDA_ANY(cudaFreeHost) CUDA_ANY(cudaHostRegister) CUDA_ANY(cudaStreamWaitEvent) CUDA_ANY(cudaEventSynchronize)
-CUDA_ANY(cudaDeviceSetLimit) CUDA_ANY(cudaStreamSetAttribute) CUDA_ANY(cudaDeviceGetAttribute) CUDA_ANY(cudaOccupancyMaxActiveBlocksPerMultiprocessor) CUDA_ANY(cudaEventCreateWithFlags)
+CUDA_ANY(cudaDeviceSetLimit) CUDA_ANY(cudaStreamSetAttribute) CUDA_ANY(cudaDeviceGetAttribute) CUDA_ANY(cudaOccupancyMaxActiveBlocksPerMultiprocessor) CUDA_ANY(cudaEventCreateWithFlags) CUDA_ANY(cudaFuncGetAttributes)
 enum cudaLimit { cudaLimitPersistingL2CacheSize = 6 };
 enum cudaAccessProperty { cudaAccessPropertyNormal = 0, cudaAccessPropertyStreaming = 1, cudaAccessPropertyPersisting = 2 };
 struct cudaAccessPolicyWindow { void* base_ptr; std::size_t num_bytes; float hitRatio; cudaAccessProperty hitProp, missProp; };
