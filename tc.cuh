@@ -863,15 +863,15 @@ __device__ __forceinline__ void oc41_carry_half(
 }
 #endif // OC41_R64
 
+#ifndef OC47_R64BAL
+#define OC47_R64BAL 1
+#endif
 #if OC47_R64BAL
 // OC47: balanced crt_tc2_r64f.  256 threads/CTA, staging 228 tasks in ONE
 // round (tid < 2*K), mma over 8 warps (one n-tile per warp, 4 m-tiles each),
 // and a TWO-threads-per-row carry: two 14-word limb halves computed in
 // parallel, stitched with __shfl_xor_sync (register exchange — NO shared
 // scratch, sA stays live across both GEMM halves).  Flag 0 = exact 9e1daea.
-#ifndef OC47_R64BAL
-#define OC47_R64BAL 1
-#endif
 constexpr unsigned CRT2_R64B_THREADS = 256;
 __host__ __device__ inline bool crt2_r64bal_ok(unsigned KS, unsigned NT,
                                                unsigned SA, unsigned l) {
