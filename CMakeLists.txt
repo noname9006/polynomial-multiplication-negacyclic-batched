@@ -35,11 +35,10 @@ target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 set_target_properties(solution PROPERTIES
   CUDA_ARCHITECTURES OFF
-  CUDA_SEPARABLE_COMPILATION ON)
+  CUDA_SEPARABLE_COMPILATION OFF)  # M2: whole-program device code (was ON + -dlto)
 target_compile_options(solution PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH};-dlto>)
-target_link_options(solution PRIVATE
-  $<DEVICE_LINK:-arch=${FHERMA_CUDA_ARCH};-dlto>)
+  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH}>)
+
 
 # NVIDIA cuPQC, when the challenge image provides it (CUPQC_SDK_DIR is set in
 # fherma/cupqc): its device BigInt library and headers. BigInt is linked because
