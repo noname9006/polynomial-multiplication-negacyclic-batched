@@ -985,8 +985,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
             for (unsigned e = 0; e < 8; ++e) {
                 const uint4 x = __ldcs(src + e);
                 v[4 * e] = x.x; v[4 * e + 1] = x.y; v[4 * e + 2] = x.z; v[4 * e + 3] = x.w;
-                // L2-only: keep L1 for the mma loop's B fragments
-                const uint4 y = __ldcg(twp + e);
+                const uint4 y = __ldg(twp + e);
                 tw[4 * e] = y.x; tw[4 * e + 1] = y.y; tw[4 * e + 2] = y.z; tw[4 * e + 3] = y.w;
             }
 #pragma unroll
@@ -1012,22 +1011,9 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
             }
         }
         __syncthreads();
-        // thread (c, jg) sums limbs [jg*JC, jg*JC+cnt), start rotated by c>>3:
-        // bank (4c + j) % 32 is then distinct across the warp (was 4-way).
-        {
-            constexpr unsigned JC = (CRT_KMAX_C + NG - 1) / NG;
-            const unsigned jc = (K + NG - 1) / NG;
-            const unsigned j0 = jg * jc;
-            const unsigned cnt = j0 < K ? ((K - j0) < jc ? (K - j0) : jc) : 0u;
-            unsigned it = cnt ? (c >> 3) % cnt : 0u;
 #pragma unroll 4
-            for (unsigned q = 0; q < cnt; ++q) {
-                const unsigned j = j0 + it;
-                fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> 30;
-                it = (it + 1 == cnt) ? 0u : it + 1;
-            }
-            (void)JC;
-        }
+        for (unsigned j = jg; j < K; j += NG)
+            fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> 30;
     } else if (untw_inv && K <= CRT_KMAX_C) {
         // TC11: batched loads (8 independent residue+untwist pairs in flight),
         // prime and correction constants from __constant__ (warp-uniform j).
