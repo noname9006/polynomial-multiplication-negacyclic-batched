@@ -198,7 +198,7 @@ inline unsigned crt_sa_stride(unsigned KS) {    // >= KS*8+4 words, == +-4 (mod 
 // radix-16 high stages expect is preserved.  Encode then runs stages 0..5.
 // Flag 0 restores the exact base path.  Twiddles come from pkf[TWI(m,low&2^m-1)].
 #ifndef OC42_FWD567
-#define OC42_FWD567 1
+#define OC42_FWD567 0
 #endif
 #ifndef TC36_FHINV
 #define TC36_FHINV 0
@@ -3383,6 +3383,158 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
     }
 }
 #endif
+
+#ifndef P1_PROBE
+#define P1_PROBE 1
+#endif
+#if P1_PROBE
+// P1 (2026-11-20): ALU floor of fused_high.  Same grid (16,K,B), block (32,8)
+// and launch bounds as fused_high, same per-thread counts: 216 butterflies
+// (fwd a,b: stage 8 + radix-16 + 2x radix-8; inv a: 2x radix-8 + radix-16 +
+// low 8..5), 16 pointwise mont, 58 composed twiddles (mont(waf, tfB)) and 5
+// direct twiddles.  No ra/rb loads (values seeded in registers), no shared,
+// no shfl, no barrier; output stored only if flag != 0 (runtime 0).
+//  V=0: gpu31::mont as in fh (2 IMAD.WIDE + IMAD)
+//  V=1: twiddle mont with precomputed wq = w*p^-1: m = a*wq, hi(a*w) - hi(m*p)
+//       (3 x 32-bit IMAD, no WIDE); same Montgomery domain as V=0
+//  V=2: as V=0 but twiddles loaded directly (no compose mont)
+struct P1Tw { u32 w, q; };
+__device__ __forceinline__ u32 p1_mul(u32 a, P1Tw t, const gpu31::Prime& p, int V) {
+    if (V == 1) {
+        const u32 m = a * t.q;
+        const u32 r = __umulhi(a, t.w) - __umulhi(m, p.p);
+        return int(r) < 0 ? r + p.p : r;
+    }
+    return gpu31::mont(a, t.w, p);
+}
+template <int V>
+__device__ __forceinline__ P1Tw p1_tw(const u32* tf, u32 wa, unsigned idx, const gpu31::Prime& p, u32 pinv) {
+    P1Tw t;
+    t.w = V == 2 ? __ldg(tf + (idx & 63)) : gpu31::mont(wa, __ldg(tf + (idx & 63)), p);
+    t.q = V == 1 ? t.w * pinv : 0u;
+    return t;
+}
+template <int V>
+__device__ __forceinline__ P1Tw p1_dir(const u32* tf, unsigned idx, u32 pinv) {
+    P1Tw t; t.w = __ldg(tf + (idx & 63)); t.q = V == 1 ? t.w * pinv : 0u; return t;
+}
+// DIT stage, stride H, on v[base..base+len): pair (i, i+H), twiddle t[i & (H-1)]
+template <int V, unsigned H, unsigned LEN>
+__device__ __forceinline__ void p1_dit(u32* v, unsigned base, const P1Tw* t, const gpu31::Prime& p) {
+#pragma unroll
+    for (unsigned i = 0; i < LEN; ++i) {
+        if (i & H) continue;
+        const u32 u = v[base + i], x = p1_mul(v[base + i + H], t[i & (H - 1)], p, V);
+        v[base + i] = gpu31::add(u, x, p.p);
+        v[base + i + H] = gpu31::sub(u, x, p.p);
+    }
+}
+template <int V, unsigned H, unsigned LEN>
+__device__ __forceinline__ void p1_gs(u32* v, unsigned base, const P1Tw* t, const gpu31::Prime& p) {
+#pragma unroll
+    for (unsigned i = 0; i < LEN; ++i) {
+        if (i & H) continue;
+        const u32 u = v[base + i], x = v[base + i + H];
+        v[base + i] = gpu31::add(u, x, p.p);
+        v[base + i + H] = p1_mul(gpu31::sub(u, x, p.p), t[i & (H - 1)], p, V);
+    }
+}
+template <int V>
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+p1_alu(u32* __restrict__ out, const gpu31::Prime* __restrict__ primes,
+       const u32* __restrict__ twf, unsigned n, unsigned K, unsigned flag) {
+    const unsigned lane = threadIdx.x, rw = threadIdx.y, bx = blockIdx.x, k = blockIdx.y, bz = blockIdx.z;
+    const unsigned low = ((lane >> 2) << 6) | (((lane >> 1) & 1) << 5) | (bx << 1) | (lane & 1);
+    const gpu31::Prime p = primes[k];
+    const u32 pinv = 0u - p.neg_inv;
+    constexpr unsigned TWS = 7 * NT_TILE + 127;
+    const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE + rw;
+    u32 waf[7], wai[7];
+#pragma unroll
+    for (unsigned q = 0; q < 7; ++q) {
+        waf[q] = twf[u64(k) * TWS + q * NT_TILE + low];
+        wai[q] = twf[u64(k) * TWS + q * NT_TILE + (low ^ 1)];
+    }
+    u32 av[16], bv[16];
+#pragma unroll
+    for (unsigned i = 0; i < 16; ++i) {
+        av[i] = ((lane + 37u * i + rw + bz) * 0x9E3779B1u) & 0x3fffffffu;
+        bv[i] = ((lane + 53u * i + bx + k) * 0x85EBCA77u) & 0x3fffffffu;
+    }
+    P1Tw t[8];
+    // fwd low stage 8 (one direct twiddle), stride 8
+    t[0] = p1_dir<V>(tfB, 1, pinv);
+    p1_dit<V, 8, 16>(av, 0, t, p); p1_dit<V, 8, 16>(bv, 0, t, p);
+    // fwd radix-16: strides 1,2,4,8 with 1,2,4,8 composed twiddles
+#pragma unroll
+    for (unsigned j = 0; j < 1; ++j) t[j] = p1_tw<V>(tfB, waf[0], 2 + j, p, pinv);
+    p1_dit<V, 1, 16>(av, 0, t, p); p1_dit<V, 1, 16>(bv, 0, t, p);
+#pragma unroll
+    for (unsigned j = 0; j < 2; ++j) t[j] = p1_tw<V>(tfB, waf[1], 4 + j, p, pinv);
+    p1_dit<V, 2, 16>(av, 0, t, p); p1_dit<V, 2, 16>(bv, 0, t, p);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) t[j] = p1_tw<V>(tfB, waf[2], 8 + j, p, pinv);
+    p1_dit<V, 4, 16>(av, 0, t, p); p1_dit<V, 4, 16>(bv, 0, t, p);
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) t[j] = p1_tw<V>(tfB, waf[3], 16 + j, p, pinv);
+    p1_dit<V, 8, 16>(av, 0, t, p); p1_dit<V, 8, 16>(bv, 0, t, p);
+    // fwd radix-8, two groups (halves), each 1+2+4 composed twiddles
+#pragma unroll
+    for (unsigned h = 0; h < 2; ++h) {
+        const unsigned b0 = h * 8;
+        t[0] = p1_tw<V>(tfB, waf[4], 24 + h, p, pinv);
+        p1_dit<V, 1, 8>(av, b0, t, p); p1_dit<V, 1, 8>(bv, b0, t, p);
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) t[j] = p1_tw<V>(tfB, waf[5], 26 + 2 * h + j, p, pinv);
+        p1_dit<V, 2, 8>(av, b0, t, p); p1_dit<V, 2, 8>(bv, b0, t, p);
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) t[j] = p1_tw<V>(tfB, waf[6], 30 + 4 * h + j, p, pinv);
+        p1_dit<V, 4, 8>(av, b0, t, p); p1_dit<V, 4, 8>(bv, b0, t, p);
+    }
+    // pointwise
+#pragma unroll
+    for (unsigned i = 0; i < 16; ++i) av[i] = gpu31::mont(av[i], bv[i], p);
+    // inverse radix-8, two groups: strides 4,2,1
+#pragma unroll
+    for (unsigned h = 0; h < 2; ++h) {
+        const unsigned b0 = h * 8;
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) t[j] = p1_tw<V>(tfB, wai[6], 38 + 4 * h + j, p, pinv);
+        p1_gs<V, 4, 8>(av, b0, t, p);
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) t[j] = p1_tw<V>(tfB, wai[5], 46 + 2 * h + j, p, pinv);
+        p1_gs<V, 2, 8>(av, b0, t, p);
+        t[0] = p1_tw<V>(tfB, wai[4], 50 + h, p, pinv);
+        p1_gs<V, 1, 8>(av, b0, t, p);
+    }
+    // inverse radix-16: strides 8,4,2,1
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) t[j] = p1_tw<V>(tfB, wai[3], 52 + j, p, pinv);
+    p1_gs<V, 8, 16>(av, 0, t, p);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) t[j] = p1_tw<V>(tfB, wai[2], 60 + j, p, pinv);
+    p1_gs<V, 4, 16>(av, 0, t, p);
+#pragma unroll
+    for (unsigned j = 0; j < 2; ++j) t[j] = p1_tw<V>(tfB, wai[1], 0 + j, p, pinv);
+    p1_gs<V, 2, 16>(av, 0, t, p);
+    t[0] = p1_tw<V>(tfB, wai[0], 3, p, pinv);
+    p1_gs<V, 1, 16>(av, 0, t, p);
+    // inverse low stages 8..5: 4 direct twiddles, 8 butterflies each
+#pragma unroll
+    for (unsigned m = 0; m < 4; ++m) {
+        t[0] = p1_dir<V>(tfB, 5 + m, pinv);
+        if (m == 0) p1_gs<V, 8, 16>(av, 0, t, p);
+        else if (m == 1) p1_gs<V, 4, 16>(av, 0, t, p);
+        else if (m == 2) p1_gs<V, 2, 16>(av, 0, t, p);
+        else p1_gs<V, 1, 16>(av, 0, t, p);
+    }
+    if (flag) {
+        const u64 ob = ((u64(bz) * K + k) * n) + u64(bx) * 4096 + rw * 512 + lane;
+#pragma unroll
+        for (unsigned i = 0; i < 16; ++i) out[ob + 32 * i] = av[i];
+    }
+}
+#endif  // P1_PROBE
 
 #endif  // __CUDACC__
 

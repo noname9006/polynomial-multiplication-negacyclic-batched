@@ -1161,7 +1161,7 @@ struct Device {
     }
 
 #ifndef P0_PROBE
-#define P0_PROBE 1
+#define P0_PROBE 0
 #endif
     // P0 (2026-11-20): what would a pair-major, L2-resident pipeline gain?
     // Setup-time only (outside the timed run).  Prints one [P0] line:
@@ -1269,6 +1269,59 @@ struct Device {
                      ser, 128.f * ser, pipe, 128.f * pipe, ovl, sq, int(err));
         for (auto& e : ev) cudaEventDestroy(e);
         cudaFree(a); cudaFree(b); cudaFree(c); cudaFree(fl);
+    }
+
+    // P1 (2026-11-20): is fused_high ALU-bound?  Setup-time only.  Prints
+    //  [P1] attr  : regs / local (spill+stack) bytes / CTAs per SM of the hot kernels
+    //  [P1] fh    : real fused_high (r8f) time for B pairs, scaled to 128 pairs
+    //  [P1] alu   : p1_alu<V> (same counts, registers only), scaled to 128 pairs
+    void p1_probe() {
+#if P1_PROBE
+        if (!tc_r8f || !d_ra || !d_rb || !d_rc) return;
+        const unsigned n = plan_.N, k = plan_.K;
+        const unsigned B = capacity_ < 128 ? capacity_ : 128;
+        cudaStream_t s = cs_[0] ? cs_[0] : 0;
+        auto attr = [&](const void* f, const char* nm, int threads, std::size_t dyn) {
+            cudaFuncAttributes a{};
+            int occ = -1;
+            if (cudaFuncGetAttributes(&a, f) != cudaSuccess) { cudaGetLastError(); return; }
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, f, threads, dyn) != cudaSuccess) cudaGetLastError();
+            std::fprintf(stderr, "[P1] attr %s regs=%d local=%zu sstat=%zu occ=%d\n", nm, a.numRegs,
+                         std::size_t(a.localSizeBytes), std::size_t(a.sharedSizeBytes), occ);
+        };
+        const std::size_t fh_dyn = 2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+        attr((const void*)tc::fused_high, "fused_high", 256, fh_dyn);
+        attr((const void*)tc::encode_fwdlow256, "encode_fwdlow256", 256, 0);
+        attr((const void*)tc::crt_tc2, "crt_tc2", 128, 0);
+        attr((const void*)tc::p1_alu<0>, "p1_alu0", 256, 0);
+        attr((const void*)tc::p1_alu<1>, "p1_alu1", 256, 0);
+        attr((const void*)tc::p1_alu<2>, "p1_alu2", 256, 0);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        auto tm = [&](auto fn) {
+            float best = 1e9f;
+            for (int rep = 0; rep < 4; ++rep) {
+                cudaEventRecord(e0, s); fn(); cudaEventRecord(e1, s);
+                cudaEventSynchronize(e1);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (rep > 0 && t < best) best = t;   // rep 0 = warm-up
+            }
+            return best * 128.f / float(B);
+        };
+        const unsigned logH = 7;
+        const float tfh = tm([&] {
+            tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8), fh_dyn, s>>>(
+                d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd, 1u, d_pk_inv, 1u);
+        });
+        const dim3 g(tc::NT_TILE / tc::NT_COLS, k, B), bl(tc::NT_COLS, 8);
+        const float t0 = tm([&] { tc::p1_alu<0><<<g, bl, 0, s>>>(d_rc, d_primes, d_twf, n, k, 0u); });
+        const float t1 = tm([&] { tc::p1_alu<1><<<g, bl, 0, s>>>(d_rc, d_primes, d_twf, n, k, 0u); });
+        const float t2 = tm([&] { tc::p1_alu<2><<<g, bl, 0, s>>>(d_rc, d_primes, d_twf, n, k, 0u); });
+        const cudaError_t err = cudaGetLastError();
+        std::fprintf(stderr, "[P1] B=%u x128: fh %.3f | alu0(mont) %.3f alu1(pre-q mont) %.3f alu2(no compose) %.3f | err=%d\n",
+                     B, tfh, t0, t1, t2, int(err));
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+#endif
     }
 
     // Read and print the stage times. Call after the stream has synchronised.
