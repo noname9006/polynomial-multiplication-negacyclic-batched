@@ -953,7 +953,16 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
        unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0,
-       const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
+       const u32* __restrict__ pki = nullptr, unsigned r8f = 0,
+       unsigned pmask = 0) {
+    // OC48 phase mask (uniform across the CTA, P4_PROBE only; 0 = unchanged):
+    // bit0 skip staging (inverse DIF + sA term writes), bit1 skip mma
+    // (accumulators stay zero), bit2 skip carry/reduce, bit3 skip out store.
+    // All __syncthreads stay unconditional; every thread evaluates the same mask.
+    const bool pm_stage = (pmask & 1u) != 0;
+    const bool pm_mma   = (pmask & 2u) != 0;
+    const bool pm_carry = (pmask & 4u) != 0;
+    const bool pm_store = (pmask & 8u) != 0;
     // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
     // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
     // Shared: one region, used as sA (u32, stride SA) -> sX (u64, stride SX)
@@ -988,6 +997,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_T(t0);
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
     u64 fsum = 0;
+    if (!pm_stage) {
     if (r8f) {
         // R8F (v2): thread = limb.  Its 32 residues of this 32-run are one
         // contiguous 128 B block -> 8 uint4 loads; the 32-point inverse
@@ -1074,6 +1084,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         fsum += (u64(term) * corr_m[j]) >> 30;
     }
     }
+    } // !pm_stage
     for (unsigned j = K + 1 + jg; j < W; j += NG) sA[c * cfg.SA + j] = 0;
     // spare words W..W+3 of the row hold the two partial sums
     sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
@@ -1105,7 +1116,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
 #pragma unroll
             for (unsigned q = 0; q < 2; ++q) acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
 #pragma unroll 3
-        for (unsigned ks = 0; ks < cfg.KS; ++ks) {
+        for (unsigned ks = 0; ks < cfg.KS && !pm_mma; ++ks) {
             const uint2 b0 = frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane];
             const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
 #pragma unroll
@@ -1148,11 +1159,12 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         // in the tail of the same sA region beyond the digit buffer.
         u64* cout = reinterpret_cast<u64*>(digits + CRT2_ROWS * DS);
         const unsigned row = tid >> 2;
-        oc26_carry_row(sX + row * cfg.SX, digits + row * DS, cout,
-                       words, l + 2);
+        if (!pm_carry)
+            oc26_carry_row(sX + row * cfg.SX, digits + row * DS, cout,
+                           words, l + 2);
         // oc26_carry_row contains the only __syncthreads of this phase; it is
         // reached by all 128 threads, so the barrier is uniform.
-        if (row < CRT2_ROWS && (tid & 3) == 0) {   // one reducer per row
+        if (!pm_carry && row < CRT2_ROWS && (tid & 3) == 0) {   // one reducer per row
             u32* dg = digits + row * DS;
             gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
         }
@@ -1160,7 +1172,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     __syncthreads();
 #else
     u32* digits = reinterpret_cast<u32*>(sX);
-    if (tid < CRT2_ROWS) {
+    if (!pm_carry && tid < CRT2_ROWS) {
         u32* dg = digits + tid * DS;
         const u64* xs = sX + tid * cfg.SX;
         u64 carry = 0;
@@ -1182,13 +1194,13 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_T(t4);
     // 5. store the tile's rows
     const unsigned rows = (n - start < CRT2_ROWS) ? (n - start) : CRT2_ROWS;
-    if (slot_logN == 0) {
+    if (!pm_store && slot_logN == 0) {
         const u64 obase = u64(pair) * n * l + u64(start) * l;
         for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
             const unsigned r = idx / l, cc = idx - r * l;
             out[obase + idx] = digits[r * DS + cc];
         }
-    } else {
+    } else if (!pm_store) {
         const u64 obase = u64(pair) * n * l;
         for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
             const unsigned r = idx / l, cc = idx - r * l;

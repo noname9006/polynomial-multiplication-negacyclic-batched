@@ -25,6 +25,11 @@
 
 #include "polymul.hpp"
 
+// OC48/P4_PROBE: CRT phase-mask probe (default 1; define 0 to disable).
+#ifndef P4_PROBE
+#define P4_PROBE 1
+#endif
+
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 
@@ -767,6 +772,10 @@ void* fherma_init(const fherma::Point& p) {
                                  int(d.tc_efl), int(d.tc_chunk)); d.print_attrs();
                 }
 
+#if P4_PROBE
+                if (state->gpu31_dev && state->gpu31_dev->tc_crt2)
+                    state->gpu31_dev->p4_probe();
+#endif
                 // Try the conflict-free CRT, keeping it only if bit-identical to
                 // the reference CRT on deterministic residue data.
                 const auto& pl = state->gpu31_dev->plan();

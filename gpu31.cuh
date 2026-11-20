@@ -825,6 +825,7 @@ struct Device {
     unsigned invcrt_rows = 32;
     bool tc_tail = false;  // TC17: per-pair tail on two streams
     unsigned crt2_SA = 0;
+    unsigned crt_pmask_ = 0;        // OC48/P4: phase mask for crt_tc2 probe
     std::size_t crt2_shared = 0;
     bool crt2_r64 = false;          // OC27: 64-row crt_tc2_r64 variant
     unsigned crt2_SX = 0;           // cfg.SX for the selected crt2 kernel
@@ -1256,7 +1257,7 @@ struct Device {
 #endif
             const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC && tc_crt2 &&
                              !r8f_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
-            if (part != 2) {
+            if (part != 2 && part != 4) {   // OC48: part 4 = CRT only
             if (tc_efl && ef256) {
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
@@ -1320,7 +1321,7 @@ struct Device {
                 fh_done = true;
             }
 #endif
-            if (!fh_done) {
+            if (!fh_done && part != 4) {
 #if TC36_FHINV
             if (tc_fhinv && OC31_TILE_RC && d_ring && d_ctr && fhinv_grid && !tc_invcrt &&
                 (n / tc::NT_TILE) % tc::TC36_IG == 0) {
@@ -1388,7 +1389,8 @@ struct Device {
                               crt2_shared, stream>>>(crt_args_, r8f ? prc : (OC31_TILE_RC ? pio : prc), pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
                                                      r8f ? n / 32 : (OC31_TILE_RC ? n / tc::NT_TILE : 0),
-                                                     d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u);
+                                                     d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u,
+                                                     crt_pmask_);
             } else
             tc::crt_tc<<<dim3((n + tc::CRT_ROWS - 1) / tc::CRT_ROWS, 1, B), 128,
                           crt_tc_shared, stream>>>(crt_args_, prc, pc, d_fcrt, crt_cfg,
@@ -1398,6 +1400,39 @@ struct Device {
             return st;
     }
 
+    // OC48 / P4_PROBE: CRT-only phase-mask probe (diagnostic; not on the timed
+    // path).  Mirrors p3_probe(): masks 0,1,2,4,8,3,7,15, B=128, input residues
+    // = whatever is in d_rc (values irrelevant — we time only).  part=4 makes
+    // tc_pipeline run ONLY crt_tc2.  One summary line on stdout.
+    void p4_probe() {
+        if (!tc_crt2 || !d_rc) return;
+        if (capacity_ < 128) return;   // B=128 is hard-coded in the probe
+        const unsigned masks[8] = {0u, 1u, 2u, 4u, 8u, 3u, 7u, 15u};
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        if (cudaEventCreate(&e0) != cudaSuccess) return;
+        if (cudaEventCreate(&e1) != cudaSuccess) { cudaEventDestroy(e0); return; }
+        float ms[8] = {};
+        for (unsigned q = 0; q < 8; ++q) {
+            crt_pmask_ = masks[q];
+            cudaError_t st = tc_pipeline(d_rc, d_rc, d_rc, d_ra, d_rb, d_rc, 128, 0, false, 4);  // warm-up
+            if (st != cudaSuccess) { cudaGetLastError(); break; }
+            cudaDeviceSynchronize();
+            for (int rep = 0; rep < 3; ++rep) {
+                cudaEventRecord(e0, 0);
+                st = tc_pipeline(d_rc, d_rc, d_rc, d_ra, d_rb, d_rc, 128, 0, false, 4);
+                cudaEventRecord(e1, 0);
+                if (st != cudaSuccess || cudaEventSynchronize(e1) != cudaSuccess) break;
+                float t = 0.f;
+                cudaEventElapsedTime(&t, e0, e1);
+                ms[q] += t / 3.f;
+            }
+            if (st != cudaSuccess) cudaGetLastError();
+        }
+        crt_pmask_ = 0;   // restore normal behaviour
+        std::printf("[P4] crt_tc2 B=128 ms: m0=%.3f m1=%.3f m2=%.3f m4=%.3f m8=%.3f m3=%.3f m7=%.3f m15=%.3f\n",
+                    ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7]);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+    }
 private:
     void build_tc(const cudaDeviceProp& prop) {
         if (prop.major < 8) return;
