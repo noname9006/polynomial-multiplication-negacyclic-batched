@@ -1665,8 +1665,7 @@ private:
                                 const unsigned low = ((L >> 2) << 6) | (((L >> 1) & 1) << 5)
                                                    | (bx << 1) | (L & 1);
                                 const std::size_t j = 1 + 2 * (std::size_t(within) * 512 + low);
-                                const std::size_t off = (std::size_t(kk) * 16 + bx) * FPS
-                                                      + ((1u << s) - 1u) + bidx;
+                                const std::size_t off = (std::size_t(kk) * 16 + bx) * 127 + bidx;   // t45 fix: row = bidx, x32 lanes below
                                 gf[off * 32 + L] = fpsi((std::size_t(1) << d) * j);
                                 gi[off * 32 + L] = ipsi((std::size_t(1) << d) * j);
                             }
