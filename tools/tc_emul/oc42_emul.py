@@ -69,7 +69,7 @@ def run(oc42, corrupt=-1):
 
     # encode256: stages 0..4 under OC42, 0..7 otherwise
     EA, EB = A.copy(), B.copy()
-    nst = 5 if oc42 else 8
+    nst = 6 if oc42 else 8
     for m in range(nst):
         EA, EB = dit_stage(EA, m), dit_stage(EB, m)
     ra = np.full(N, -1, dtype=np.int64)
@@ -97,8 +97,8 @@ def run(oc42, corrupt=-1):
         X = rows[:, None] * 512 + low[None, :]
 
         if oc42:
-            # forward stages 5,6,7 by lane^1,^2,^4 (no transpose)
-            for m in (5, 6, 7):
+            # forward stages 6,7 by lane^4,^8 (no transpose)
+            for m in (6, 7):
                 lb = 1 << (m - 4)
                 wf5 = fw(m, low & ((1 << m) - 1)).astype(object)
                 if m == corrupt:
