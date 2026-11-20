@@ -1186,6 +1186,10 @@ struct Device {
         attr((const void*)tc::crt_tc2_r64f, "crt_tc2_r64f", 128, crt2_r64f_shared);
         std::fprintf(stderr, "[P1] crt2_r64f=%d\n", int(crt2_r64f));
 #endif
+#if OC47_R64BAL
+        attr((const void*)tc::crt_tc2_r64bal, "crt_tc2_r64bal", 256, crt2_r64f_shared);
+        std::fprintf(stderr, "[P1] crt2_r64bal=%d\n", int(crt2_r64bal));
+#endif
     }
 
     // Read and print the stage times. Call after the stream has synchronised.
