@@ -1160,6 +1160,117 @@ struct Device {
         return cudaGetLastError();
     }
 
+#ifndef P0_PROBE
+#define P0_PROBE 1
+#endif
+    // P0 (2026-11-20): what would a pair-major, L2-resident pipeline gain?
+    // Setup-time only (outside the timed run).  Prints one [P0] line:
+    //  cold  : per-pair stage time (B=1) after an L2 flush
+    //  hot   : fh right after encode of the same pair, CRT right after fh
+    //  bNP   : batched (B=NP) stage time / NP  (the normal path, DRAM-bound)
+    //  ser1  : whole pipeline pair by pair on one stream, per pair
+    //  pipe2 : encode stream + tail stream (tail j waits encode j, encode j
+    //          waits tail j-2), per pair  -> x128 = projected batch time
+    //  ovl   : encode(pair1) || tail(pair0) on two streams vs their sum
+    void p0_probe() {
+        if (!P0_PROBE || !cs_[0] || !cs_[1] || !tc_r8f) return;
+        const unsigned n = plan_.N, l = plan_.L, k = plan_.K;
+        const unsigned NP = capacity_ < 16 ? capacity_ : 16;
+        if (NP < 4) return;
+        const std::size_t ins = std::size_t(n) * l, res = std::size_t(k) * n;
+        const std::size_t flb = std::size_t(256) << 20;
+        u32 *a = nullptr, *b = nullptr, *c = nullptr; void* fl = nullptr;
+        if (cudaMalloc(&a, NP * ins * 4) != cudaSuccess || cudaMalloc(&b, NP * ins * 4) != cudaSuccess ||
+            cudaMalloc(&c, NP * ins * 4) != cudaSuccess || cudaMalloc(&fl, flb) != cudaSuccess) {
+            cudaGetLastError();
+            if (a) cudaFree(a); if (b) cudaFree(b); if (c) cudaFree(c); if (fl) cudaFree(fl);
+            std::fprintf(stderr, "[P0] alloc failed\n");
+            return;
+        }
+        cudaStream_t s0 = cs_[0], s1 = cs_[1];
+        cudaMemsetAsync(a, 0x37, NP * ins * 4, s0);
+        cudaMemsetAsync(b, 0x29, NP * ins * 4, s0);
+        cudaStreamSynchronize(s0);
+        const unsigned NE = 2 * NP + 4;
+        std::vector<cudaEvent_t> ev(NE);
+        for (auto& e : ev) cudaEventCreate(&e);
+        auto P = [&](unsigned j, u32 B, cudaStream_t s, int part) {
+            return tc_pipeline(a + j * ins, b + j * ins, c + j * ins, d_ra + j * res, d_rb + j * res,
+                               d_rc + j * res, B, s, false, part);
+        };
+        auto flush = [&]() { cudaMemsetAsync(fl, 0x11, flb, s0); };
+        auto tm = [&](auto fn) {
+            float best = 1e9f;
+            for (int rep = 0; rep < 3; ++rep) {
+                cudaEventRecord(ev[0], s0);
+                fn();
+                cudaEventRecord(ev[1], s0);
+                cudaEventSynchronize(ev[1]);
+                float t = 0.f; cudaEventElapsedTime(&t, ev[0], ev[1]);
+                if (t < best) best = t;
+            }
+            return best;
+        };
+        // B=1 timings; each flush is outside the timed region
+        float ec = 1e9f, fc = 1e9f, cc = 1e9f, fh = 1e9f, ch = 1e9f;
+        for (int rep = 0; rep < 3; ++rep) {
+            // hot: encode then fh, timed separately
+            flush(); P(0, 1, s0, 1);
+            cudaEventRecord(ev[2], s0); P(0, 1, s0, 3); cudaEventRecord(ev[3], s0);
+            P(0, 1, s0, 4); cudaEventRecord(ev[4], s0);
+            cudaEventSynchronize(ev[4]);
+            float t1 = 0, t2 = 0; cudaEventElapsedTime(&t1, ev[2], ev[3]); cudaEventElapsedTime(&t2, ev[3], ev[4]);
+            fh = t1 < fh ? t1 : fh; ch = t2 < ch ? t2 : ch;
+            // cold fh / cold crt
+            flush(); cudaEventRecord(ev[2], s0); P(0, 1, s0, 3); cudaEventRecord(ev[3], s0);
+            flush(); cudaEventRecord(ev[4], s0); P(0, 1, s0, 4); cudaEventRecord(ev[5], s0);
+            cudaEventSynchronize(ev[5]);
+            cudaEventElapsedTime(&t1, ev[2], ev[3]); cudaEventElapsedTime(&t2, ev[4], ev[5]);
+            fc = t1 < fc ? t1 : fc; cc = t2 < cc ? t2 : cc;
+        }
+        for (int rep = 0; rep < 3; ++rep) {   // cold encode
+            float t1 = 0; flush(); cudaEventRecord(ev[2], s0); P(0, 1, s0, 1); cudaEventRecord(ev[3], s0);
+            cudaEventSynchronize(ev[3]); cudaEventElapsedTime(&t1, ev[2], ev[3]); ec = t1 < ec ? t1 : ec;
+        }
+        flush();
+        const float be = tm([&] { P(0, NP, s0, 1); }) / NP;
+        const float bf = tm([&] { P(0, NP, s0, 3); }) / NP;
+        const float bc = tm([&] { P(0, NP, s0, 4); }) / NP;
+        const float ser = tm([&] { for (unsigned j = 0; j < NP; ++j) P(j, 1, s0, 0); }) / NP;
+        const float pipe = tm([&] {
+            // ev[4 + j]: encode j done; ev[4 + NP + j]: tail j done
+            cudaStreamWaitEvent(s1, ev[0], 0);
+            for (unsigned j = 0; j < NP; ++j) {
+                if (j >= 2) cudaStreamWaitEvent(s0, ev[4 + NP + j - 2], 0);
+                P(j, 1, s0, 1);
+                cudaEventRecord(ev[4 + j], s0);
+                cudaStreamWaitEvent(s1, ev[4 + j], 0);
+                P(j, 1, s1, 2);
+                cudaEventRecord(ev[4 + NP + j], s1);
+            }
+            cudaStreamWaitEvent(s0, ev[4 + 2 * NP - 1], 0);
+        }) / NP;
+        const float ovl = tm([&] {
+            P(0, 1, s0, 1);
+            cudaEventRecord(ev[2], s0);
+            cudaStreamWaitEvent(s1, ev[2], 0);
+            P(0, 1, s1, 2);          // tail pair 0 on s1
+            P(1, 1, s0, 1);          // encode pair 1 on s0 concurrently
+            cudaEventRecord(ev[3], s1);
+            cudaStreamWaitEvent(s0, ev[3], 0);
+        });
+        const float sq = tm([&] { P(0, 1, s0, 1); P(0, 1, s0, 2); P(1, 1, s0, 1); });
+        const cudaError_t err = cudaGetLastError();
+        std::fprintf(stderr,
+                     "[P0] NP=%u cold: enc %.3f fh %.3f crt %.3f | hot: fh %.3f crt %.3f | "
+                     "bNP/pair: enc %.3f fh %.3f crt %.3f (sum %.3f, x128 %.1f) | ser1 %.3f/pair (x128 %.1f) | "
+                     "pipe2 %.3f/pair (x128 %.1f) | ovl enc1||tail0 %.3f vs serial %.3f | err=%d\n",
+                     NP, ec, fc, cc, fh, ch, be, bf, bc, be + bf + bc, 128.f * (be + bf + bc),
+                     ser, 128.f * ser, pipe, 128.f * pipe, ovl, sq, int(err));
+        for (auto& e : ev) cudaEventDestroy(e);
+        cudaFree(a); cudaFree(b); cudaFree(c); cudaFree(fl);
+    }
+
     // Read and print the stage times. Call after the stream has synchronised.
     void report_profile() const {
         if (!profiling_) return;
@@ -1213,7 +1324,8 @@ struct Device {
                             u32 B, cudaStream_t stream, bool prof, int part = 0,
                             u32* pinv = nullptr) {
         u32* pio = pinv ? pinv : pra;   // TC35: inv_low output slot
-        // part 0: whole pipeline, 1: encode (+fwd low) only, 2: tail only
+        // part 0: whole pipeline, 1: encode (+fwd low) only, 2: tail only,
+        // 3: fused_high only (r8f), 4: CRT only (r8f)  [P0 probes]
         const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
         cudaError_t st = cudaSuccess;
             const unsigned logH = logN - 9;
@@ -1227,7 +1339,7 @@ struct Device {
 #endif
             const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC && tc_crt2 &&
                              !r8f_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
-            if (part != 2) {
+            if (part == 0 || part == 1) {
             if (tc_efl && ef256) {
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
@@ -1256,8 +1368,8 @@ struct Device {
             }
             }
             if (part == 1) return cudaGetLastError();
-            bool fh_done = false;
-            if (r8f) {
+            bool fh_done = part == 4;
+            if (r8f && part != 4) {
                 // R8F: fused_high runs inverse low stages 8..5 and writes
                 // [pair][x>>5][K][32] into prc; crt_tc2 does stages 4..0.
                 tc::fused_high<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
@@ -1268,6 +1380,7 @@ struct Device {
                             cudaEventRecord(ev_[6], stream); }
                 fh_done = true;
             }
+            if (part == 3) return cudaGetLastError();
 #if R8_CLUSTER
             if (tc_r8 && r8_ready && OC31_TILE_RC && ef256 && logH == 7 && !tc_invcrt) {
                 // R8: fused_high + inv_low in one kernel (cluster of 16 = one
