@@ -825,6 +825,9 @@ struct Device {
     bool crt2_r64f = false;         // OC41: R8F 64-row crt_tc2_r64f variant
     std::size_t crt2_r64f_shared = 0;
 #endif
+#if OC47_R64BAL
+    bool crt2_r64bal = false;       // OC47: 256-thread balanced variant
+#endif
     std::size_t persist_bytes_ = 0;   // TC35 access-policy window on d_rc slots
     float persist_ratio_ = 0.f;
     // TC35: attach the persisting window to a stream (no-op when unsupported).
@@ -1350,6 +1353,16 @@ struct Device {
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
+#if OC47_R64BAL
+                if (r8f && crt2_r64bal) {
+                    c2.SX = tc::crt2_sxh(crt_cfg.NT);
+                    tc::crt_tc2_r64bal<<<dim3((n + tc::CRT2_R64F_ROWS - 1) / tc::CRT2_R64F_ROWS, 1, B),
+                                      256, crt2_r64f_shared, stream>>>(
+                        crt_args_, prc, pc, d_fcrt, c2,
+                        d_primes, d_untw_slot, logN, d_corr_m, n / 32,
+                        d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u);
+                } else
+#endif
 #if OC41_R64
                 if (r8f && crt2_r64f) {
                     c2.SX = tc::crt2_sxh(crt_cfg.NT);   // SXH
@@ -1446,6 +1459,10 @@ private:
                     const unsigned sxh = tc::crt2_sxh(crt_cfg.NT);
                     crt2_r64f_shared = tc::crt_tc2_r64f_smem(crt2_SA, sxh);
                 }
+#if OC47_R64BAL
+                crt2_r64bal = crt2_r64f &&
+                    tc::crt2_r64bal_ok(crt_cfg.KS, crt_cfg.NT, crt2_SA, plan_.L);
+#endif
 #endif
 #if R8_CLUSTER
                 {
