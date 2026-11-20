@@ -2871,7 +2871,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     auto issue_rp = [&](unsigned ng, unsigned buf) {
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
-            const unsigned kk = ng * 2 + q;
+            const unsigned kk = ng * EF_PR + q;
             const bool ok = kk < K;
             const u32* gp = packed + (ok ? u64(kk) * TC_LT + r : 0);
             const unsigned sa = unsigned(__cvta_generic_to_shared(&sR3[buf][q][r]));
@@ -2879,7 +2879,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
         if (tid < 2 * EF_PR) {
             const unsigned q = tid & (EF_PR - 1);
-            const unsigned kk = ng * 2 + q;
+            const unsigned kk = ng * EF_PR + q;
             const bool ok = kk < K;
             if (tid < EF_PR) {
                 const gpu31::Prime* gp = primes + (ok ? kk : 0);

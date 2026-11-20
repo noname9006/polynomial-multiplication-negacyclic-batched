@@ -50,6 +50,21 @@ def main():
             issued[gid + 2] = gid
     print("OC43 buffer schedule: %d groups, no live-buffer overwrite" % NG)
 
+    # group -> prime mapping: group g covers primes [g*EF_PR, g*EF_PR+EF_PR)
+    # (EF_NTB n-tiles x 2 primes each).  The buggy variant g*2+q collides.
+    EF_PR = EF_NTB * 2
+    covered = set()
+    for gid in range(NG):
+        for q in range(EF_PR):
+            covered.add(gid * EF_PR + q)
+    assert len(covered) == NG * EF_PR
+    wrong = set()
+    for gid in range(NG):
+        for q in range(EF_PR):
+            wrong.add(gid * 2 + q)
+    assert len(wrong) < len(covered), "negative test: wrong kk mapping not detected"
+    print("group->prime mapping: %d distinct primes; buggy variant only %d" % (len(covered), len(wrong)))
+
     seen, collided = {}, False
     for gid in range(NG):
         b = gid % 2                       # deliberately wrong scheme
