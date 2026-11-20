@@ -276,6 +276,35 @@ inline bool crt2_r64_ok(unsigned KS, unsigned NT, unsigned SA, unsigned l) {
            crt_tc2_r64_smem(SA, SXH) <= 48 * 1024;
 }
 
+// OC41 (agent B): CRT on 64 rows over R8F (crt_tc2_r64f).  Two adjacent
+// 32-runs form one CTA; each B fragment feeds 4 m-tiles instead of 2
+// (like OC27/OC40), halving the L2 B traffic.  Unlike the older OC27 r64
+// variant (parallel carry with scratch in the dead sA region — WRONG on the
+// platform, see the OC27 fix), OC41 uses a SEQUENTIAL carry with local digits
+// and a register handover: sA stays LIVE across both GEMM halves, so NO
+// scratch may be written into it.  Flag OC41_R64 (0 = exact crt_tc2 path).
+#ifndef OC41_R64
+#define OC41_R64 1
+#endif
+constexpr unsigned CRT2_R64F_ROWS = 64;
+__host__ __device__ inline std::size_t crt_tc2_r64f_smem(unsigned SA, unsigned SXH) {
+    return ((std::size_t(CRT2_R64F_ROWS) * SA * 4 + 15) & ~std::size_t(15)) +
+           std::size_t(CRT2_R64F_ROWS) * SXH * 8;
+}
+// R8F 64-row guard: w0 = 2*NTH <= l (half 0 stores low digits only), the
+// shifted half-1 window fits, local digit window holds DSH words, and the
+// static shared budget fits 48 KB.
+__host__ __device__ inline bool crt2_r64f_ok(unsigned KS, unsigned NT,
+                                             unsigned SA, unsigned l) {
+    const unsigned SXH = crt2_sxh(NT);
+    const unsigned NTH = (SXH - 1) / 2;
+    if (2 * NTH > l) return false;
+    if (2 * SXH < l + 2) return false;
+    if (2 * SXH > 60) return false;             // local u32 dg[60]
+    if (KS > CRT_KS_MAX || NT > 2 * NTH) return false;
+    return crt_tc2_r64f_smem(SA, SXH) <= 48 * 1024;
+}
+
 // OC34 (agent B): cp.async double-buffered residue staging in crt_tc2_r64.
 // The staging phase (~34% of CRT) reads residues synchronously, then mounts
 // them; TC30 showed the same overlap trick in encode is worth -1.4 ms.  Here
@@ -769,6 +798,70 @@ __device__ __forceinline__ void oc26_carry_row(
     }
 }
 #endif // OC26_CARRY
+
+#if OC41_R64
+// OC41: sequential carry for 64 rows, one n-tile half, one thread per row.
+// Digits in a per-thread LOCAL array; the half-0 -> half-1 handover carry cin0
+// lives in a REGISTER (row = tid in BOTH halves, same thread owns the row).
+// NO shared scratch: sA stays LIVE across both GEMM halves (the old OC27
+// parallel carry aliased scratch onto sA and corrupted half-1's A operands —
+// ~14% wrong limbs on the platform; OC41 must not repeat it).
+// Seam: half 0 stores LOW digits + parks cin0; half 1 computes V = sumB+cin0,
+// shifts V UP by w0, adds L_A with ripple, one reduce_sum<1> -> total mod q.
+__device__ __forceinline__ void oc41_carry_half(
+        const u64* __restrict__ xs, unsigned SXH, u64& cin0,
+        u32* __restrict__ out, u64 obase,
+        unsigned rows, unsigned l, unsigned words, unsigned slot_logN,
+        unsigned start, unsigned tid, unsigned half, unsigned w0,
+        unsigned bits, u32 gap, const u32* __restrict__ q) {
+    if (tid >= rows) return;
+    const unsigned row = tid;
+    const unsigned l2 = l + 2;
+    const unsigned DSH = 2 * SXH;
+    u32 dg[60];                       // local window (DSH <= 58, l2 <= 57)
+    const u64* x = xs + row * SXH;
+    u64 carry = 0;
+    for (unsigned w = 0; w < words; ++w) {
+        carry += x[w];
+        dg[w] = u32(carry);
+        carry >>= 32;
+    }
+    u64 ob;
+    if (slot_logN == 0) ob = obase + u64(row) * l;
+    else ob = obase + u64(__brev(start + row) >> (32 - slot_logN)) * l;
+    if (half == 0) {
+        cin0 = carry;
+        for (unsigned w = words; w < l2; ++w) dg[w] = 0;   // LOW digits only
+        gpu31::reduce_sum<1>(dg, l, bits, gap, q);
+        for (unsigned cc = 0; cc < l; ++cc) out[ob + cc] = dg[cc];
+    } else {
+        u64 tail = carry;
+        for (unsigned w = words; w < l2; ++w) { dg[w] = u32(tail); tail >>= 32; }
+        u64 add = cin0;
+        for (unsigned w = 0; w < l2 && add; ++w) {
+            const u64 sum = u64(dg[w]) + u32(add);
+            dg[w] = u32(sum);
+            add = (add >> 32) + (sum >> 32);
+        }
+        for (unsigned j = DSH; j-- > w0;)
+            dg[j] = (j - w0 < l2) ? dg[j - w0] : 0u;       // shift UP
+        for (unsigned j = 0; j < w0; ++j) dg[j] = 0;
+        u64 c2 = 0;
+        for (unsigned cc = 0; cc < l; ++cc) {
+            const u64 v = u64(dg[cc]) + u64(out[ob + cc]) + c2;
+            dg[cc] = u32(v);
+            c2 = v >> 32;
+        }
+        for (unsigned w = l; w < DSH && c2; ++w) {
+            const u64 v = u64(dg[w]) + c2;
+            dg[w] = u32(v);
+            c2 = v >> 32;
+        }
+        gpu31::reduce_sum<1>(dg, l, bits, gap, q);
+        for (unsigned cc = 0; cc < l; ++cc) out[ob + cc] = dg[cc];
+    }
+}
+#endif // OC41_R64
 
 #if OC27_ROWS64
 // OC27: the OC26 carry over 64 rows for one n-tile half, in two 32-row
@@ -1410,6 +1503,170 @@ crt_tc2_r64(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict
     }
 }
 #endif // OC27_ROWS64
+
+
+
+#if OC41_R64
+// OC41 (agent B): CRT on 64 rows over R8F.  CTA = two adjacent 32-runs
+// (x>>5 = 2b and 2b+1); 128 threads, 4 m-tiles/warp, B feeds 4 mma.
+// Staging: thread = (limb, run), 2*K=228 tasks over 128 threads; 32-point
+// inverse DIF in registers, twiddles loaded PER STAGE (<=16 live) to keep
+// register pressure low (R8F v5 ld.cg showed staging is register-stressed).
+// Carry: sequential, local digits, register handover — sA stays LIVE across
+// both GEMM halves, so NO shared scratch (the OC27 parallel-carry bug).
+__global__ void __launch_bounds__(128, 1)
+crt_tc2_r64f(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles,
+       const u32* __restrict__ pki, unsigned r8f) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    u32* sA = reinterpret_cast<u32*>(smem_raw);
+    u64* sX = reinterpret_cast<u64*>(smem_raw +
+        ((std::size_t(CRT2_R64F_ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15)));
+    const unsigned SXH = cfg.SX;                 // host passes crt2_sxh(NT)
+    const unsigned NTH = (SXH - 1) / 2;
+    const unsigned UP = (NTH + 3) / 4;
+    const unsigned n = pl.n, l = pl.limbs, K = pl.count;
+    const unsigned pair = blockIdx.z;
+    const unsigned start = blockIdx.x * CRT2_R64F_ROWS;
+    const unsigned tid = threadIdx.x;
+    const unsigned c = tid & 63, jg = tid >> 6;  // row-in-CTA, staging group
+    const unsigned W = cfg.KS * 8;
+    // R8F residue layout [pair][x>>5][K][32], two 32-runs per CTA.
+    const u64 rbase2 = (u64(pair) * ntiles + (start >> 5)) * K;
+
+    TCP_T(t0);
+    // 1. staging: 228 tasks (limb j x run r) over 128 threads (t and t+128).
+    u64 fsum = 0;
+    if (r8f >= 2 && ntiles && tid < 2 * K) {
+        for (unsigned task = tid; task < 2 * K; task += 128) {
+            const unsigned run = task / K;
+            const unsigned j = task - run * K;
+            const gpu31::Prime pj = c_crt_prime[j];
+            const uint4* src = reinterpret_cast<const uint4*>(
+                residues + ((rbase2 + run * K + j) << 5));
+            const u32* twu = pki + u64(j) * TC_LT;   // scalar per-stage twiddle loads
+            u32 v[32];
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const uint4 x = __ldcs(src + e);
+                v[4 * e] = x.x; v[4 * e + 1] = x.y;
+                v[4 * e + 2] = x.z; v[4 * e + 3] = x.w;
+            }
+#pragma unroll
+            for (int m = 4; m >= 0; --m) {
+                const unsigned half = 1u << m;
+                u32 tw[16];
+#pragma unroll
+                for (unsigned jj = 0; jj < half; ++jj)
+                    tw[jj] = __ldg(twu + (half - 1) + jj);
+#pragma unroll
+                for (unsigned i = 0; i < 32; ++i) {
+                    if (i & half) continue;
+                    const u32 u = v[i], x = v[i + half];
+                    v[i] = gpu31::add(u, x, pj.p);
+                    v[i + half] = gpu31::mont(gpu31::sub(u, x, pj.p),
+                                              tw[i & (half - 1)], pj);
+                }
+            }
+            // R8F v3+: the inverse output already is the term.
+            const unsigned rowbase = run * 32;
+#pragma unroll
+            for (unsigned i = 0; i < 32; ++i)
+                sA[(rowbase + i) * cfg.SA + j] = v[i];
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (unsigned j = jg; j < K; j += 2)
+            fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> 30;
+    }
+    for (unsigned j = K + 1 + jg; j < W; j += 2) sA[c * cfg.SA + j] = 0;
+    sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
+    sA[c * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
+    __syncthreads();
+    if (jg == 0) {
+        const u32* rw = sA + c * cfg.SA + W;
+        u64 s = 0;
+#pragma unroll
+        for (unsigned q = 0; q < 2; ++q) s += u64(rw[2 * q]) | (u64(rw[2 * q + 1]) << 32);
+        sA[c * cfg.SA + K] = u32((s + (u64(1) << 31)) >> 32);
+    }
+    __syncthreads();
+
+    TCP_T(t1);
+    const unsigned warp = tid >> 5, lane = tid & 31;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const bool odd = t & 1;
+    const unsigned sh = odd ? 16u : 0u;
+    TCP_T(t2);
+    const unsigned rows = (n - start < CRT2_R64F_ROWS) ? (n - start) : CRT2_R64F_ROWS;
+    const u64 obase = u64(pair) * n * l;
+    u64 cin0 = 0;                     // register handover across the 2 halves
+    long long mma_cyc = 0, carry_cyc = 0;
+    for (unsigned half = 0; half < 2; ++half) {
+        const long long tm0 = (TC_PROF && tid == 0) ? (long long)clock64() : 0;
+#pragma unroll 1
+        for (unsigned u = 0; u < UP; ++u) {
+            const unsigned ntA = half * NTH + warp + 4 * u;
+            const unsigned ntB = ntA + 8;
+            const bool hasA = (warp + 4 * u) < NTH && ntA < cfg.NT;
+            const bool hasB = (warp + 4 * u + 8) < NTH && ntB < cfg.NT;
+            if (!hasA && !hasB) continue;
+            int acc[4][2][4];
+#pragma unroll
+            for (unsigned mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (unsigned q = 0; q < 2; ++q)
+                    acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
+#pragma unroll 3
+            for (unsigned ks = 0; ks < cfg.KS; ++ks) {
+                const uint2 b0 = hasA ? frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane]
+                                      : make_uint2(0u, 0u);
+                const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane]
+                                      : make_uint2(0u, 0u);
+#pragma unroll
+                for (unsigned mt = 0; mt < 4; ++mt) {
+                    const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
+                    const u32* r1 = r0 + 8 * cfg.SA;
+                    const u32 x0 = r0[0], x1 = r1[0], x2 = r0[4], x3 = r1[4];
+                    if (hasA) mma_u8(acc[mt][0], x0, x1, x2, x3, b0.x, b0.y);
+                    if (hasB) mma_u8(acc[mt][1], x0, x1, x2, x3, b1.x, b1.y);
+                }
+            }
+#pragma unroll
+            for (unsigned mt = 0; mt < 4; ++mt)
+#pragma unroll
+                for (unsigned q = 0; q < 2; ++q) {
+                    const unsigned nt = q ? ntB : ntA;
+                    if (!(q ? hasB : hasA)) continue;
+                    const u64 pg = (u64(u32(acc[mt][q][0])) << sh) +
+                                   (u64(u32(acc[mt][q][1])) << (sh + 8));
+                    const u64 pg8 = (u64(u32(acc[mt][q][2])) << sh) +
+                                    (u64(u32(acc[mt][q][3])) << (sh + 8));
+                    const u64 send = odd ? pg : pg8;
+                    const u64 mine = odd ? pg8 : pg;
+                    const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                    const unsigned row = mt * 16 + g + (odd ? 8 : 0);
+                    sX[row * SXH + (nt - half * NTH) * 2 + (t >> 1)] = tot;
+                }
+        }
+        __syncthreads();
+        const long long tm1 = (TC_PROF && tid == 0) ? (long long)clock64() : 0;
+        oc41_carry_half(sX, SXH, cin0, out, obase,
+                        rows, l, NTH * 2, slot_logN, start, tid,
+                        half, half * NTH * 2, pl.bits, pl.gap, pl.q);
+        __syncthreads();   // all rows read sX before next half's GEMM writes it
+        const long long tm2 = (TC_PROF && tid == 0) ? (long long)clock64() : 0;
+        mma_cyc += tm1 - tm0; carry_cyc += tm2 - tm1;
+    }
+    TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2);
+    if (TC_PROF && tid == 0) {
+        atomicAdd(&g_tcprof[2], (unsigned long long)mma_cyc);
+        atomicAdd(&g_tcprof[3], (unsigned long long)carry_cyc);
+    }
+}
+#endif // OC41_R64
 
 
 // ---------------------------------------------------------------------------

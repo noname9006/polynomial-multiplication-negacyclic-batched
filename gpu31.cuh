@@ -821,6 +821,10 @@ struct Device {
     bool crt2_r64 = false;          // OC27: 64-row crt_tc2_r64 variant
     unsigned crt2_SX = 0;           // cfg.SX for the selected crt2 kernel
     std::size_t crt2_r64_shared = 0;
+#if OC41_R64
+    bool crt2_r64f = false;         // OC41: R8F 64-row crt_tc2_r64f variant
+    std::size_t crt2_r64f_shared = 0;
+#endif
     std::size_t persist_bytes_ = 0;   // TC35 access-policy window on d_rc slots
     float persist_ratio_ = 0.f;
     // TC35: attach the persisting window to a stream (no-op when unsupported).
@@ -1346,6 +1350,16 @@ struct Device {
             if (tc_crt2) {
                 tc::CrtTc c2 = crt_cfg;
                 c2.SA = crt2_SA;
+#if OC41_R64
+                if (r8f && crt2_r64f) {
+                    c2.SX = tc::crt2_sxh(crt_cfg.NT);   // SXH
+                    tc::crt_tc2_r64f<<<dim3((n + tc::CRT2_R64F_ROWS - 1) / tc::CRT2_R64F_ROWS, 1, B),
+                                      128, crt2_r64f_shared, stream>>>(
+                        crt_args_, prc, pc, d_fcrt, c2,
+                        d_primes, d_untw_slot, logN, d_corr_m, n / 32,
+                        d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u);
+                } else
+#endif
 #if OC27_ROWS64
                 if (crt2_r64) {
                     c2.SX = crt2_SX;   // SXH: sX half stride
@@ -1421,6 +1435,17 @@ private:
                 }
 #else
                 crt2_SX = crt_cfg.SX;
+#endif
+#if OC41_R64
+                // OC41: R8F 64-row variant.  Kept SEPARATE from crt2_r64 so
+                // the `r8f` activation condition (which excludes r8f_r64 =
+                // crt2_r64) still holds — R8F path needs d_fenc_b/d_pk_inv.
+                crt2_r64f = tc::crt2_r64f_ok(crt_cfg.KS, crt_cfg.NT,
+                                              crt2_SA, plan_.L);
+                if (crt2_r64f) {
+                    const unsigned sxh = tc::crt2_sxh(crt_cfg.NT);
+                    crt2_r64f_shared = tc::crt_tc2_r64f_smem(crt2_SA, sxh);
+                }
 #endif
 #if R8_CLUSTER
                 {
