@@ -61,7 +61,19 @@ struct Prime {
 GPU31_FHD inline u32 umin32(u32 x, u32 y) {
     return x < y ? x : y;   // IMNMX.U32
 }
+// M4: Montgomery with 32-bit halves only (IMAD, IMAD.HI) instead of two
+// IMAD.WIDE: m = lo*p^-1 makes lo(t) == lo(m*p) exactly, so
+// (t - m*p)/2^32 = hi(t) - hi(m*p) in (-p, p); fix sign with umin. 0 = M1.
+#ifndef M4_MULHI
+#define M4_MULHI 1
+#endif
 GPU31_FHD inline u32 mont(u32 a, u32 b, const Prime& p) {
+#if M4_MULHI && defined(__CUDA_ARCH__)
+    const u32 lo = a * b, hi = __umulhi(a, b);
+    const u32 m = lo * (0u - p.neg_inv);           // p^-1 mod 2^32
+    const u32 d = hi - __umulhi(m, p.p);
+    return umin32(d, d + p.p);
+#else
     const u64 t = u64(a) * b;
     const u32 m = u32(t) * p.neg_inv;              // neg_inv = -p^-1 mod 2^32
     const u32 u = u32((t + u64(m) * p.p) >> 32);
@@ -69,6 +81,7 @@ GPU31_FHD inline u32 mont(u32 a, u32 b, const Prime& p) {
     return umin32(u, u - p.p);
 #else
     return u >= p.p ? u - p.p : u;
+#endif
 #endif
 }
 GPU31_FHD inline u32 add(u32 a, u32 b, u32 p) {
