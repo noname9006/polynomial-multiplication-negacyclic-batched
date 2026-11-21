@@ -507,7 +507,7 @@ encode_tc(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const gpu31::Weight w0 = weights[std::size_t(k) * l];
                 const u32 lo = gpu31::canonical_word(u32(tot), p.p);
                 u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
-                if (hi >= p.p) hi -= p.p;
+                hi = gpu31::umin32(hi, hi - p.p);
                 const u32 v = gpu31::add(lo, hi, p.p);
                 dst[rbase + u64(k) * n + i] = rtwist ? gpu31::mont(v, tw[j], p) : v;
             }
@@ -2591,7 +2591,7 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 if (k < K) {
                     const u32 lo = gpu31::canonical_word(u32(tot), p.p);
                     u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
-                    if (hi >= p.p) hi -= p.p;
+                    hi = gpu31::umin32(hi, hi - p.p);
                     val = rtwist ? gpu31::mont(gpu31::add(lo, hi, p.p), tw[mt][j], p)
                                  : gpu31::add(lo, hi, p.p);
                 }
@@ -2964,7 +2964,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 if (k < K) {
                     const u32 lo = gpu31::canonical_word(u32(tot), p.p);
                     u32 hi = gpu31::lazy_product(u32(tot >> 32), w0, p.p);
-                    if (hi >= p.p) hi -= p.p;
+                    hi = gpu31::umin32(hi, hi - p.p);
                     val = gpu31::add(lo, hi, p.p);
                 }
                 const unsigned rl = rowbase + mt * 16 + g + (odd ? 8 : 0);

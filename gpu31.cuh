@@ -68,7 +68,7 @@ GPU31_FHD inline u32 mont(u32 a, u32 b, const Prime& p) {
 #if M1_MIN
     return umin32(u, u - p.p);
 #else
-    return u >= p.p ? u - p.p : u;
+    return umin32(u, u - p.p);
 #endif
 }
 GPU31_FHD inline u32 add(u32 a, u32 b, u32 p) {
@@ -134,16 +134,16 @@ GPU31_FHD inline u32 canonical_word(u32 x, u32 p) {
 #if M1_MIN
     x = umin32(x, x - p); x = umin32(x, x - p); x = umin32(x, x - p);
 #else
-    if (x >= p) x -= p;
-    if (x >= p) x -= p;
-    if (x >= p) x -= p;
+    x = umin32(x, x - p);
+    x = umin32(x, x - p);
+    x = umin32(x, x - p);
 #endif
     return x;
 }
 GPU31_FHD inline u32 finish(u64 sum, Weight radix, u32 p) {
     const u32 lo = canonical_word(u32(sum), p);
     u32 hi = lazy_product(u32(sum >> 32), radix, p);
-    if (hi >= p) hi -= p;
+    hi = umin32(hi, hi - p);
     return add(lo, hi, p);
 }
 
@@ -156,15 +156,15 @@ GPU31_FHD inline u32 reduce128(u32 lo32, u32 mid32, u32 hiw,
                                const Weight& w0, u32 p, u64 r2) {
     u32 acc = canonical_word(lo32, p);
     u32 t = lazy_product(mid32, w0, p);
-    if (t >= p) t -= p;
-    acc += t; if (acc >= p) acc -= p;
+    t = umin32(t, t - p);
+    acc += t; acc = umin32(acc, acc - p);
     const u64 z = u64(hiw) * r2;            // hiw < 16, r2 < p < 2^31 -> z < 2^36
     const u32 zl = u32(z), zh = u32(z >> 32);
     const u32 zlc = canonical_word(zl, p);
     u32 tz = lazy_product(zh, w0, p);
-    if (tz >= p) tz -= p;
-    t = zlc + tz; if (t >= p) t -= p;
-    acc += t; if (acc >= p) acc -= p;
+    tz = umin32(tz, tz - p);
+    t = zlc + tz; t = umin32(t, t - p);
+    acc += t; acc = umin32(acc, acc - p);
     return acc;
 }
 GPU31_FHD inline u32 convert(const u32* input, const Weight* w, unsigned limbs, u32 p) {
@@ -199,7 +199,7 @@ GPU31_FHD inline u32 weight_residue(u32 r, const PrimeInfo& p) {
     const u32 quot = u32((u64(r) * p.inv_shoup) >> 32);
 #endif
     const u32 t = r * p.inv - quot * p.p;
-    return t >= p.p ? t - p.p : t;
+    return umin32(t, t - p.p);
 }
 template <unsigned Stride>
 GPU31_FHD inline u32 shifted_word(const u32* q, unsigned limbs, unsigned pos, unsigned shift) {
