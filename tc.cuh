@@ -366,6 +366,10 @@ __host__ __device__ inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntile
 // TC32: primes/weights of the group by cp.async into shared (encode256).
 // TC33: fused_high __launch_bounds__(256,3): cap registers at 85 so the 3
 // CTAs/SM that TC31's 32.8 KB smem allows are not blocked by registers.
+// M6: fused_high radix-16 (q==0, R8F) processes a and b one after the other.
+#ifndef M6_SPLIT
+#define M6_SPLIT 1
+#endif
 #ifndef TC33_FH3
 #define TC33_FH3 1
 #endif
@@ -1549,6 +1553,51 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + k * H], p);
 #pragma unroll
             for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
+#if M6_SPLIT && OC10_R16 && OC12_IO && R8F_XCHG
+            if (q == 0 && ef256) {
+                // M6: operands one at a time -> 16 live values instead of 32
+                // (fused_high is capped at 85 regs by launch_bounds(256,3)).
+#pragma unroll 1
+                for (unsigned o = 0; o < 2; ++o) {
+                    const u32* __restrict__ src = o ? rb : ra;
+                    u32* dsh = o ? sb : sa;
+                    u32 v[16];
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) {
+                        const unsigned row = r0 + i * H;
+                        const u64 ad = r8f ? plane + (u64(bx) * HC + row) * 32 + lane
+                                           : plane + u64(row) * NT_TILE + low;
+                        v[i] = src[ad];
+                    }
+                    const bool up = (lane & 16) != 0;
+#pragma unroll
+                    for (unsigned r = 0; r < 8; ++r) {
+                        u32 x = up ? v[r] : v[r + 8];
+                        x = __shfl_xor_sync(0xffffffffu, x, 16);
+                        if (up) v[r] = x; else v[r + 8] = x;
+                        gpu31::butterfly(v[r], v[r + 8], w8, p);
+                        x = up ? v[r] : v[r + 8];
+                        x = __shfl_xor_sync(0xffffffffu, x, 16);
+                        if (up) v[r] = x; else v[r + 8] = x;
+                    }
+#pragma unroll
+                    for (unsigned i = 0; i < 16; i += 2) gpu31::butterfly(v[i], v[i+1], t1, p);
+#pragma unroll
+                    for (unsigned k = 0; k < 2; ++k)
+#pragma unroll
+                        for (unsigned i = k; i < 16; i += 4) gpu31::butterfly(v[i], v[i+2], t2[k], p);
+#pragma unroll
+                    for (unsigned k = 0; k < 4; ++k)
+#pragma unroll
+                        for (unsigned i = k; i < 16; i += 8) gpu31::butterfly(v[i], v[i+4], t4[k], p);
+#pragma unroll
+                    for (unsigned i = 0; i < 8; ++i) gpu31::butterfly(v[i], v[i+8], t8[i], p);
+#pragma unroll
+                    for (unsigned i = 0; i < 16; ++i) dsh[ix[i]] = v[i];
+                }
+                continue;
+            }
+#endif
             u32 av[16], bv[16];
 #if OC10_R16 && OC12_IO
             if (q == 0) {
