@@ -766,6 +766,10 @@ void* fherma_init(const fherma::Point& p) {
                                  int(d.tc_enc), int(d.tc_crt), int(d.tc_fuse_decode), int(d.tc_ntt),
                                  int(d.tc_efl), int(d.tc_chunk));
                 }
+#if P5_PROBE
+                if (state->gpu31_dev && state->gpu31_dev->tc_ntt)
+                    state->gpu31_dev->p5_probe();
+#endif
 
                 // Try the conflict-free CRT, keeping it only if bit-identical to
                 // the reference CRT on deterministic residue data.

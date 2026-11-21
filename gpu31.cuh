@@ -1725,6 +1725,7 @@ private:
     }
 
 #if P5_PROBE
+public:
     // OC53/P5: phase-mask probe of fused_high ONLY.  Launches tc::fh_probe<PM>
     // directly (no other kernels), B=128, one warm-up + 3 timed runs per mask.
     // Input residues are whatever is in d_ra/d_rb (values irrelevant: timing).
@@ -1755,6 +1756,7 @@ private:
             d_pk_fwd, 1u, d_pk_inv, 1u);
         return cudaGetLastError();
     }
+private:
 #endif
 
     template <bool Two>
