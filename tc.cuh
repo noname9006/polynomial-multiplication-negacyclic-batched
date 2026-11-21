@@ -2833,6 +2833,9 @@ constexpr unsigned E2_ROWS = 256;
 // OC28_EPICONF: 272 (== 16 mod 32) removes the epilogue's 2-way bank conflict
 // on the q=0/q=1 sT rows; 0 restores the original 264 (== 8 mod 32).
 constexpr unsigned E2_PT = OC28_EPICONF ? (E2_ROWS + E2_ROWS / 16) : (E2_ROWS + E2_ROWS / 32);
+#ifndef M16_ST16
+#define M16_ST16 1
+#endif
 #ifndef M15_CP16
 #define M15_CP16 1
 #endif
@@ -3181,6 +3184,22 @@ encode256_dev(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             // bx = (low>>1)&15, lane = (low>>6)<<2 | ((low>>5)&1)<<1 | (low&1).
             // idx = q | bx(4) | l4(4): 16 consecutive idx = one 64 B run.
             const unsigned row = start >> 9, hi = (start >> 8) & 1;
+#if M16_ST16
+            // M16: 4 consecutive l4 per thread -> one 16-byte store.
+            for (unsigned c = tid; c < EF_PR * E2_ROWS / 4; c += 256) {
+                const unsigned q = c / (E2_ROWS / 4), r = (c % (E2_ROWS / 4)) * 4;
+                const unsigned bxx = (r >> 5) + ((r >> 4) & 1) * 8, l4 = r & 15;
+                const unsigned pb = ((l4 >> 2) << 6) | (bxx << 1);
+                const unsigned kk = nt0 * 2 + q;
+                if (kk < K) {
+                    uint4 v;
+                    v.x = sT[q][padw(pb)];      v.y = sT[q][padw(pb | 1)];
+                    v.z = sT[q][padw(pb | 32)]; v.w = sT[q][padw(pb | 33)];
+                    *reinterpret_cast<uint4*>(dst + rbase + u64(kk) * n + (u64(bxx) * (n >> 9) + row) * 32 + (hi << 4) + l4) = v;
+                }
+            }
+            if (false)
+#endif
             for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
                 const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
                 // half-warps take bx and bx+8: their sT banks are disjoint (<=2-way)
