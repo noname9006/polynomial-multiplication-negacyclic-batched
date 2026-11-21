@@ -9,17 +9,31 @@
 - GPU не нужен: код проверяется прогонами на FHERMA;
 - для локальной проверки синтаксиса — g++ (C++17) и sh: `sh tools/nvsyntax/check.sh`.
 
-## 2. Доступ к GitHub (fine-grained токен)
-1. GitHub (аккаунт владельца репозитория) → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
-2. Срок — 30 дней. Repository access: Only select repositories → `polynomial-multiplication-negacyclic-batched`.
-3. Permissions → Repository permissions → Contents: Read and write. Больше ничего.
-4. На машине агента:
+## 2. Доступ к GitHub (deploy key — ключ только для этого репозитория)
+Deploy key — SSH-ключ, привязанный к одному репозиторию, а не к аккаунту. Токен аккаунта агенту не нужен.
+
+1. На машине агента создайте ключ (без пароля, чтобы агент мог пушить сам):
    ```
-   git config --global credential.helper manager
-   git clone https://github.com/noname9006/polynomial-multiplication-negacyclic-batched.git
+   ssh-keygen -t ed25519 -C "agent-y" -f ~/.ssh/y_deploy -N ""
    ```
-   При первом `git push` логин — владелец репозитория, пароль — токен. Git Credential Manager его запомнит.
-5. Рекомендуется защитить `master`: Settings → Branches → правило для `master`, запись только владельцу. В master вливает только основной агент.
+2. Скопируйте публичную часть (`~/.ssh/y_deploy.pub`, **не** файл без `.pub`).
+3. GitHub → репозиторий `polynomial-multiplication-negacyclic-batched` → Settings → Deploy keys → Add deploy key: название `agent-y`, вставить ключ, отметить **Allow write access** → Add key.
+4. На машине агента добавьте в `~/.ssh/config`:
+   ```
+   Host github-y
+       HostName github.com
+       User git
+       IdentityFile ~/.ssh/y_deploy
+       IdentitiesOnly yes
+   ```
+5. Клонируйте и проверьте:
+   ```
+   git clone git@github-y:noname9006/polynomial-multiplication-negacyclic-batched.git
+   ssh -T git@github-y
+   ```
+   Вторая команда должна ответить приветствием с именем репозитория.
+6. Защитите `master`: Settings → Branches → Add rule → `master` → Restrict who can push → только владелец. Deploy key с записью может пушить в любую ветку, а в master вливает только основной агент.
+7. Отключить доступ — удалить ключ в Settings → Deploy keys.
 
 ## 3. Доступ к FHERMA (токен CLI)
 1. На сайте FHERMA: Command line → Issue a token (показывается один раз, действует 90 дней).
@@ -35,7 +49,7 @@
 4. Перезапустите терминал и агента, чтобы он увидел переменную.
 5. Проверьте сами: `fherma --help` и любая команда, читающая аккаунт.
 
-Токен не вписывать в файлы репозитория, задания, `.env`, аргументы команд и чат. После челленджа отозвать оба токена.
+Токен не вписывать в файлы репозитория, задания, `.env`, аргументы команд и чат. После челленджа отозвать токен FHERMA и удалить deploy key.
 
 ## 4. Запуск агента
 Откройте агента в папке клона и дайте ему первым сообщением:
