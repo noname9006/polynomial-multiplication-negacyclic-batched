@@ -1297,7 +1297,10 @@ crt_tc2_t2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict_
     int acc[2][4][2][2][4];   // 2 tiles x 4 nt-slots x 2 mt x 2 q x 4 = 128 ints
     // 2-3. uniform nt0 loop; each ks load feeds 4 mma (2 tiles x 2 m-tiles).
     // acc[t][mt][q][4] = 2*2*2*4 = 32 ints.
-    for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 8) {
+#pragma unroll
+    for (unsigned sl = 0; sl < 4; ++sl) {   // t51: compile-time sl -> acc stays in registers
+        const unsigned nt0 = warp + sl * 8u;
+        if (nt0 >= cfg.NT) break;
         const unsigned ntA = nt0, ntB = nt0 + 4u;
         const bool hasB = ntB < cfg.NT;
 #pragma unroll
@@ -1320,7 +1323,6 @@ crt_tc2_t2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict_
                     const u32* r0 = sA + (t*32u + mt*16u + g)*cfg.SA + ks*8u + tt;
                     const u32* r1 = r0 + 8u*cfg.SA;
                     const u32 x0=r0[0],x1=r1[0],x2=r0[4],x3=r1[4];
-                    const unsigned sl=(nt0-warp)/8u;
                     mma_u8(acc[t][sl][mt][0],x0,x1,x2,x3,b0.x,b0.y);
                     if (hasB) mma_u8(acc[t][sl][mt][1],x0,x1,x2,x3,b1.x,b1.y);
                 }
@@ -1333,6 +1335,7 @@ crt_tc2_t2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict_
     const u64 obase = u64(pair) * n * l;
     for (unsigned t = 0; t < 2; ++t) {
         const unsigned rows_here = (n - (start + t * 32u) < 32u) ? (n - (start + t*32u)) : 32u;
+#pragma unroll
         for (unsigned sl = 0; sl < 4; ++sl) {
             const unsigned nt0 = warp + sl * 8u;
             if (nt0 >= cfg.NT) break;
