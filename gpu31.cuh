@@ -1254,11 +1254,33 @@ struct Device {
                              !r8f_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
             if (part != 2) {
             if (tc_efl && ef256) {
+#if M7_CL > 1
+                {
+                    // M7 (cluster only when the row-tile count divides; the kernel reads
+                    // the actual cluster size, so a plain launch is also correct): clusters of M7_CL row tiles share the group tables (TMA multicast)
+                    cudaLaunchConfig_t cf = {};
+                    cudaLaunchAttribute at[1];
+                    at[0].id = cudaLaunchAttributeClusterDimension;
+                    at[0].val.clusterDim.x = ((n / tc::E2_ROWS) % M7_CL == 0) ? M7_CL : 1;
+                    at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+                    cf.gridDim = dim3(n / tc::E2_ROWS, 2, B); cf.blockDim = dim3(256, 1, 1);
+                    cf.dynamicSmemBytes = 0; cf.stream = stream; cf.attrs = at; cf.numAttrs = 1;
+                    const u32* ca = pa; const u32* cb_ = pb;
+                    const uint2* fe = d_fenc; const uint2* feb = r8f ? d_fenc_b : nullptr;
+                    const gpu31::Prime* pr_ = d_primes; const gpu31::Weight* wt_ = d_weights;
+                    const u32* pk_ = d_pk_fwd;
+                    st = cudaLaunchKernelEx(&cf, tc::encode_fwdlow256, ca, cb_, pra, prb, fe, pr_, wt_,
+                                            pk_, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u, feb);
+                    if (st == cudaSuccess) st = cudaGetLastError();
+                    if (st != cudaSuccess) return st;
+                }
+#else
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
                     d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,
                     r8f ? d_fenc_b : nullptr);
                 if ((st = cudaGetLastError()) != cudaSuccess) return st;
+#endif
                 if (prof) { cudaEventRecord(ev_[1], stream); cudaEventRecord(ev_[2], stream);
                                   cudaEventRecord(ev_[3], stream); }
             } else if (tc_efl) {

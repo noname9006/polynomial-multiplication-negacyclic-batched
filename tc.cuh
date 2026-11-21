@@ -2776,6 +2776,46 @@ encode_fwdlow(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 // A fragments in registers); stage 8 is done by fused_high (ef256).
 // grid (n/256, 2, B), block 256, static smem ~23.8 KB.
 // ---------------------------------------------------------------------------
+// M7: encode256 group tables (twiddle rows + B fragments) are fetched once per
+// cluster of M7_CL CTAs with TMA bulk multicast instead of once per CTA
+// (P3: table reload = 2.25 ms, 14.7 GB from L2).  1 = off (master path).
+#ifndef M7_CL
+#define M7_CL 2
+#endif
+#if M7_CL > 1 && defined(__CUDACC__)
+__device__ __forceinline__ unsigned m7_rank() {
+    unsigned r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r;
+}
+__device__ __forceinline__ unsigned m7_ncta() {
+    unsigned r; asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(r)); return r;
+}
+__device__ __forceinline__ void m7_csync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+__device__ __forceinline__ void m7_bar_init(unsigned long long* b) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(unsigned(__cvta_generic_to_shared(b))) : "memory");
+}
+__device__ __forceinline__ void m7_expect(unsigned long long* b, unsigned bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(unsigned(__cvta_generic_to_shared(b))), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void m7_bulk_mc(void* dst, const void* src, unsigned bytes,
+                                           unsigned long long* b, unsigned short mask) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster"
+                 " [%0], [%1], %2, [%3], %4;"
+                 :: "r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src), "r"(bytes),
+                    "r"(unsigned(__cvta_generic_to_shared(b))), "h"(mask) : "memory");
+}
+__device__ __forceinline__ void m7_wait(unsigned long long* b, unsigned parity) {
+    const unsigned a = unsigned(__cvta_generic_to_shared(b));
+    unsigned done = 0;
+    while (!done) {
+        asm volatile("{\n\t.reg .pred p;\n\t"
+                     "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n\t"
+                     "selp.u32 %0, 1, 0, p;\n\t}" : "=r"(done) : "r"(a), "r"(parity) : "memory");
+    }
+}
+#endif
 constexpr unsigned E2_ROWS = 256;
 // OC28_EPICONF: 272 (== 16 mod 32) removes the epilogue's 2-way bank conflict
 // on the q=0/q=1 sT rows; 0 restores the original 264 (== 8 mod 32).
@@ -2796,6 +2836,9 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     __shared__ __align__(16) uint2 sBb[2][EF_NTB * ENC_KS_MAX * 32];
     __shared__ __align__(16) gpu31::Prime sPb[2][EF_PR];    // TC32
     __shared__ __align__(16) gpu31::Weight sWb[2][EF_PR];
+#if M7_CL > 1
+    __shared__ __align__(8) unsigned long long m7bar[2];
+#endif
 #else
     __shared__ u32 sR[EF_PR][E2_ROWS];
     __shared__ uint2 sB[EF_NTB * ENC_KS_MAX * 32];
@@ -2853,10 +2896,26 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         }
     }
 #endif
+#if TC30_CPA && M7_CL > 1
+    const unsigned m7rk = m7_rank(), m7n = m7_ncta();
+#endif
 #if TC30_CPA
     // TC30: group twiddles/B fragments arrive by cp.async into a double
     // buffer one group ahead (no registers, overlaps the previous group).
     auto issue = [&](unsigned nb, unsigned buf) {
+#if M7_CL > 1
+        if (tid == 0) {
+            const unsigned vq = (K > nb * 2) ? ((K - nb * 2) < EF_PR ? (K - nb * 2) : EF_PR) : 0u;
+            const unsigned vt = (NT > nb) ? ((NT - nb) < EF_NTB ? (NT - nb) : EF_NTB) : 0u;
+            const unsigned bb = vt * KS * 32u * 8u;
+            m7_expect(&m7bar[buf], vq * E2_ROWS * 4u + bb);
+            const unsigned short mask = (unsigned short)((1u << m7n) - 1u);
+            for (unsigned q = m7rk; q < vq; q += m7n)
+                m7_bulk_mc(&sRb[buf][q][0], packed + u64(nb * 2 + q) * TC_LT, E2_ROWS * 4u, &m7bar[buf], mask);
+            if (bb && (vq % m7n) == m7rk)
+                m7_bulk_mc(&sBb[buf][0], frag + std::size_t(nb) * KS * 32, bb, &m7bar[buf], mask);
+        }
+#else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
             const unsigned kk = nb * 2 + q;
@@ -2873,6 +2932,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned sa = unsigned(__cvta_generic_to_shared(&sBb[buf][idx]));
             asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
         }
+#endif
 #if TC32_PW
         if (tid < 2 * EF_PR) {
             // TC32: this group's primes and first-limb weights ride along,
@@ -2893,6 +2953,13 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
 #endif
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
+#if M7_CL > 1
+    if (tid == 0) {
+        m7_bar_init(&m7bar[0]); m7_bar_init(&m7bar[1]);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    m7_csync();   // peers' barriers initialised before any multicast lands
+#endif
     issue(0, 0);
 #endif
     for (unsigned nt0 = 0; nt0 < NT; nt0 += EF_NTB) {
@@ -2906,7 +2973,12 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         const gpu31::Weight* sW = sWb[cb];
 #endif
         asm volatile("cp.async.wait_group 0;" ::: "memory");
+#if M7_CL > 1
+        m7_wait(&m7bar[cb], ((nt0 / EF_NTB) >> 1) & 1u);
+        m7_csync();   // every cluster CTA finished the previous group -> buffer cb^1 free
+#else
         __syncthreads();
+#endif
         if (nt0 + EF_NTB < NT) issue(nt0 + EF_NTB, cb ^ 1);
 #else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
@@ -3116,6 +3188,9 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
         TCP_T(g5);
         pe[0] += g1 - g0; pe[1] += g2 - g1; pe[2] += g3 - g2; pe[3] += g4 - g3; pe[4] += g5 - g4;
     }
+#if TC30_CPA && M7_CL > 1
+    m7_csync();
+#endif
     TCP_ADD(10, 0, pe[0]); TCP_ADD(11, 0, pe[1]); TCP_ADD(12, 0, pe[2]);
     TCP_ADD(13, 0, pe[3]); TCP_ADD(14, 0, pe[4]);
 }
