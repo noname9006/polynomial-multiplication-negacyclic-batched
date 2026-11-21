@@ -1254,6 +1254,11 @@ struct Device {
                              !r8f_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
             if (part != 2) {
             if (tc_efl && ef256) {
+                if (M12_ENCSPEC && r8f && n == 65536 && l == 55 && k == 114 && logN == 16 &&
+                    enc_KS == 7 && enc_NT == 57)
+                tc::encode256_spec<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
+                    pa, pb, pra, prb, d_fenc, d_primes, d_weights, d_pk_fwd, d_fenc_b);
+                else
                 tc::encode_fwdlow256<<<dim3(n / tc::E2_ROWS, 2, B), 256, 0, stream>>>(
                     pa, pb, pra, prb, d_fenc, d_primes, d_weights,
                     d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,

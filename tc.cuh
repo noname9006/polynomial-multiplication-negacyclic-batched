@@ -2810,14 +2810,23 @@ constexpr unsigned E2_ROWS = 256;
 // OC28_EPICONF: 272 (== 16 mod 32) removes the epilogue's 2-way bank conflict
 // on the q=0/q=1 sT rows; 0 restores the original 264 (== 8 mod 32).
 constexpr unsigned E2_PT = OC28_EPICONF ? (E2_ROWS + E2_ROWS / 16) : (E2_ROWS + E2_ROWS / 32);
-__global__ void __launch_bounds__(256, 2)
-encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
+#ifndef M12_ENCSPEC
+#define M12_ENCSPEC 1
+#endif
+// M12: SPEC=true folds the benchmark point (n=65536, l=55, K=114, logN=16,
+// KS=7, NT=57, r8f=1) into the encode body, like M9 did for fused_high.
+template <bool SPEC>
+__device__ __forceinline__ void
+encode256_dev(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  u32* __restrict__ ra, u32* __restrict__ rb,
                  const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
                  const gpu31::Weight* __restrict__ weights,
-                 const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
-                 unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0,
-                 const uint2* __restrict__ frag_b = nullptr) {
+                 const u32* __restrict__ packed, unsigned n_a, unsigned l_a, unsigned K_a,
+                 unsigned logN_a, unsigned KS_a, unsigned NT_a, unsigned r8f_a,
+                 const uint2* __restrict__ frag_b) {
+    const unsigned n = SPEC ? 65536u : n_a, l = SPEC ? 55u : l_a, K = SPEC ? 114u : K_a;
+    const unsigned logN = SPEC ? 16u : logN_a, KS = SPEC ? 7u : KS_a, NT = SPEC ? 57u : NT_a;
+    const unsigned r8f = SPEC ? 1u : r8f_a;
     __shared__ u32 sT[EF_PR][E2_PT];
     // R8F: operand b uses the CRT-weight-scaled table (term = residue in CRT)
     if (blockIdx.y && frag_b) frag = frag_b;
@@ -3148,6 +3157,24 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     }
     TCP_ADD(10, 0, pe[0]); TCP_ADD(11, 0, pe[1]); TCP_ADD(12, 0, pe[2]);
     TCP_ADD(13, 0, pe[3]); TCP_ADD(14, 0, pe[4]);
+}
+__global__ void __launch_bounds__(256, 2)
+encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
+                 u32* __restrict__ ra, u32* __restrict__ rb,
+                 const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
+                 const gpu31::Weight* __restrict__ weights,
+                 const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
+                 unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0,
+                 const uint2* __restrict__ frag_b = nullptr) {
+    encode256_dev<false>(src_a, src_b, ra, rb, frag, primes, weights, packed, n, l, K, logN, KS, NT, r8f, frag_b);
+}
+__global__ void __launch_bounds__(256, 2)
+encode256_spec(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
+               u32* __restrict__ ra, u32* __restrict__ rb,
+               const uint2* __restrict__ frag, const gpu31::Prime* __restrict__ primes,
+               const gpu31::Weight* __restrict__ weights,
+               const u32* __restrict__ packed, const uint2* __restrict__ frag_b) {
+    encode256_dev<true>(src_a, src_b, ra, rb, frag, primes, weights, packed, 0, 0, 0, 0, 0, 0, 0, frag_b);
 }
 
 // ---------------------------------------------------------------------------
