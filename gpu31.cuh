@@ -66,8 +66,10 @@ struct Prime {
 #endif
 #if M11_P30
 #define GPU31_PTOP 30
+#define GPU31_CSH 29
 #else
 #define GPU31_PTOP 31
+#define GPU31_CSH 30
 #endif
 GPU31_FHD inline u32 umin32(u32 x, u32 y) {
     return x < y ? x : y;   // IMNMX.U32
@@ -1435,7 +1437,7 @@ private:
             {
                 std::vector<u32> cm(plan_.K);
                 for (unsigned kk = 0; kk < plan_.K; ++kk)
-                    cm[kk] = u32((u64(1) << 62) / plan_.primes[kk].p);
+                    cm[kk] = u32((u64(1) << (32 + GPU31_CSH)) / plan_.primes[kk].p);   // M11: 2^61/p for p<2^30
                 upload_u32(d_corr_m, cm);
                 if (plan_.K <= tc::CRT_KMAX_C) {
                     if (cudaMemcpyToSymbol(tc::c_crt_corr, cm.data(), cm.size() * sizeof(u32)) != cudaSuccess ||

@@ -576,7 +576,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
                 if (j < K) {
                     const u32 term = gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
-                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                    fsum += (u64(term) * c_crt_corr[j]) >> GPU31_CSH;
                 }
             }
         }
@@ -592,7 +592,7 @@ crt_tc(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ ou
                 term = gpu31::weight_residue(r, pl.primes[j]);
         }
         sA[c * cfg.SA + j] = term;
-        fsum += (u64(term) * corr_m[j]) >> 30;
+        fsum += (u64(term) * corr_m[j]) >> GPU31_CSH;
     }
     }
     for (unsigned j = K + 1 + jg; j < W; j += 2) sA[c * cfg.SA + j] = 0;
@@ -1014,7 +1014,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         __syncthreads();
 #pragma unroll 4
         for (unsigned j = jg; j < K; j += NG)
-            fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> 30;
+            fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> GPU31_CSH;
     } else if (untw_inv && K <= CRT_KMAX_C) {
         // TC11: batched loads (8 independent residue+untwist pairs in flight),
         // prime and correction constants from __constant__ (warp-uniform j).
@@ -1035,7 +1035,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                         ? r[q]
                         : gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
-                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                    fsum += (u64(term) * c_crt_corr[j]) >> GPU31_CSH;
                 }
             }
         }
@@ -1053,7 +1053,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
                 term = gpu31::weight_residue(r, pl.primes[j]);
         }
         sA[c * cfg.SA + j] = term;
-        fsum += (u64(term) * corr_m[j]) >> 30;
+        fsum += (u64(term) * corr_m[j]) >> GPU31_CSH;
     }
     }
     for (unsigned j = K + 1 + jg; j < W; j += NG) sA[c * cfg.SA + j] = 0;
@@ -1274,7 +1274,7 @@ crt_tc2_r64(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict
                 if (j < K && j % NG == jg) {
                     const u32 term = src[p * CRT2_R64_ROWS + c];
                     sA[c * cfg.SA + j] = term;
-                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                    fsum += (u64(term) * c_crt_corr[j]) >> GPU31_CSH;
                 }
             }
             __syncthreads();   // all reads of buf done before it is reused
@@ -1299,7 +1299,7 @@ crt_tc2_r64(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict
                         ? r[q]
                         : gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
                     sA[c * cfg.SA + j] = term;
-                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                    fsum += (u64(term) * c_crt_corr[j]) >> GPU31_CSH;
                 }
             }
         }
@@ -1317,7 +1317,7 @@ crt_tc2_r64(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict
                 term = gpu31::weight_residue(r, pl.primes[j]);
         }
         sA[c * cfg.SA + j] = term;
-        fsum += (u64(term) * corr_m[j]) >> 30;
+        fsum += (u64(term) * corr_m[j]) >> GPU31_CSH;
     }
     }
     for (unsigned j = K + 1 + jg; j < W; j += NG) sA[c * cfg.SA + j] = 0;
@@ -3331,7 +3331,7 @@ inv_crt(gpu31::CrtArgs pl, const u32* __restrict__ rc, u32* __restrict__ out,
         const unsigned row = tid >> 3, q = tid & 7;
         u64 fsum = 0;
         for (unsigned j = q; j < K; j += 8)
-            fsum += (u64(sA[row * cfg.SA + j]) * c_crt_corr[j]) >> 30;
+            fsum += (u64(sA[row * cfg.SA + j]) * c_crt_corr[j]) >> GPU31_CSH;
         fsum += __shfl_xor_sync(0xffffffffu, fsum, 1);
         fsum += __shfl_xor_sync(0xffffffffu, fsum, 2);
         fsum += __shfl_xor_sync(0xffffffffu, fsum, 4);
