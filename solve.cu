@@ -931,6 +931,10 @@ void fherma_h2d(void* state, const fherma::Inputs& in) {
     if (cudaMemcpyAsync(s->d_b, in.b.data.data(), bytes, cudaMemcpyHostToDevice, s->stream) !=
         cudaSuccess)
         return;
+    // M8: wait for the copies here, so no tail of the input transfer is left
+    // queued ahead of fherma_run's kernels (it would be counted in the ranked
+    // time). Waiting is not computation; the function still only copies.
+    if (cudaStreamSynchronize(s->stream) != cudaSuccess) return;
     s->inputs_on_device = true;
 }
 
