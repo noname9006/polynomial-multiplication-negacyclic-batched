@@ -367,7 +367,7 @@ __host__ __device__ inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntile
 // TC33: fused_high __launch_bounds__(256,3): cap registers at 85 so the 3
 // CTAs/SM that TC31's 32.8 KB smem allows are not blocked by registers.
 #ifndef TC33_FH3
-#define TC33_FH3 1
+#define TC33_FH3 0   // M5: test without the 85-reg cap (P5: fh is butterfly-bound, local=16)
 #endif
 #ifndef TC32_PW
 #define TC32_PW 1
@@ -2226,7 +2226,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
     TCP_ADD(8, f3, f4); TCP_ADD(9, f4, f5);
 }
 
-__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 2)
 fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
@@ -2240,7 +2240,7 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
 // R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
 // grid (16, K, B), block (32, 8); requires logH == 7 (one row per warp) and
 // the OC31 tile-major output.  out must not alias ra (read by other CTAs).
-__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 2)
 fused_high_r8(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ out,
               const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
               const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
@@ -2353,7 +2353,7 @@ __device__ __forceinline__ void tc36_signal(unsigned* x) {
     __syncthreads();
     if (threadIdx.x == 0 && threadIdx.y == 0) atomicAdd(x, 1u);
 }
-__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 2)
 fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ ring,
        u32* __restrict__ dst2, const gpu31::Prime* __restrict__ primes,
        const u32* __restrict__ twf, const u32* __restrict__ twi, unsigned n, unsigned K,
