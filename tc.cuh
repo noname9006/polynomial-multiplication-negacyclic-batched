@@ -2289,6 +2289,21 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                    pki, nullptr, r8f);
 }
 
+#ifndef M10_FH7
+#define M10_FH7 1
+#endif
+// M10: production fused_high (logH=7, R8F, ef256) as its own kernel, so the
+// generic <0> branch does not share its register allocation / stack frame.
+__global__ void __launch_bounds__(256, TC33_FH3 ? 3 : 1)
+fused_high7(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
+            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
+            const u32* __restrict__ twi, unsigned n, unsigned K,
+            const u32* __restrict__ pkf, const u32* __restrict__ pki) {
+    fused_high_dev<7>(ra, rb, rc, primes, twf, twi, n, K, 7u, pkf, 1u,
+                      blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
+                      pki, nullptr, 1u);
+}
+
 // R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
 // grid (16, K, B), block (32, 8); requires logH == 7 (one row per warp) and
 // the OC31 tile-major output.  out must not alias ra (read by other CTAs).
