@@ -1380,6 +1380,17 @@ struct Device {
                                                          OC31_TILE_RC ? n / tc::NT_TILE : 0);
                 } else
 #endif
+#if OC51_T2
+                if (r8f && (n & 63u) == 0) {
+                    tc::CrtTc c2t = c2;
+                    c2t.SA = tc::oc51_sa(crt_cfg.KS, crt2_SA);
+                    const std::size_t shm = tc::oc51_smem(c2t.SA, c2t.SX);
+                    tc::crt_tc2_t2<<<dim3(n / 64u, 1, B), 128, shm, stream>>>(
+                        crt_args_, prc, pc, d_fcrt, c2t,
+                        d_primes, d_untw_slot, logN, d_corr_m, n / 32u,
+                        d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u);
+                } else
+#endif
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
                               crt2_shared, stream>>>(crt_args_, r8f ? prc : (OC31_TILE_RC ? pio : prc), pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
