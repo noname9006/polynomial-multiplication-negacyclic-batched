@@ -2833,6 +2833,9 @@ constexpr unsigned E2_ROWS = 256;
 // OC28_EPICONF: 272 (== 16 mod 32) removes the epilogue's 2-way bank conflict
 // on the q=0/q=1 sT rows; 0 restores the original 264 (== 8 mod 32).
 constexpr unsigned E2_PT = OC28_EPICONF ? (E2_ROWS + E2_ROWS / 16) : (E2_ROWS + E2_ROWS / 32);
+#ifndef M15_CP16
+#define M15_CP16 1
+#endif
 #ifndef M12_ENCSPEC
 #define M12_ENCSPEC 1
 #endif
@@ -2919,6 +2922,26 @@ encode256_dev(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
     // TC30: group twiddles/B fragments arrive by cp.async into a double
     // buffer one group ahead (no registers, overlaps the previous group).
     auto issue = [&](unsigned nb, unsigned buf) {
+#if M15_CP16
+        // M15: 16-byte cp.async (4 words / 2 uint2 per copy) instead of 4/8-byte.
+        for (unsigned c = tid; c < EF_PR * E2_ROWS / 4; c += 256) {
+            const unsigned q = c / (E2_ROWS / 4), r = (c % (E2_ROWS / 4)) * 4;
+            const unsigned kk = nb * 2 + q;
+            const bool ok = kk < K;
+            const u32* gp = packed + (ok ? u64(kk) * TC_LT + r : 0);
+            const unsigned sa = unsigned(__cvta_generic_to_shared(&sRb[buf][q][r]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 16 : 0) : "memory");
+        }
+        for (unsigned c = tid; c < EF_NTB * KS * 16; c += 256) {
+            const unsigned idx = c * 2;
+            const unsigned j = idx / (KS * 32), rem = idx - j * (KS * 32);
+            const unsigned nt = nb + j;
+            const bool ok = nt < NT;
+            const uint2* gp = frag + (ok ? std::size_t(nt) * KS * 32 + rem : 0);
+            const unsigned sa = unsigned(__cvta_generic_to_shared(&sBb[buf][idx]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 16 : 0) : "memory");
+        }
+#else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, r = idx % E2_ROWS;
             const unsigned kk = nb * 2 + q;
@@ -2935,6 +2958,7 @@ encode256_dev(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned sa = unsigned(__cvta_generic_to_shared(&sBb[buf][idx]));
             asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(sa), "l"(gp), "r"(ok ? 8 : 0) : "memory");
         }
+#endif
 #if TC32_PW
         if (tid < 2 * EF_PR) {
             // TC32: this group's primes and first-limb weights ride along,
