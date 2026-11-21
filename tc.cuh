@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <type_traits>
 
 // TC10 (parallel branch): warp-shuffle for the first 5 DIT stages of
 // encode_fwdlow.  Set to 0 for A/B against the original shared-only path.
@@ -1468,6 +1469,41 @@ __device__ __forceinline__ u32 r8_ld_cluster(const u32* local, unsigned rank) {
     asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(ra) : "memory");
     return v;
 }
+#ifndef M11B_LAZY
+#define M11B_LAZY 1
+#endif
+// M11b: arithmetic policies for fused_high_dev.  ArLazy keeps every value in
+// the redundant range [0, 2p) (needs 4p < 2^32, i.e. M11_P30): Montgomery
+// products skip their final correction (a,b < 2p -> ab < 4p^2 < 2^32 p ->
+// result < 2p); add/sub correct against 2p.  Stores to global canonicalize.
+struct ArCanon {
+    static __device__ __forceinline__ u32 mont(u32 a, u32 b, const gpu31::Prime& p) { return gpu31::mont(a, b, p); }
+    static __device__ __forceinline__ u32 add(u32 a, u32 b, u32 p) { return gpu31::add(a, b, p); }
+    static __device__ __forceinline__ u32 sub(u32 a, u32 b, u32 p) { return gpu31::sub(a, b, p); }
+    static __device__ __forceinline__ void butterfly(u32& a, u32& b, u32 w, const gpu31::Prime& p) { gpu31::butterfly(a, b, w, p); }
+    static __device__ __forceinline__ u32 canon(u32 x, u32) { return x; }
+};
+struct ArLazy {
+    static __device__ __forceinline__ u32 mont(u32 a, u32 b, const gpu31::Prime& p) {
+        const u64 t = u64(a) * b;
+        const u32 m = u32(t) * p.neg_inv;
+        return u32((t + u64(m) * p.p) >> 32);
+    }
+    static __device__ __forceinline__ u32 add(u32 a, u32 b, u32 p) {
+        const u32 s = a + b, p2 = 2 * p;
+        return gpu31::umin32(s, s - p2);
+    }
+    static __device__ __forceinline__ u32 sub(u32 a, u32 b, u32 p) {
+        const u32 p2 = 2 * p, d = a - b + p2;
+        return gpu31::umin32(d, d - p2);
+    }
+    static __device__ __forceinline__ void butterfly(u32& a, u32& b, u32 w, const gpu31::Prime& p) {
+        const u32 u = a, v = mont(b, w, p);
+        a = add(u, v, p.p);
+        b = sub(u, v, p.p);
+    }
+    static __device__ __forceinline__ u32 canon(u32 x, u32 p) { return gpu31::umin32(x, x - p); }
+};
 #ifndef M9_LOGH7
 #define M9_LOGH7 1
 #endif
@@ -1508,6 +1544,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
     const unsigned k = by;
     const u64 plane = (u64(bz) * K + k) * n;
     const gpu31::Prime p = primes[k];
+    using Ar = typename std::conditional<(LH == 7 && M11B_LAZY && M11_P30), ArLazy, ArCanon>::type;
     constexpr unsigned TWS = 7 * NT_TILE + 127;
     const u32* tfB = twf + u64(k) * TWS + 7 * NT_TILE;
     const u32* tiB = twi + u64(k) * TWS + 7 * NT_TILE;
@@ -1548,14 +1585,14 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             unsigned ix[16];
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t1 = Ar::mont(waf[s], tfB[(H - 1) + w], p);
             u32 t2[2], t4[4], t8[8];
 #pragma unroll
-            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 2; ++k) t2[k] = Ar::mont(waf[s+1], tfB[(2 * H - 1) + w + k * H], p);
 #pragma unroll
-            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 4; ++k) t4[k] = Ar::mont(waf[s+2], tfB[(4 * H - 1) + w + k * H], p);
 #pragma unroll
-            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 8; ++k) t8[k] = Ar::mont(waf[s+3], tfB[(8 * H - 1) + w + k * H], p);
             u32 av[16], bv[16];
 #if OC10_R16 && OC12_IO
             if (q == 0) {
@@ -1578,8 +1615,8 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                         sa_ = __shfl_xor_sync(0xffffffffu, sa_, 16);
                         sb_ = __shfl_xor_sync(0xffffffffu, sb_, 16);
                         if (up) { av[r] = sa_; bv[r] = sb_; } else { av[r + 8] = sa_; bv[r + 8] = sb_; }
-                        gpu31::butterfly(av[r], av[r + 8], w8, p);
-                        gpu31::butterfly(bv[r], bv[r + 8], w8, p);
+                        Ar::butterfly(av[r], av[r + 8], w8, p);
+                        Ar::butterfly(bv[r], bv[r + 8], w8, p);
                         sa_ = up ? av[r] : av[r + 8]; sb_ = up ? bv[r] : bv[r + 8];
                         sa_ = __shfl_xor_sync(0xffffffffu, sa_, 16);
                         sb_ = __shfl_xor_sync(0xffffffffu, sb_, 16);
@@ -1593,11 +1630,11 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                         const u32 xa = __shfl_xor_sync(0xffffffffu, av[i], 16);
                         const u32 xb = __shfl_xor_sync(0xffffffffu, bv[i], 16);
                         if (up) {
-                            av[i] = gpu31::sub(xa, gpu31::mont(av[i], w8, p), p.p);
-                            bv[i] = gpu31::sub(xb, gpu31::mont(bv[i], w8, p), p.p);
+                            av[i] = Ar::sub(xa, Ar::mont(av[i], w8, p), p.p);
+                            bv[i] = Ar::sub(xb, Ar::mont(bv[i], w8, p), p.p);
                         } else {
-                            av[i] = gpu31::add(av[i], gpu31::mont(xa, w8, p), p.p);
-                            bv[i] = gpu31::add(bv[i], gpu31::mont(xb, w8, p), p.p);
+                            av[i] = Ar::add(av[i], Ar::mont(xa, w8, p), p.p);
+                            bv[i] = Ar::add(bv[i], Ar::mont(xb, w8, p), p.p);
                         }
                     }
                 }
@@ -1609,29 +1646,29 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             }
 #pragma unroll
             for (unsigned i = 0; i < 16; i += 2) {
-                gpu31::butterfly(av[i], av[i+1], t1, p);
-                gpu31::butterfly(bv[i], bv[i+1], t1, p);
+                Ar::butterfly(av[i], av[i+1], t1, p);
+                Ar::butterfly(bv[i], bv[i+1], t1, p);
             }
 #pragma unroll
             for (unsigned k = 0; k < 2; ++k) {
 #pragma unroll
                 for (unsigned i = k; i < 16; i += 4) {
-                    gpu31::butterfly(av[i], av[i+2], t2[k], p);
-                    gpu31::butterfly(bv[i], bv[i+2], t2[k], p);
+                    Ar::butterfly(av[i], av[i+2], t2[k], p);
+                    Ar::butterfly(bv[i], bv[i+2], t2[k], p);
                 }
             }
 #pragma unroll
             for (unsigned k = 0; k < 4; ++k) {
 #pragma unroll
                 for (unsigned i = k; i < 16; i += 8) {
-                    gpu31::butterfly(av[i], av[i+4], t4[k], p);
-                    gpu31::butterfly(bv[i], bv[i+4], t4[k], p);
+                    Ar::butterfly(av[i], av[i+4], t4[k], p);
+                    Ar::butterfly(bv[i], bv[i+4], t4[k], p);
                 }
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) {
-                gpu31::butterfly(av[i], av[i+8], t8[i], p);
-                gpu31::butterfly(bv[i], bv[i+8], t8[i], p);
+                Ar::butterfly(av[i], av[i+8], t8[i], p);
+                Ar::butterfly(bv[i], bv[i+8], t8[i], p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
@@ -1649,32 +1686,32 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             unsigned ix[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2a = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(waf[s+1], tfB[(2 * H - 1) + w + H], p);
+            const u32 t1 = Ar::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t2a = Ar::mont(waf[s+1], tfB[(2 * H - 1) + w], p);
+            const u32 t2b = Ar::mont(waf[s+1], tfB[(2 * H - 1) + w + H], p);
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(waf[s+2], tfB[(4 * H - 1) + w + i * H], p);
+                t4[i] = Ar::mont(waf[s+2], tfB[(4 * H - 1) + w + i * H], p);
             u32 av[8], bv[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
 #pragma unroll
             for (unsigned i = 0; i < 8; i += 2) {
-                gpu31::butterfly(av[i], av[i+1], t1, p);
-                gpu31::butterfly(bv[i], bv[i+1], t1, p);
+                Ar::butterfly(av[i], av[i+1], t1, p);
+                Ar::butterfly(bv[i], bv[i+1], t1, p);
             }
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
                 const u32 tw = (i & 1) ? t2b : t2a;
-                gpu31::butterfly(av[i], av[i+2], tw, p);
-                gpu31::butterfly(bv[i], bv[i+2], tw, p);
+                Ar::butterfly(av[i], av[i+2], tw, p);
+                Ar::butterfly(bv[i], bv[i+2], tw, p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
-                gpu31::butterfly(av[i], av[i+4], t4[i], p);
-                gpu31::butterfly(bv[i], bv[i+4], t4[i], p);
+                Ar::butterfly(av[i], av[i+4], t4[i], p);
+                Ar::butterfly(bv[i], bv[i+4], t4[i], p);
             }
 #if OC10_R16 && OC11_FUSE
             if (oc11_fuse && q + 1 == n8) {
@@ -1684,33 +1721,33 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 // the exact inverse of the three DIT butterflies above, so the
                 // group's data never needs the separate pointwise/DIF passes.
 #pragma unroll
-                for (unsigned i = 0; i < 8; ++i) av[i] = gpu31::mont(av[i], bv[i], p);
+                for (unsigned i = 0; i < 8; ++i) av[i] = Ar::mont(av[i], bv[i], p);
                 u32 q4[4];
 #pragma unroll
                 for (unsigned i = 0; i < 4; ++i)
-                    q4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
-                const u32 q2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
-                const u32 q2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
-                const u32 q1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                    q4[i] = Ar::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
+                const u32 q2a = Ar::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
+                const u32 q2b = Ar::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
+                const u32 q1 = Ar::mont(wai[s], tiB[(H - 1) + w], p);
 #pragma unroll
                 for (unsigned i = 0; i < 4; ++i) {
                     const u32 u = av[i], v = av[i+4];
-                    av[i] = gpu31::add(u, v, p.p);
-                    av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), q4[i], p);
+                    av[i] = Ar::add(u, v, p.p);
+                    av[i+4] = Ar::mont(Ar::sub(u, v, p.p), q4[i], p);
                 }
 #pragma unroll
                 for (unsigned j = 0; j < 4; ++j) {
                     const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
                     const u32 tw = (i & 1) ? q2b : q2a;
                     const u32 u = av[i], v = av[i+2];
-                    av[i] = gpu31::add(u, v, p.p);
-                    av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+                    av[i] = Ar::add(u, v, p.p);
+                    av[i+2] = Ar::mont(Ar::sub(u, v, p.p), tw, p);
                 }
 #pragma unroll
                 for (unsigned i = 0; i < 8; i += 2) {
                     const u32 u = av[i], v = av[i+1];
-                    av[i] = gpu31::add(u, v, p.p);
-                    av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), q1, p);
+                    av[i] = Ar::add(u, v, p.p);
+                    av[i+1] = Ar::mont(Ar::sub(u, v, p.p), q1, p);
                 }
 #pragma unroll
                 for (unsigned i = 0; i < 8; ++i) sa[ix[i]] = av[i];
@@ -1730,9 +1767,9 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            const u32 w = Ar::mont(waf[s], tfB[(H - 1) + within], p);
+            Ar::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
+            Ar::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
         __syncthreads();
     }
@@ -1750,32 +1787,32 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             unsigned ix[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) ix[i] = (r0 + i * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2a = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
+            const u32 t1 = Ar::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t2a = Ar::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
+            const u32 t2b = Ar::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(waf[s + 2], tfB[(4 * H - 1) + w + i * H], p);
+                t4[i] = Ar::mont(waf[s + 2], tfB[(4 * H - 1) + w + i * H], p);
             u32 av[8], bv[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { av[i] = sa[ix[i]]; bv[i] = sb[ix[i]]; }
 #pragma unroll
             for (unsigned i = 0; i < 8; i += 2) {
-                gpu31::butterfly(av[i], av[i + 1], t1, p);
-                gpu31::butterfly(bv[i], bv[i + 1], t1, p);
+                Ar::butterfly(av[i], av[i + 1], t1, p);
+                Ar::butterfly(bv[i], bv[i + 1], t1, p);
             }
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
                 const u32 tw = (i & 1) ? t2b : t2a;
-                gpu31::butterfly(av[i], av[i + 2], tw, p);
-                gpu31::butterfly(bv[i], bv[i + 2], tw, p);
+                Ar::butterfly(av[i], av[i + 2], tw, p);
+                Ar::butterfly(bv[i], bv[i + 2], tw, p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
-                gpu31::butterfly(av[i], av[i + 4], t4[i], p);
-                gpu31::butterfly(bv[i], bv[i + 4], t4[i], p);
+                Ar::butterfly(av[i], av[i + 4], t4[i], p);
+                Ar::butterfly(bv[i], bv[i + 4], t4[i], p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) { sa[ix[i]] = av[i]; sb[ix[i]] = bv[i]; }
@@ -1790,9 +1827,9 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            const u32 w = Ar::mont(waf[s], tfB[(H - 1) + within], p);
+            Ar::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
+            Ar::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
         __syncthreads();
     }
@@ -1809,15 +1846,15 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             const unsigned r0 = (g - w) * 4 + w;
             const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
                            i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
-            const u32 t1 = gpu31::mont(waf[s], tfB[(H - 1) + w], p);
-            const u32 t2 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
-            const u32 t3 = gpu31::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
+            const u32 t1 = Ar::mont(waf[s], tfB[(H - 1) + w], p);
+            const u32 t2 = Ar::mont(waf[s + 1], tfB[(2 * H - 1) + w], p);
+            const u32 t3 = Ar::mont(waf[s + 1], tfB[(2 * H - 1) + w + H], p);
             u32 a0 = sa[i0], a1 = sa[i1], a2 = sa[i2], a3 = sa[i3];
             u32 b0 = sb[i0], b1 = sb[i1], b2 = sb[i2], b3 = sb[i3];
-            gpu31::butterfly(a0, a1, t1, p); gpu31::butterfly(a2, a3, t1, p);
-            gpu31::butterfly(b0, b1, t1, p); gpu31::butterfly(b2, b3, t1, p);
-            gpu31::butterfly(a0, a2, t2, p); gpu31::butterfly(a1, a3, t3, p);
-            gpu31::butterfly(b0, b2, t2, p); gpu31::butterfly(b1, b3, t3, p);
+            Ar::butterfly(a0, a1, t1, p); Ar::butterfly(a2, a3, t1, p);
+            Ar::butterfly(b0, b1, t1, p); Ar::butterfly(b2, b3, t1, p);
+            Ar::butterfly(a0, a2, t2, p); Ar::butterfly(a1, a3, t3, p);
+            Ar::butterfly(b0, b2, t2, p); Ar::butterfly(b1, b3, t3, p);
             sa[i0] = a0; sa[i1] = a1; sa[i2] = a2; sa[i3] = a3;
             sb[i0] = b0; sb[i1] = b1; sb[i2] = b2; sb[i3] = b3;
         }
@@ -1829,9 +1866,9 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
             const u32 wa = (s == 6 ? waf[6] : (s == 4 ? waf[4] : (s == 2 ? waf[2] : waf[0])));
-            const u32 w = gpu31::mont(wa, tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            const u32 w = Ar::mont(wa, tfB[(H - 1) + within], p);
+            Ar::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
+            Ar::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
         __syncthreads();
     }
@@ -1843,9 +1880,9 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(waf[s], tfB[(H - 1) + within], p);
-            gpu31::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
-            gpu31::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
+            const u32 w = Ar::mont(waf[s], tfB[(H - 1) + within], p);
+            Ar::butterfly(sa[first * S + lane], sa[second * S + lane], w, p);
+            Ar::butterfly(sb[first * S + lane], sb[second * S + lane], w, p);
         }
         __syncthreads();
     }
@@ -1856,7 +1893,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #endif
     {
         for (unsigned h = rw; h < HC; h += 8)
-            sa[h * S + lane] = gpu31::mont(sa[h * S + lane], sb[h * S + lane], p);
+            sa[h * S + lane] = Ar::mont(sa[h * S + lane], sb[h * S + lane], p);
         __syncthreads();
     }
     TCP_T(f3);
@@ -1870,10 +1907,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 w = Ar::mont(wai[s], tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
-            sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[first * S + lane] = Ar::add(u, v, p.p);
+            sa[second * S + lane] = Ar::mont(Ar::sub(u, v, p.p), w, p);
         }
         __syncthreads();
     }
@@ -1893,32 +1930,32 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
-            const u32 t2a = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                t4[i] = Ar::mont(wai[s+2], tiB[(4 * H - 1) + w + i * H], p);
+            const u32 t2a = Ar::mont(wai[s+1], tiB[(2 * H - 1) + w], p);
+            const u32 t2b = Ar::mont(wai[s+1], tiB[(2 * H - 1) + w + H], p);
+            const u32 t1 = Ar::mont(wai[s], tiB[(H - 1) + w], p);
             u32 av[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) av[i] = sa[ix[i]];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
                 const u32 u = av[i], v = av[i+4];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[i], p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i+4] = Ar::mont(Ar::sub(u, v, p.p), t4[i], p);
             }
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
                 const u32 tw = (i & 1) ? t2b : t2a;
                 const u32 u = av[i], v = av[i+2];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i+2] = Ar::mont(Ar::sub(u, v, p.p), tw, p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; i += 2) {
                 const u32 u = av[i], v = av[i+1];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i+1] = Ar::mont(Ar::sub(u, v, p.p), t1, p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) sa[ix[i]] = av[i];
@@ -1937,12 +1974,12 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             for (unsigned i = 0; i < 16; ++i) ix[i] = (r0 + i * H) * S + lane;
             u32 t2[2], t4[4], t8[8];
 #pragma unroll
-            for (unsigned k = 0; k < 2; ++k) t2[k] = gpu31::mont(wai[s+1], tiB[(2 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 2; ++k) t2[k] = Ar::mont(wai[s+1], tiB[(2 * H - 1) + w + k * H], p);
 #pragma unroll
-            for (unsigned k = 0; k < 4; ++k) t4[k] = gpu31::mont(wai[s+2], tiB[(4 * H - 1) + w + k * H], p);
+            for (unsigned k = 0; k < 4; ++k) t4[k] = Ar::mont(wai[s+2], tiB[(4 * H - 1) + w + k * H], p);
 #pragma unroll
-            for (unsigned k = 0; k < 8; ++k) t8[k] = gpu31::mont(wai[s+3], tiB[(8 * H - 1) + w + k * H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            for (unsigned k = 0; k < 8; ++k) t8[k] = Ar::mont(wai[s+3], tiB[(8 * H - 1) + w + k * H], p);
+            const u32 t1 = Ar::mont(wai[s], tiB[(H - 1) + w], p);
             u32 av[16];
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) av[i] = sa[ix[i]];
@@ -1950,8 +1987,8 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) {
                 const u32 u = av[i], v = av[i+8];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i+8] = gpu31::mont(gpu31::sub(u, v, p.p), t8[i], p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i+8] = Ar::mont(Ar::sub(u, v, p.p), t8[i], p);
             }
             // stage s+2: pairs (i,i+4), i mod 4 = k
 #pragma unroll
@@ -1959,8 +1996,8 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #pragma unroll
                 for (unsigned i = k; i < 16; i += 8) {
                     const u32 u = av[i], v = av[i+4];
-                    av[i] = gpu31::add(u, v, p.p);
-                    av[i+4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[k], p);
+                    av[i] = Ar::add(u, v, p.p);
+                    av[i+4] = Ar::mont(Ar::sub(u, v, p.p), t4[k], p);
                 }
             }
             // stage s+1: pairs (i,i+2), i mod 2 = k
@@ -1969,16 +2006,16 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #pragma unroll
                 for (unsigned i = k; i < 16; i += 4) {
                     const u32 u = av[i], v = av[i+2];
-                    av[i] = gpu31::add(u, v, p.p);
-                    av[i+2] = gpu31::mont(gpu31::sub(u, v, p.p), t2[k], p);
+                    av[i] = Ar::add(u, v, p.p);
+                    av[i+2] = Ar::mont(Ar::sub(u, v, p.p), t2[k], p);
                 }
             }
             // stage s: pairs (i,i+1)
 #pragma unroll
             for (unsigned i = 0; i < 16; i += 2) {
                 const u32 u = av[i], v = av[i+1];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i+1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i+1] = Ar::mont(Ar::sub(u, v, p.p), t1, p);
             }
 #if OC10_R16 && OC12_IO
             if (q + 1 == n16 && r8f) {
@@ -2004,15 +2041,15 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                         const u32 rcv = __shfl_xor_sync(0xffffffffu, snd, lb);
                         if (hi) av[r] = rcv; else av[r | rb] = rcv;
                         const u32 u = av[r], x = av[r | rb];
-                        av[r] = gpu31::add(u, x, p.p);
-                        av[r | rb] = gpu31::mont(gpu31::sub(u, x, p.p), w, p);
+                        av[r] = Ar::add(u, x, p.p);
+                        av[r | rb] = Ar::mont(Ar::sub(u, x, p.p), w, p);
                     }
                 }
                 const unsigned inner = (bx << 1) | (lane & 1);
                 const u64 tb = u64(bz) * (n >> 5) + u64(r0 + ((lane >> 1) & 15)) * 16;
 #pragma unroll
                 for (unsigned r = 0; r < 16; ++r)
-                    rc[((tb + r) * K + k) * 32 + inner] = av[r];
+                    rc[((tb + r) * K + k) * 32 + inner] = Ar::canon(av[r], p.p);
 #else
 #pragma unroll
                 for (int m = 8; m >= 5; --m) {
@@ -2022,14 +2059,14 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #pragma unroll
                     for (unsigned i = 0; i < 16; ++i) {
                         const u32 x = __shfl_xor_sync(0xffffffffu, av[i], lb);
-                        av[i] = hi ? gpu31::mont(gpu31::sub(x, av[i], p.p), w, p) : gpu31::add(av[i], x, p.p);
+                        av[i] = hi ? Ar::mont(Ar::sub(x, av[i], p.p), w, p) : Ar::add(av[i], x, p.p);
                     }
                 }
                 const unsigned inner = (bx << 1) | (lane & 1);
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i) {
                     const unsigned xx = (r0 + i * H) * NT_TILE + low;
-                    rc[((u64(bz) * (n >> 5) + (xx >> 5)) * K + k) * 32 + inner] = av[i];
+                    rc[((u64(bz) * (n >> 5) + (xx >> 5)) * K + k) * 32 + inner] = Ar::canon(av[i], p.p);
                 }
 #endif
             } else if (q + 1 == n16 && !r8out) {
@@ -2037,7 +2074,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 // straight to global, skipping the shared write + store read.
 #pragma unroll
                 for (unsigned i = 0; i < 16; ++i)
-                    rc[rcoff + u64(r0 + i * H) * NT_TILE + low] = av[i];
+                    rc[rcoff + u64(r0 + i * H) * NT_TILE + low] = Ar::canon(av[i], p.p);
             } else
 #endif
             {
@@ -2056,10 +2093,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 w = Ar::mont(wai[s], tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
-            sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[first * S + lane] = Ar::add(u, v, p.p);
+            sa[second * S + lane] = Ar::mont(Ar::sub(u, v, p.p), w, p);
         }
         __syncthreads();
     }
@@ -2076,32 +2113,32 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             u32 t4[4];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
-                t4[i] = gpu31::mont(wai[s + 2], tiB[(4 * H - 1) + w + i * H], p);
-            const u32 t2a = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
-            const u32 t2b = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+                t4[i] = Ar::mont(wai[s + 2], tiB[(4 * H - 1) + w + i * H], p);
+            const u32 t2a = Ar::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
+            const u32 t2b = Ar::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
+            const u32 t1 = Ar::mont(wai[s], tiB[(H - 1) + w], p);
             u32 av[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) av[i] = sa[ix[i]];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
                 const u32 u = av[i], v = av[i + 4];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i + 4] = gpu31::mont(gpu31::sub(u, v, p.p), t4[i], p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i + 4] = Ar::mont(Ar::sub(u, v, p.p), t4[i], p);
             }
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned i = (j < 2) ? j : j + 2;   // 0,1,4,5
                 const u32 tw = (i & 1) ? t2b : t2a;
                 const u32 u = av[i], v = av[i + 2];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i + 2] = gpu31::mont(gpu31::sub(u, v, p.p), tw, p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i + 2] = Ar::mont(Ar::sub(u, v, p.p), tw, p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; i += 2) {
                 const u32 u = av[i], v = av[i + 1];
-                av[i] = gpu31::add(u, v, p.p);
-                av[i + 1] = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+                av[i] = Ar::add(u, v, p.p);
+                av[i + 1] = Ar::mont(Ar::sub(u, v, p.p), t1, p);
             }
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) sa[ix[i]] = av[i];
@@ -2115,10 +2152,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(wa, tiB[(H - 1) + within], p);
+            const u32 w = Ar::mont(wa, tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
-            sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[first * S + lane] = Ar::add(u, v, p.p);
+            sa[second * S + lane] = Ar::mont(Ar::sub(u, v, p.p), w, p);
         }
         __syncthreads();
     }
@@ -2132,18 +2169,18 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
             const unsigned r0 = (g - w) * 4 + w;
             const unsigned i0 = r0 * S + lane, i1 = (r0 + H) * S + lane,
                            i2 = (r0 + 2 * H) * S + lane, i3 = (r0 + 3 * H) * S + lane;
-            const u32 t2 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
-            const u32 t3 = gpu31::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
-            const u32 t1 = gpu31::mont(wai[s], tiB[(H - 1) + w], p);
+            const u32 t2 = Ar::mont(wai[s + 1], tiB[(2 * H - 1) + w], p);
+            const u32 t3 = Ar::mont(wai[s + 1], tiB[(2 * H - 1) + w + H], p);
+            const u32 t1 = Ar::mont(wai[s], tiB[(H - 1) + w], p);
             u32 x0 = sa[i0], x1 = sa[i1], x2 = sa[i2], x3 = sa[i3];
             u32 u = x0, v = x2;
-            x0 = gpu31::add(u, v, p.p); x2 = gpu31::mont(gpu31::sub(u, v, p.p), t2, p);
+            x0 = Ar::add(u, v, p.p); x2 = Ar::mont(Ar::sub(u, v, p.p), t2, p);
             u = x1; v = x3;
-            x1 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t3, p);
+            x1 = Ar::add(u, v, p.p); x3 = Ar::mont(Ar::sub(u, v, p.p), t3, p);
             u = x0; v = x1;
-            x0 = gpu31::add(u, v, p.p); x1 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            x0 = Ar::add(u, v, p.p); x1 = Ar::mont(Ar::sub(u, v, p.p), t1, p);
             u = x2; v = x3;
-            x2 = gpu31::add(u, v, p.p); x3 = gpu31::mont(gpu31::sub(u, v, p.p), t1, p);
+            x2 = Ar::add(u, v, p.p); x3 = Ar::mont(Ar::sub(u, v, p.p), t1, p);
             sa[i0] = x0; sa[i1] = x1; sa[i2] = x2; sa[i3] = x3;
         }
         __syncthreads();
@@ -2156,10 +2193,10 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
         for (unsigned h = rw; h < HC / 2; h += 8) {
             const unsigned within = h & (H - 1);
             const unsigned first = 2 * (h - within) + within, second = first + H;
-            const u32 w = gpu31::mont(wai[s], tiB[(H - 1) + within], p);
+            const u32 w = Ar::mont(wai[s], tiB[(H - 1) + within], p);
             const u32 u = sa[first * S + lane], v = sa[second * S + lane];
-            sa[first * S + lane] = gpu31::add(u, v, p.p);
-            sa[second * S + lane] = gpu31::mont(gpu31::sub(u, v, p.p), w, p);
+            sa[first * S + lane] = Ar::add(u, v, p.p);
+            sa[second * S + lane] = Ar::mont(Ar::sub(u, v, p.p), w, p);
         }
         __syncthreads();
     }
@@ -2170,7 +2207,7 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #endif
     if (!r8out) {
         for (unsigned h = rw; h < HC; h += 8)
-            rc[rcoff + u64(h) * NT_TILE + low] = sa[h * S + lane];
+            rc[rcoff + u64(h) * NT_TILE + low] = Ar::canon(sa[h * S + lane], p.p);
     }
     if (r8out) {
         // R8: inv_low fused here.  The 16 CTAs of this plane form a cluster;
@@ -2200,8 +2237,8 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
                 const unsigned j = (lane + 32 * i) & (half - 1);
                 const u32 w = __ldg(tw + TWI(m, j));
                 const u32 u = v[i], x = v[i + dd];
-                v[i] = gpu31::add(u, x, p.p);
-                v[i + dd] = gpu31::mont(gpu31::sub(u, x, p.p), w, p);
+                v[i] = Ar::add(u, x, p.p);
+                v[i + dd] = Ar::mont(Ar::sub(u, x, p.p), w, p);
             }
         }
 #pragma unroll
@@ -2213,20 +2250,20 @@ fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __re
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) {
                 const u32 x = __shfl_xor_sync(0xffffffffu, v[i], half);
-                v[i] = hi ? gpu31::mont(gpu31::sub(x, v[i], p.p), w, p) : gpu31::add(v[i], x, p.p);
+                v[i] = hi ? Ar::mont(Ar::sub(x, v[i], p.p), w, p) : Ar::add(v[i], x, p.p);
             }
         }
 #if OC32_PREWEIGHT
         if (TC22_MERGED) {
             const u32 cw = c_crt_slotc[k];
 #pragma unroll
-            for (unsigned i = 0; i < 16; ++i) v[i] = gpu31::mont(v[i], cw, p);
+            for (unsigned i = 0; i < 16; ++i) v[i] = Ar::mont(v[i], cw, p);
         }
 #endif
         const u64 tile = u64(bz) * (n / NT_TILE) + h;
         const u64 ob = (tile * K + k) * NT_TILE;
 #pragma unroll
-        for (unsigned i = 0; i < 16; ++i) r8out[ob + lane + 32 * i] = v[i];
+        for (unsigned i = 0; i < 16; ++i) r8out[ob + lane + 32 * i] = Ar::canon(v[i], p.p);
     }
     TCP_T(f5);
     TCP_ADD(5, f0, f1); TCP_ADD(6, f1, f2); TCP_ADD(7, f2, f3);
