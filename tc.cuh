@@ -1469,6 +1469,9 @@ __device__ __forceinline__ u32 r8_ld_cluster(const u32* local, unsigned rank) {
     asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(ra) : "memory");
     return v;
 }
+#ifndef M11C_LAZY
+#define M11C_LAZY 1
+#endif
 #ifndef M11B_LAZY
 #define M11B_LAZY 1
 #endif
@@ -2855,6 +2858,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                  const u32* __restrict__ packed, unsigned n, unsigned l, unsigned K,
                  unsigned logN, unsigned KS, unsigned NT, unsigned r8f = 0,
                  const uint2* __restrict__ frag_b = nullptr) {
+    using EAr = typename std::conditional<(M11C_LAZY && M11_P30), ArLazy, ArCanon>::type;
     __shared__ u32 sT[EF_PR][E2_PT];
     // R8F: operand b uses the CRT-weight-scaled table (term = residue in CRT)
     if (blockIdx.y && frag_b) frag = frag_b;
@@ -3070,11 +3074,11 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                     const u32 other = __shfl_xor_sync(0xffffffffu, v[e], Hb);
                     // bf(lower,upper): lower' = lower+mont(upper), upper'=lower-mont(upper)
                     if (!upper) {
-                        const u32 u = v[e], t = gpu31::mont(other, wt, pr);
-                        v[e] = gpu31::add(u, t, pr.p);
+                        const u32 u = v[e], t = EAr::mont(other, wt, pr);
+                        v[e] = EAr::add(u, t, pr.p);
                     } else {
-                        const u32 u = other, t = gpu31::mont(v[e], wt, pr);
-                        v[e] = gpu31::sub(u, t, pr.p);
+                        const u32 u = other, t = EAr::mont(v[e], wt, pr);
+                        v[e] = EAr::sub(u, t, pr.p);
                     }
                 }
             }
@@ -3087,7 +3091,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 for (unsigned e = 0; e < 8; ++e) {
                     if (e & span) continue;
                     const unsigned jtw = lane + (e & (span - 1)) * 32;
-                    gpu31::butterfly(v[e], v[e + span], tw[TWI(stage, jtw)], pr);
+                    EAr::butterfly(v[e], v[e + span], tw[TWI(stage, jtw)], pr);
                 }
             }
 
@@ -3095,7 +3099,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const u64 base_out = rbase + u64(kk) * n + start;
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e)
-                    dst[base_out + lane + 32 * e] = v[e];
+                    dst[base_out + lane + 32 * e] = EAr::canon(v[e], pr.p);
             }
         }
 #else
@@ -3126,7 +3130,7 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                     for (unsigned e = 0; e < 8; ++e) {
                         if (e & span) continue;
                         const unsigned j = w + (e & (span - 1)) * H;
-                        gpu31::butterfly(v[e], v[e + span], tw8[TWI(m + st, j)], pr8);
+                        EAr::butterfly(v[e], v[e + span], tw8[TWI(m + st, j)], pr8);
                     }
                 }
 #pragma unroll
@@ -3147,10 +3151,10 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
             const unsigned i0 = padw(w), i1 = padw(w + 64), i2 = padw(w + 128), i3 = padw(w + 192);
             u32 v0 = row[i0], v1 = row[i1], v2 = row[i2], v3 = row[i3];
             const u32 t1 = sR[q][TWI(6, w)];
-            gpu31::butterfly(v0, v1, t1, pr4);
-            gpu31::butterfly(v2, v3, t1, pr4);
-            gpu31::butterfly(v0, v2, sR[q][TWI(7, w)], pr4);
-            gpu31::butterfly(v1, v3, sR[q][TWI(7, w + 64)], pr4);
+            EAr::butterfly(v0, v1, t1, pr4);
+            EAr::butterfly(v2, v3, t1, pr4);
+            EAr::butterfly(v0, v2, sR[q][TWI(7, w)], pr4);
+            EAr::butterfly(v1, v3, sR[q][TWI(7, w + 64)], pr4);
             row[i0] = v0; row[i1] = v1; row[i2] = v2; row[i3] = v3;
         }
         __syncthreads();
@@ -3170,13 +3174,13 @@ encode_fwdlow256(const u32* __restrict__ src_a, const u32* __restrict__ src_b,
                 const unsigned kk = nt0 * 2 + q;
                 if (kk < K)
                     dst[rbase + u64(kk) * n + (u64(bxx) * (n >> 9) + row) * 32 + (hi << 4) + l4] =
-                        sT[q][padw(pos)];
+                        EAr::canon(sT[q][padw(pos)], primes[kk].p);
             }
         } else
         for (unsigned idx = tid; idx < EF_PR * E2_ROWS; idx += 256) {
             const unsigned q = idx / E2_ROWS, pos = idx % E2_ROWS;
             const unsigned kk = nt0 * 2 + q;
-            if (kk < K) dst[rbase + u64(kk) * n + start + pos] = sT[q][padw(pos)];
+            if (kk < K) dst[rbase + u64(kk) * n + start + pos] = EAr::canon(sT[q][padw(pos)], primes[kk].p);
         }
         __syncthreads();
 #endif
