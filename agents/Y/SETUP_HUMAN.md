@@ -12,13 +12,15 @@
 ## 2. Доступ к GitHub (deploy key — ключ только для этого репозитория)
 Deploy key — SSH-ключ, привязанный к одному репозиторию, а не к аккаунту. Токен аккаунта агенту не нужен.
 
-1. На машине агента создайте ключ (без пароля, чтобы агент мог пушить сам):
+Доступ к GitHub есть только у владельца репозитория. Поэтому шаги делятся: **[человек]** — на машине агента, **[владелец]** — в GitHub.
+
+1. **[человек]** Создайте ключ (без пароля, чтобы агент мог пушить сам):
    ```
    ssh-keygen -t ed25519 -C "agent-y" -f ~/.ssh/y_deploy -N ""
    ```
-2. Скопируйте публичную часть (`~/.ssh/y_deploy.pub`, **не** файл без `.pub`).
-3. GitHub → репозиторий `polynomial-multiplication-negacyclic-batched` → Settings → Deploy keys → Add deploy key: название `agent-y`, вставить ключ, отметить **Allow write access** → Add key.
-4. На машине агента добавьте в `~/.ssh/config`:
+2. **[человек]** Отправьте владельцу **только публичную часть** — содержимое `~/.ssh/y_deploy.pub` (одна строка, начинается с `ssh-ed25519`). Её можно пересылать в любом мессенджере. Файл `~/.ssh/y_deploy` без `.pub` — секретный, его никому не отправлять.
+3. **[владелец]** GitHub → репозиторий `polynomial-multiplication-negacyclic-batched` → Settings → Deploy keys → Add deploy key: название `agent-y`, вставить присланную строку, отметить **Allow write access** → Add key. Сообщить человеку, что ключ добавлен.
+4. **[человек]** Добавьте в `~/.ssh/config`:
    ```
    Host github-y
        HostName github.com
@@ -26,14 +28,14 @@ Deploy key — SSH-ключ, привязанный к одному репози
        IdentityFile ~/.ssh/y_deploy
        IdentitiesOnly yes
    ```
-5. Клонируйте и проверьте:
+5. **[человек]** Клонируйте и проверьте:
    ```
    git clone git@github-y:noname9006/polynomial-multiplication-negacyclic-batched.git
    ssh -T git@github-y
    ```
    Вторая команда должна ответить приветствием с именем репозитория.
-6. Защитите `master`: Settings → Branches → Add rule → `master` → Restrict who can push → только владелец. Deploy key с записью может пушить в любую ветку, а в master вливает только основной агент.
-7. Отключить доступ — удалить ключ в Settings → Deploy keys.
+6. **[владелец]** Защитите `master`: Settings → Branches → Add rule → `master` → Restrict who can push → только владелец. Deploy key с записью может пушить в любую ветку, а в master вливает только основной агент.
+7. **[владелец]** Отключить доступ — удалить ключ в Settings → Deploy keys.
 
 ## 3. Доступ к FHERMA (токен CLI)
 1. На сайте FHERMA: Command line → Issue a token (показывается один раз, действует 90 дней).
