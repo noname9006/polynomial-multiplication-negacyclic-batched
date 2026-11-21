@@ -1261,7 +1261,7 @@ struct Device {
                     cudaLaunchConfig_t cf = {};
                     cudaLaunchAttribute at[1];
                     at[0].id = cudaLaunchAttributeClusterDimension;
-                    at[0].val.clusterDim.x = ((n / tc::E2_ROWS) % M7_CL == 0) ? M7_CL : 1;
+                    at[0].val.clusterDim.x = 1;   // M7b diagnostic: bulk+mbarrier path without a cluster
                     at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
                     cf.gridDim = dim3(n / tc::E2_ROWS, 2, B); cf.blockDim = dim3(256, 1, 1);
                     cf.dynamicSmemBytes = 0; cf.stream = stream; cf.attrs = at; cf.numAttrs = 1;
