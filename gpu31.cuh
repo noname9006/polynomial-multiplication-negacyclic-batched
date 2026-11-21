@@ -1390,6 +1390,12 @@ struct Device {
                                                          OC31_TILE_RC ? n / tc::NT_TILE : 0);
                 } else
 #endif
+                if (M13_CRTSPEC && r8f && d_fenc_b && n == 65536 && logN == 16 && crt_args_.count == 114 &&
+                    c2.KS == 15 && c2.NT == 28)
+                tc::crt_tc2_spec<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
+                              crt2_shared, stream>>>(crt_args_, prc, pc, d_fcrt, c2,
+                                                     d_primes, d_untw_slot, d_corr_m, d_pk_inv);
+                else
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
                               crt2_shared, stream>>>(crt_args_, r8f ? prc : (OC31_TILE_RC ? pio : prc), pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,

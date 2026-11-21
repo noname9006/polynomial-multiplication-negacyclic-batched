@@ -929,12 +929,20 @@ __device__ __forceinline__ void oc27_carry_half(
 #endif // OC27_ROWS64
 
 // TC15 CRT variant: 32 rows/CTA, warps split n-tiles, B reused by 2 m-tiles.
-__global__ void __launch_bounds__(128, 3)
-crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+#ifndef M13_CRTSPEC
+#define M13_CRTSPEC 1
+#endif
+// M13: SPEC folds KS=15, NT=28, K=114, slot_logN=16, r8f path constants.
+template <bool SPEC>
+__device__ __forceinline__ void
+crt_tc2_dev(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
        const uint2* __restrict__ frag, CrtTc cfg,
        const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
-       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0,
-       const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
+       unsigned slot_logN_a, const u32* __restrict__ corr_m, unsigned ntiles_a,
+       const u32* __restrict__ pki, unsigned r8f_a) {
+    const unsigned KS_ = SPEC ? 15u : cfg.KS, NT_ = SPEC ? 28u : cfg.NT, CNT_ = SPEC ? 114u : pl.count;
+    const unsigned slot_logN = SPEC ? 16u : slot_logN_a, ntiles = SPEC ? 2048u : ntiles_a;
+    const unsigned r8f = SPEC ? 2u : r8f_a;
     // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
     // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
     // Shared: one region, used as sA (u32, stride SA) -> sX (u64, stride SX)
@@ -946,7 +954,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         ((std::size_t(CRT2_ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15)));
     constexpr unsigned NG = 128 / CRT2_ROWS;   // staging groups per row
 
-    const unsigned n = pl.n, l = pl.limbs, K = pl.count;
+    const unsigned n = pl.n, l = pl.limbs, K = CNT_;
     const unsigned pair = blockIdx.z, start = blockIdx.x * CRT2_ROWS;
     const unsigned tid = threadIdx.x;
     const unsigned c = tid & (CRT2_ROWS - 1), jg = tid / CRT2_ROWS;
@@ -964,7 +972,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
             ? residues[((rbase2 + j) << tsh) + (coeff & ((1u << tsh) - 1u))]
             : residues[rbase + u64(j) * n + coeff];
     };
-    const unsigned W = cfg.KS * 8;
+    const unsigned W = KS_ * 8;
 
     TCP_T(t0);
     // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
@@ -1077,18 +1085,18 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     const bool odd = t & 1;
     const unsigned sh = (t & 1) * 16;
     TCP_T(t2);
-    for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 8) {
+    for (unsigned nt0 = warp; nt0 < NT_; nt0 += 8) {
         const unsigned ntA = nt0, ntB = nt0 + 4;
-        const bool hasB = ntB < cfg.NT;
+        const bool hasB = ntB < NT_;
         int acc[2][2][4];
 #pragma unroll
         for (unsigned mt = 0; mt < 2; ++mt)
 #pragma unroll
             for (unsigned q = 0; q < 2; ++q) acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
 #pragma unroll 3
-        for (unsigned ks = 0; ks < cfg.KS; ++ks) {
-            const uint2 b0 = frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane];
-            const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
+        for (unsigned ks = 0; ks < KS_; ++ks) {
+            const uint2 b0 = frag[(std::size_t(ntA) * KS_ + ks) * 32 + lane];
+            const uint2 b1 = hasB ? frag[(std::size_t(ntB) * KS_ + ks) * 32 + lane] : make_uint2(0u, 0u);
 #pragma unroll
             for (unsigned mt = 0; mt < 2; ++mt) {
                 const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
@@ -1123,7 +1131,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
 #if OC26_CARRY
     u32* digits = reinterpret_cast<u32*>(sA);   // separate from xs (no race)
     {
-        const unsigned words = cfg.NT * 2;
+        const unsigned words = NT_ * 2;
         // sA is 32*SA*4 bytes; digits need 32*DS*4 = 32*2*SX*4 bytes.  With
         // SA >= 2*SX in all configs (SA=124, SX=57), this fits; cout[] lives
         // in the tail of the same sA region beyond the digit buffer.
@@ -1145,7 +1153,7 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
         u32* dg = digits + tid * DS;
         const u64* xs = sX + tid * cfg.SX;
         u64 carry = 0;
-        const unsigned words = cfg.NT * 2;
+        const unsigned words = NT_ * 2;
         for (unsigned w = 0; w < words; ++w) {
             carry += xs[w];
             dg[w] = u32(carry);
@@ -1180,6 +1188,21 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_T(t5);
     TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2); TCP_ADD(2, t2, t3);
     TCP_ADD(3, t3, t4); TCP_ADD(4, t4, t5);
+}
+__global__ void __launch_bounds__(128, 3)
+crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles = 0,
+       const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
+    crt_tc2_dev<false>(pl, residues, out, frag, cfg, primes, untw_inv, slot_logN, corr_m, ntiles, pki, r8f);
+}
+__global__ void __launch_bounds__(128, 3)
+crt_tc2_spec(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       const u32* __restrict__ corr_m, const u32* __restrict__ pki) {
+    crt_tc2_dev<true>(pl, residues, out, frag, cfg, primes, untw_inv, 0, corr_m, 0, pki, 0);
 }
 
 #if OC27_ROWS64
