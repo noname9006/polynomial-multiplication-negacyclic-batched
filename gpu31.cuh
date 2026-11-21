@@ -1185,6 +1185,65 @@ struct Device {
         return cudaGetLastError();
     }
 
+    // P8 probe (2026-11-21): phase-masked template copy of encode256.
+    //  bit0 no input read (constant) | bit1 input only | bit2 barriers only |
+    //  bit3 no barriers.  Init-time, timing-only; master kernels untouched.
+    void p8_probe() {
+#if P8_PROBE
+        if (!tc_efl || capacity_ < 128) return;
+        const unsigned n = plan_.N, l = plan_.L, k = plan_.K, logN = plan_.logN;
+        const unsigned logH = logN - 9;
+        if (n % tc::E2_ROWS || logN == 0) return;
+        const bool ef256 = TC29_EF256 && TC22_MERGED && tc_efl && logH >= 4;
+        if (!ef256) return;
+#if OC27_ROWS64
+        const bool r8f_r64 = crt2_r64;
+#else
+        const bool r8f_r64 = false;
+#endif
+        const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC &&
+                         tc_crt2 && !r8f_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
+        const unsigned B = capacity_ < 128 ? capacity_ : 128;
+        const std::size_t ins = std::size_t(n) * l;
+        u32 *d_a = nullptr, *d_b = nullptr;
+        if (cudaMalloc(&d_a, B * ins * 4) != cudaSuccess ||
+            cudaMalloc(&d_b, B * ins * 4) != cudaSuccess) {
+            cudaGetLastError();
+            if (d_a) cudaFree(d_a);
+            if (d_b) cudaFree(d_b);
+            std::fprintf(stderr, "[P8] alloc failed\n");
+            return;
+        }
+        cudaMemset(d_a, 0x37, B * ins * 4);
+        cudaMemset(d_b, 0x29, B * ins * 4);
+        cudaStream_t s = cs_[0] ? cs_[0] : 0;
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const dim3 grid(n / tc::E2_ROWS, 2, B);
+        const unsigned masks[] = {0u, 1u, 2u, 4u, 8u, 18u, 16u, 34u};
+        std::fprintf(stderr, "[P8] encode256 B=%u (mask 0=full 1=no_input 2=input_only 4=bars_only 8=no_bars 16=v4 18=input_v4 34=contig):", B);
+        for (unsigned m : masks) {
+            float best = 1e9f;
+            for (int rep = 0; rep < 3; ++rep) {
+                cudaEventRecord(e0, s);
+                tc::encode_p8_probe<<<grid, 256, 0, s>>>(
+                    d_a, d_b, d_ra, d_rb, d_fenc, d_primes, d_weights, d_pk_fwd,
+                    n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,
+                    r8f ? d_fenc_b : nullptr, m);
+                cudaEventRecord(e1, s);
+                cudaStreamSynchronize(s);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (t < best) best = t;
+            }
+            std::fprintf(stderr, " m%u=%.3f", m, best);
+        }
+        std::fprintf(stderr, " | err=%d\n", int(cudaGetLastError()));
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaFree(d_a); cudaFree(d_b);
+        cudaGetLastError();
+#endif
+    }
+
     // Read and print the stage times. Call after the stream has synchronised.
     void report_profile() const {
         if (!profiling_) return;
