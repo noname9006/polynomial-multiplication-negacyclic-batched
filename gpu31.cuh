@@ -58,6 +58,17 @@ struct Prime {
 #ifndef M1_MIN
 #define M1_MIN 1
 #endif
+// M11: RNS primes in (2^29, 2^30) instead of (2^30, 2^31).  4p < 2^32 makes
+// lazy (redundant [0,2p)/[0,4p)) butterflies possible.  K grows ~114 -> 118,
+// but encode/CRT group counts (ceil(K/8), ceil((K+1)/8)) stay 15.
+#ifndef M11_P30
+#define M11_P30 1
+#endif
+#if M11_P30
+#define GPU31_PTOP 30
+#else
+#define GPU31_PTOP 31
+#endif
 GPU31_FHD inline u32 umin32(u32 x, u32 y) {
     return x < y ? x : y;   // IMNMX.U32
 }
@@ -131,7 +142,10 @@ GPU31_FHD inline u32 lazy_product(u32 limb, Weight w, u32 p) {
     return limb * w.value - quotient * p;
 }
 GPU31_FHD inline u32 canonical_word(u32 x, u32 p) {
-#if M1_MIN
+#if M11_P30
+    // p in (2^29, 2^30): x < 2^32 < 8p.  4p < 2^32, so each umin step is exact.
+    x = umin32(x, x - 4 * p); x = umin32(x, x - 2 * p); x = umin32(x, x - p);
+#elif M1_MIN
     x = umin32(x, x - p); x = umin32(x, x - p); x = umin32(x, x - p);
 #else
     if (x >= p) x -= p;
@@ -436,24 +450,24 @@ struct Plan {
         {
             const double need = 2.0 * W + logN + 5.0;
             double have = 0;
-            u32 q = ((u32(1) << 31) - 2) / (2 * N) * (2 * N) + 1;
+            u32 q = ((u32(1) << GPU31_PTOP) - 2) / (2 * N) * (2 * N) + 1;
             while (have < need) {
-                while (q > (1u << 30) && !host_is_prime(q)) q -= 2 * N;
-                if (q <= (1u << 30)) break;
+                while (q > (1u << (GPU31_PTOP - 1)) && !host_is_prime(q)) q -= 2 * N;
+                if (q <= (1u << (GPU31_PTOP - 1))) break;
                 have += std::log2(double(q));
                 ++K;
                 q -= 2 * N;
             }
-            const unsigned classic = (2 * W + logN + 4 + 29) / 30;
+            const unsigned classic = (2 * W + logN + 4 + GPU31_PTOP - 2) / (GPU31_PTOP - 1);
             if (have < need || K > classic) K = classic;
         }
 #else
         K = (2 * W + logN + 4 + 29) / 30;
 #endif
-        u32 p = ((u32(1) << 31) - 2) / (2 * N) * (2 * N) + 1;
+        u32 p = ((u32(1) << GPU31_PTOP) - 2) / (2 * N) * (2 * N) + 1;
         for (unsigned k = 0; k < K; ++k) {
-            while (p > (1u << 30) && !host_is_prime(p)) p -= 2 * N;
-            if (p <= (1u << 30)) throw std::runtime_error("gpu31: not enough suitable RNS primes");
+            while (p > (1u << (GPU31_PTOP - 1)) && !host_is_prime(p)) p -= 2 * N;
+            if (p <= (1u << (GPU31_PTOP - 1))) throw std::runtime_error("gpu31: not enough suitable RNS primes");
             u32 inv = 1;
             for (unsigned j = 0; j < 5; ++j) inv *= 2 - p * inv;   // p^-1 mod 2^32
             const u32 one = u32((u64(1) << 32) % p);               // 2^32 mod p
