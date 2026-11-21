@@ -313,6 +313,16 @@ __host__ __device__ inline bool oc34_ok(unsigned SXH, unsigned K, unsigned ntile
            oc34_buf_bytes() <= std::size_t(CRT2_R64_ROWS) * SXH * 8;
 }
 
+// OC55 (agent B): CRT on 8 warps/CTA (256 threads) with the SAME 32 rows and
+// the SAME shared.  Each warp owns ONE n-tile (w, w+8, ...) and covers both
+// m-tiles via acc[2][4] (8 ints, half master's 16), so 3 CTA x 8 warp = 24
+// warp/SM vs 12.  Unique B fragments stay 28/CTA -> same ~28 GB traffic;
+// only the latency hiding doubles.  Registers ~80 <= 85 cap at 3x256 threads.
+// Flag OC55_WARPS8 (default 1, defined BEFORE first #if); 0 = byte-exact master.
+#ifndef OC55_WARPS8
+#define OC55_WARPS8 1
+#endif
+
 // OC8 (parallel branch): radix-8 high stages in fused_high - three DIT/DIF
 // stages per shared round trip (s, s+1, s+2), plus radix-2 tail stages.
 // CPU-validated bit-exact against the radix-2 reference (20 random trials).
@@ -1181,6 +1191,186 @@ crt_tc2(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ o
     TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2); TCP_ADD(2, t2, t3);
     TCP_ADD(3, t3, t4); TCP_ADD(4, t4, t5);
 }
+
+#if OC55_WARPS8
+// OC55: 256 threads / 8 warps on the same 32 rows and shared layout.
+// Each warp covers ONE n-tile (nt = warp + 8u) with both m-tiles, so the
+// B fragment feeds 2 mma (as master) but the warp count doubles to 24/SM.
+// Staging and carry keep master's NG=4 layout (shared unchanged).
+__global__ void __launch_bounds__(256, 3)
+crt_tc2_w8(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles,
+       const u32* __restrict__ pki, unsigned r8f) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    u32* sA = reinterpret_cast<u32*>(smem_raw);
+    u64* sX = reinterpret_cast<u64*>(smem_raw +
+        ((std::size_t(CRT2_ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15)));
+    constexpr unsigned NG = 4;   // keep master's fsum layout (sA W..W+7)
+    constexpr unsigned THREADS = 256;
+    const unsigned n = pl.n, l = pl.limbs, K = pl.count, W = cfg.KS * 8u;
+    const unsigned pair = blockIdx.z, start = blockIdx.x * CRT2_ROWS;
+    const unsigned tid = threadIdx.x;
+    const unsigned c = tid & (CRT2_ROWS - 1), jg = tid / CRT2_ROWS;  // jg 0..7
+    const unsigned i = start + c;
+    const bool active = i < n;
+    const u64 rbase = u64(pair) * K * n;
+    const unsigned tsh = r8f ? 5u : 9u;
+    const u64 rbase2 = (OC31_TILE_RC && ntiles)
+        ? (u64(pair) * ntiles + (start >> tsh)) * K : 0ull;
+    auto RC = [&](unsigned j, unsigned coeff) -> u32 {
+        return (OC31_TILE_RC && ntiles)
+            ? residues[((rbase2 + j) << tsh) + (coeff & ((1u << tsh) - 1u))]
+            : residues[rbase + u64(j) * n + coeff];
+    };
+
+    TCP_T(t0);
+    // 1. staging: master NG=4 layout (spare words W..W+7).  All 256 threads
+    // participate in barriers; only the first 128 do the fsum work.
+    u64 fsum = 0;
+    if (tid < 128u) {
+        const unsigned c2 = tid & 31u, jg2 = tid >> 5;   // 0..3
+        if (r8f) {
+            if (jg2 < K) {
+                const unsigned j = jg2;
+                const gpu31::Prime pj = c_crt_prime[j];
+                const uint4* src = reinterpret_cast<const uint4*>(residues + ((rbase2 + j) << 5u));
+                const uint4* twp = reinterpret_cast<const uint4*>(pki + u64(j) * TC_LT);
+                u32 v[32], tw[32];
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) {
+                    const uint4 x = __ldcs(src + e);
+                    v[4*e]=x.x; v[4*e+1]=x.y; v[4*e+2]=x.z; v[4*e+3]=x.w;
+                    const uint4 y = __ldg(twp + e);
+                    tw[4*e]=y.x; tw[4*e+1]=y.y; tw[4*e+2]=y.z; tw[4*e+3]=y.w;
+                }
+#pragma unroll
+                for (int m = 4; m >= 0; --m) {
+                    const unsigned half = 1u << m;
+#pragma unroll
+                    for (unsigned ii = 0; ii < 32; ++ii) {
+                        if (ii & half) continue;
+                        const u32 u=v[ii], x=v[ii+half];
+                        v[ii]=gpu31::add(u,x,pj.p);
+                        v[ii+half]=gpu31::mont(gpu31::sub(u,x,pj.p),tw[(half-1u)+(ii&(half-1u))],pj);
+                    }
+                }
+#pragma unroll
+                for (unsigned r = 0; r < 32; ++r) sA[r*cfg.SA+j] = v[r];
+            }
+        } else if (untw_inv && K <= CRT_KMAX_C) {
+#pragma unroll 1
+            for (unsigned j0 = jg2; j0 < K; j0 += 8*NG) {
+                u32 r[8], u[8];
+#pragma unroll
+                for (unsigned q = 0; q < 8; ++q) {
+                    const unsigned j = j0 + NG*q;
+                    r[q] = (j<K && active) ? RC(j,i) : 0u;
+                    u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j<K && active) ? untw_inv[u64(j)*n+i] : 0u);
+                }
+#pragma unroll
+                for (unsigned q = 0; q < 8; ++q) {
+                    const unsigned j = j0 + NG*q;
+                    if (j<K) { const u32 term=(OC32_PREWEIGHT&&TC22_MERGED&&slot_logN&&!r8f)?r[q]:gpu31::mont(r[q],(TC22_MERGED&&slot_logN)?c_crt_slotc[j]:u[q],c_crt_prime[j]);
+                        sA[c2*cfg.SA+j]=term; fsum += (u64(term)*c_crt_corr[j])>>30; }
+                }
+            }
+        } else {
+#pragma unroll 4
+            for (unsigned j = jg2; j < K; j += NG) {
+                u32 term=0;
+                if (active) {const u32 r=RC(j,i);
+                    if (OC32_PREWEIGHT&&TC22_MERGED&&slot_logN&&untw_inv) term=r;
+                    else if (untw_inv) term=gpu31::mont(r,untw_inv[u64(j)*n+i],primes[j]);
+                    else term=gpu31::weight_residue(r,pl.primes[j]);}
+                sA[c2*cfg.SA+j]=term; fsum += (u64(term)*c_crt_corr[j])>>30;
+            }
+        }
+        for (unsigned j = K+1+jg2; j < W; j += NG) sA[c2*cfg.SA+j]=0;
+        sA[c2*cfg.SA+W+2*jg2]=u32(fsum);
+        sA[c2*cfg.SA+W+2*jg2+1]=u32(fsum>>32);
+    }
+    __syncthreads();   // CTA-wide: all 256 threads, after all staging writes
+    if (tid < 128u && (tid>>5)==0) {   // one reducer per row (master)
+        const unsigned c2 = tid & 31u;
+        const u32* rw = sA + c2*cfg.SA + W;
+        u64 ssum=0;
+#pragma unroll
+        for (unsigned q=0;q<NG;++q) ssum += u64(rw[2*q]) | (u64(rw[2*q+1])<<32);
+        sA[c2*cfg.SA+K]=u32((ssum+(u64(1)<<31))>>32);
+    }
+    __syncthreads();
+
+    TCP_T(t1);
+    const unsigned warp = tid >> 5, lane = tid & 31;    // 8 warps
+    const unsigned g = lane >> 2, tt = lane & 3;
+    const bool odd = tt & 1;
+    const unsigned sh = odd ? 16u : 0u;
+    TCP_T(t2);
+    // 2-3. 8 warps, ONE n-tile each, 2 m-tiles -> acc[2][4] (8 ints).
+    for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 8) {
+        const unsigned ntA = nt0;
+        int acc[2][4];   // 2 m-tiles x 4 ints (ONE n-tile per warp)
+#pragma unroll
+        for (unsigned mt=0;mt<2;++mt)
+            acc[mt][0]=acc[mt][1]=acc[mt][2]=acc[mt][3]=0;
+#pragma unroll 3
+        for (unsigned ks=0;ks<cfg.KS;++ks) {
+            const uint2 b = frag[(std::size_t(ntA)*cfg.KS+ks)*32+lane];
+#pragma unroll
+            for (unsigned mt=0;mt<2;++mt) {
+                const u32* r0=sA+(mt*16+g)*cfg.SA+ks*8+tt;
+                const u32* r1=r0+8*cfg.SA;
+                const u32 x0=r0[0],x1=r1[0],x2=r0[4],x3=r1[4];
+                mma_u8(acc[mt],x0,x1,x2,x3,b.x,b.y);
+            }
+        }
+#pragma unroll
+        for (unsigned mt=0;mt<2;++mt) {
+            const u64 pg =(u64(u32(acc[mt][0]))<<sh)+(u64(u32(acc[mt][1]))<<(sh+8));
+            const u64 pg8=(u64(u32(acc[mt][2]))<<sh)+(u64(u32(acc[mt][3]))<<(sh+8));
+            const u64 send = odd ? pg : pg8, mine = odd ? pg8 : pg;
+            const u64 tot = mine + __shfl_xor_sync(0xffffffffu,send,1);
+            const unsigned row=mt*16+g+(odd?8u:0u);
+            sX[row*cfg.SX+ntA*2+(tt>>1)]=tot;
+        }
+    }
+    __syncthreads();
+
+    TCP_T(t3);
+    const unsigned DS = 2u*cfg.SX;
+    u32* digits = reinterpret_cast<u32*>(sX);
+    if (tid < CRT2_ROWS) {
+        u32* dg=digits+tid*DS; const u64* xs=sX+tid*cfg.SX;
+        u64 carry=0; const unsigned words=cfg.NT*2u;
+        for (unsigned w=0;w<words;++w){carry+=xs[w];dg[w]=u32(carry);carry>>=32;}
+        for (unsigned w=words;w<l+2u;++w){dg[w]=u32(carry);carry>>=32;}
+        gpu31::reduce_sum<1>(dg,l,pl.bits,pl.gap,pl.q);
+    }
+    __syncthreads();
+
+    TCP_T(t4);
+    const unsigned rows=(n-start<CRT2_ROWS)?(n-start):CRT2_ROWS;
+    if (slot_logN==0) {
+        const u64 ob=u64(pair)*n*l+u64(start)*l;
+        for(unsigned idx=tid;idx<rows*l;idx+=THREADS){
+            const unsigned r=idx/l,cc=idx-r*l;
+            out[ob+idx]=digits[r*DS+cc];
+        }
+    } else {
+        const u64 ob=u64(pair)*n*l;
+        for(unsigned idx=tid;idx<rows*l;idx+=THREADS){
+            const unsigned r=idx/l,cc=idx-r*l;
+            const unsigned pos=__brev(start+r)>>(32-slot_logN);
+            out[ob+u64(pos)*l+cc]=digits[r*DS+cc];
+        }
+    }
+    TCP_T(t5);
+    TCP_ADD(0,t0,t1);TCP_ADD(1,t1,t2);TCP_ADD(2,t2,t3);
+    TCP_ADD(3,t3,t4);TCP_ADD(4,t4,t5);
+}
+#endif // OC55_WARPS8
 
 #if OC27_ROWS64
 // OC27 CRT variant: 64 rows/CTA, warps split n-tiles, B reused by 4 m-tiles.

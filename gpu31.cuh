@@ -1380,6 +1380,14 @@ struct Device {
                                                          OC31_TILE_RC ? n / tc::NT_TILE : 0);
                 } else
 #endif
+#if OC55_WARPS8
+                if (r8f && (n & 31u) == 0) {
+                    tc::crt_tc2_w8<<<dim3(n / tc::CRT2_ROWS, 1, B), 256, crt2_shared, stream>>>(
+                        crt_args_, prc, pc, d_fcrt, c2,
+                        d_primes, d_untw_slot, logN, d_corr_m,
+                        r8f ? n / 32u : 0u, d_pk_inv, r8f ? (d_fenc_b ? 2u : 1u) : 0u);
+                } else
+#endif
                 tc::crt_tc2<<<dim3((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, B), 128,
                               crt2_shared, stream>>>(crt_args_, r8f ? prc : (OC31_TILE_RC ? pio : prc), pc, d_fcrt, c2,
                                                      d_primes, d_untw_slot, logN, d_corr_m,
