@@ -1468,16 +1468,23 @@ __device__ __forceinline__ u32 r8_ld_cluster(const u32* local, unsigned rank) {
     asm volatile("ld.shared::cluster.u32 %0, [%1];" : "=r"(v) : "r"(ra) : "memory");
     return v;
 }
+#ifndef M9_LOGH7
+#define M9_LOGH7 1
+#endif
+// M9: LH != 0 makes logH a compile-time constant, so every waf/wai/stage index
+// folds and the 56-byte local-memory copy of waf[7]/wai[7] disappears.
+template <unsigned LH>
 __device__ __forceinline__ void
 fused_high_dev(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
-           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
+           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH_arg,
            const u32* __restrict__ pkf, unsigned ef256,
            unsigned bx, unsigned by, unsigned bz, u64 rcoff,
            const u32* __restrict__ pki = nullptr, u32* __restrict__ r8out = nullptr,
            unsigned r8f = 0) {
     // twf/twi: per prime [7][512] "low" factors followed by [127] "within"
     // factors: w = mont(A[s][low], B[(2^s-1)+within]) = root[(within*512+low)<<d].
+    const unsigned logH = LH ? LH : logH_arg;
     extern __shared__ u32 sm[];
     constexpr unsigned S = TC31_S32 ? NT_COLS : NT_COLS + 1;   // all accesses are row*S+lane
     const unsigned HC = 1u << logH;
@@ -2232,7 +2239,15 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
            const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
            const u32* __restrict__ pkf = nullptr, unsigned ef256 = 0,
            const u32* __restrict__ pki = nullptr, unsigned r8f = 0) {
-    fused_high_dev(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
+#if M9_LOGH7
+    if (logH == 7) {
+        fused_high_dev<7>(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
+                          blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
+                          pki, nullptr, r8f);
+        return;
+    }
+#endif
+    fused_high_dev<0>(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
                    blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
                    pki, nullptr, r8f);
 }
@@ -2245,7 +2260,7 @@ fused_high_r8(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __res
               const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
               const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
               const u32* __restrict__ pkf, unsigned ef256, const u32* __restrict__ pki) {
-    fused_high_dev(ra, rb, nullptr, primes, twf, twi, n, K, logH, pkf, ef256,
+    fused_high_dev<7>(ra, rb, nullptr, primes, twf, twi, n, K, logH, pkf, ef256,
                    blockIdx.x, blockIdx.y, blockIdx.z, 0, pki, out);
 }
 
@@ -2377,7 +2392,7 @@ fh_inv(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__
             const unsigned q = st;
             if (q >= P) continue;
             if (q >= TC36_R) tc36_wait(inv_done + (q - TC36_R), IG);
-            fused_high_dev(ra, rb, ring, primes, twf, twi, n, K, logH, pkf, ef256,
+            fused_high_dev<0>(ra, rb, ring, primes, twf, twi, n, K, logH, pkf, ef256,
                            r, q % K, q / K, u64(q % TC36_R) * n);
             tc36_signal(fh_done + q);
         } else {
