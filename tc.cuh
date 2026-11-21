@@ -23,6 +23,15 @@
 // [ntile][kstep][lane] order (uint2 per lane): one coalesced LDG.64 per mma.
 #pragma once
 
+// P7b probe (H5 retry): persistent-copy kernels. P7b already measured, default 0.
+#ifndef P7B_PROBE
+#define P7B_PROBE 0
+#endif
+// P7c probe (H5 final check): concurrency control + persistent kernels.
+#ifndef P7C_PROBE
+#define P7C_PROBE 1
+#endif
+
 #include <cstdint>
 #include <vector>
 
@@ -2236,6 +2245,322 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                    blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
                    pki, nullptr, r8f);
 }
+
+
+#if P7B_PROBE || P7C_PROBE
+// ---- P7b/P7c probe copies (not used by the master pipeline) ----------
+__device__ __forceinline__ void crt_tc2_dev_p7b(gpu31::CrtArgs pl,
+       const u32* __restrict__ residues, u32* __restrict__ out,
+       const uint2* __restrict__ frag, CrtTc cfg,
+       const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+       unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles,
+       const u32* __restrict__ pki, unsigned r8f, unsigned tile) {
+    // slot_logN != 0: residues are in bit-reversed slot order (DIF inverse);
+    // row `slot` holds coefficient rev(slot).  untw_inv is then slot-ordered.
+    // Shared: one region, used as sA (u32, stride SA) -> sX (u64, stride SX)
+    // -> digits (u32, in place over sX, stride 2*SX).
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    // TC15: 32 rows/CTA; sA stays live during the GEMM, sX is separate.
+    u32* sA = reinterpret_cast<u32*>(smem_raw);
+    u64* sX = reinterpret_cast<u64*>(smem_raw +
+        ((std::size_t(CRT2_ROWS) * cfg.SA * 4 + 15) & ~std::size_t(15)));
+    constexpr unsigned NG = 128 / CRT2_ROWS;   // staging groups per row
+
+    const unsigned n = pl.n, l = pl.limbs, K = pl.count;
+    const unsigned ntile_x = (pl.n + CRT2_ROWS - 1) / CRT2_ROWS;
+    const unsigned pair = tile / ntile_x, start = (tile % ntile_x) * CRT2_ROWS;
+    const unsigned tid = threadIdx.x;
+    const unsigned c = tid & (CRT2_ROWS - 1), jg = tid / CRT2_ROWS;
+    const unsigned i = start + c;
+    const bool active = i < n;
+    const u64 rbase = u64(pair) * K * n;
+    // OC31: tile-major rc written by inv_low into the dead pra buffer.
+    // CRT2_ROWS (32) divides NT_TILE (512), so a CTA never straddles tiles.
+    // R8F: [pair][x>>5][K][32] from fused_high (ntiles = n/32).
+    const unsigned tsh = r8f ? 5u : 9u;
+    const u64 rbase2 = (OC31_TILE_RC && ntiles)
+        ? (u64(pair) * ntiles + (start >> tsh)) * K : 0ull;
+    auto RC = [&](unsigned j, unsigned coeff) -> u32 {
+        return (OC31_TILE_RC && ntiles)
+            ? residues[((rbase2 + j) << tsh) + (coeff & ((1u << tsh) - 1u))]
+            : residues[rbase + u64(j) * n + coeff];
+    };
+    const unsigned W = cfg.KS * 8;
+
+    TCP_T(t0);
+    // 1. terms + fixed-point correction sum (term/p in 2^-32 units)
+    u64 fsum = 0;
+    if (r8f) {
+        // R8F (v2): thread = limb.  Its 32 residues of this 32-run are one
+        // contiguous 128 B block -> 8 uint4 loads; the 32-point inverse
+        // (DIF stages 4..0) runs in registers (80 butterflies, no shfl), then
+        // the n^-1*inv weight and one sA column write.  The row correction
+        // sums are taken from sA after the barrier.
+        if (tid < K) {
+            const unsigned j = tid;
+            const gpu31::Prime pj = c_crt_prime[j];
+            const uint4* src = reinterpret_cast<const uint4*>(residues + ((rbase2 + j) << 5));
+            const uint4* twp = reinterpret_cast<const uint4*>(pki + u64(j) * TC_LT);
+            u32 v[32], tw[32];
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const uint4 x = __ldcs(src + e);
+                v[4 * e] = x.x; v[4 * e + 1] = x.y; v[4 * e + 2] = x.z; v[4 * e + 3] = x.w;
+                const uint4 y = __ldg(twp + e);
+                tw[4 * e] = y.x; tw[4 * e + 1] = y.y; tw[4 * e + 2] = y.z; tw[4 * e + 3] = y.w;
+            }
+#pragma unroll
+            for (int m = 4; m >= 0; --m) {
+                const unsigned half = 1u << m;
+#pragma unroll
+                for (unsigned i = 0; i < 32; ++i) {
+                    if (i & half) continue;
+                    const u32 u = v[i], x = v[i + half];
+                    v[i] = gpu31::add(u, x, pj.p);
+                    v[i + half] = gpu31::mont(gpu31::sub(u, x, pj.p), tw[(half - 1) + (i & (half - 1))], pj);
+                }
+            }
+            if (r8f >= 2) {
+                // R8F v3: b was encoded with the CRT weight folded in, so the
+                // inverse output already is the term.
+#pragma unroll
+                for (unsigned r = 0; r < 32; ++r) sA[r * cfg.SA + j] = v[r];
+            } else {
+                const u32 cw = c_crt_slotc[j];
+#pragma unroll
+                for (unsigned r = 0; r < 32; ++r) sA[r * cfg.SA + j] = gpu31::mont(v[r], cw, pj);
+            }
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (unsigned j = jg; j < K; j += NG)
+            fsum += (u64(sA[c * cfg.SA + j]) * c_crt_corr[j]) >> 30;
+    } else if (untw_inv && K <= CRT_KMAX_C) {
+        // TC11: batched loads (8 independent residue+untwist pairs in flight),
+        // prime and correction constants from __constant__ (warp-uniform j).
+#pragma unroll 1
+        for (unsigned j0 = jg; j0 < K; j0 += 8 * NG) {
+            u32 r[8], u[8];
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) {
+                const unsigned j = j0 + NG * q;
+                r[q] = (j < K && active) ? RC(j, i) : 0u;
+                u[q] = (TC22_MERGED && slot_logN) ? 0u : ((j < K && active) ? untw_inv[u64(j) * n + i] : 0u);
+            }
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) {
+                const unsigned j = j0 + NG * q;
+                if (j < K) {
+                    const u32 term = (OC32_PREWEIGHT && TC22_MERGED && slot_logN && !r8f)
+                        ? r[q]
+                        : gpu31::mont(r[q], (TC22_MERGED && slot_logN) ? c_crt_slotc[j] : u[q], c_crt_prime[j]);
+                    sA[c * cfg.SA + j] = term;
+                    fsum += (u64(term) * c_crt_corr[j]) >> 30;
+                }
+            }
+        }
+    } else {
+#pragma unroll 4
+    for (unsigned j = jg; j < K; j += NG) {
+        u32 term = 0;
+        if (active) {
+            const u32 r = RC(j, i);
+            if (OC32_PREWEIGHT && TC22_MERGED && slot_logN && untw_inv)
+                term = r;
+            else if (untw_inv)
+                term = gpu31::mont(r, untw_inv[u64(j) * n + i], primes[j]);
+            else
+                term = gpu31::weight_residue(r, pl.primes[j]);
+        }
+        sA[c * cfg.SA + j] = term;
+        fsum += (u64(term) * corr_m[j]) >> 30;
+    }
+    }
+    for (unsigned j = K + 1 + jg; j < W; j += NG) sA[c * cfg.SA + j] = 0;
+    // spare words W..W+3 of the row hold the two partial sums
+    sA[c * cfg.SA + W + 2 * jg] = u32(fsum);
+    sA[c * cfg.SA + W + 2 * jg + 1] = u32(fsum >> 32);
+    __syncthreads();
+    if (jg == 0) {
+        const u32* rw = sA + c * cfg.SA + W;
+        u64 s = 0;
+#pragma unroll
+        for (unsigned q = 0; q < NG; ++q) s += u64(rw[2 * q]) | (u64(rw[2 * q + 1]) << 32);
+        sA[c * cfg.SA + K] = u32((s + (u64(1) << 31)) >> 32);
+    }
+    __syncthreads();
+
+    TCP_T(t1);
+    // 2-3. warps split the n-tiles (nt = warp + 4u); each warp covers all
+    // 32 rows (2 m-tiles) so one B fragment feeds two mma; A from shared.
+    const unsigned warp = tid >> 5, lane = tid & 31;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const bool odd = t & 1;
+    const unsigned sh = (t & 1) * 16;
+    TCP_T(t2);
+    for (unsigned nt0 = warp; nt0 < cfg.NT; nt0 += 8) {
+        const unsigned ntA = nt0, ntB = nt0 + 4;
+        const bool hasB = ntB < cfg.NT;
+        int acc[2][2][4];
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (unsigned q = 0; q < 2; ++q) acc[mt][q][0] = acc[mt][q][1] = acc[mt][q][2] = acc[mt][q][3] = 0;
+#pragma unroll 3
+        for (unsigned ks = 0; ks < cfg.KS; ++ks) {
+            const uint2 b0 = frag[(std::size_t(ntA) * cfg.KS + ks) * 32 + lane];
+            const uint2 b1 = hasB ? frag[(std::size_t(ntB) * cfg.KS + ks) * 32 + lane] : make_uint2(0u, 0u);
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const u32* r0 = sA + (mt * 16 + g) * cfg.SA + ks * 8 + t;
+                const u32* r1 = r0 + 8 * cfg.SA;
+                const u32 x0 = r0[0], x1 = r1[0], x2 = r0[4], x3 = r1[4];
+                mma_u8(acc[mt][0], x0, x1, x2, x3, b0.x, b0.y);
+                if (hasB) mma_u8(acc[mt][1], x0, x1, x2, x3, b1.x, b1.y);
+            }
+        }
+#pragma unroll
+        for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (unsigned q = 0; q < 2; ++q) {
+                if (q == 1 && !hasB) continue;
+                const unsigned nt = q ? ntB : ntA;
+                const u64 pg = (u64(u32(acc[mt][q][0])) << sh) + (u64(u32(acc[mt][q][1])) << (sh + 8));
+                const u64 pg8 = (u64(u32(acc[mt][q][2])) << sh) + (u64(u32(acc[mt][q][3])) << (sh + 8));
+                const u64 send = odd ? pg : pg8;
+                const u64 mine = odd ? pg8 : pg;
+                const u64 tot = mine + __shfl_xor_sync(0xffffffffu, send, 1);
+                const unsigned row = mt * 16 + g + (odd ? 8 : 0);
+                sX[row * cfg.SX + nt * 2 + (t >> 1)] = tot;
+            }
+    }
+    __syncthreads();
+
+    TCP_T(t3);
+    // 4. carry + reduce.  OC26_CARRY=0: exact original path (one thread per
+    // row, digits in place over sX).  OC26_CARRY=1: four threads per row,
+    // separate digit buffer in the dead sA region, owner propagates carries.
+    const unsigned DS = 2 * cfg.SX;
+#if OC26_CARRY
+    u32* digits = reinterpret_cast<u32*>(sA);   // separate from xs (no race)
+    {
+        const unsigned words = cfg.NT * 2;
+        // sA is 32*SA*4 bytes; digits need 32*DS*4 = 32*2*SX*4 bytes.  With
+        // SA >= 2*SX in all configs (SA=124, SX=57), this fits; cout[] lives
+        // in the tail of the same sA region beyond the digit buffer.
+        u64* cout = reinterpret_cast<u64*>(digits + CRT2_ROWS * DS);
+        const unsigned row = tid >> 2;
+        oc26_carry_row(sX + row * cfg.SX, digits + row * DS, cout,
+                       words, l + 2);
+        // oc26_carry_row contains the only __syncthreads of this phase; it is
+        // reached by all 128 threads, so the barrier is uniform.
+        if (row < CRT2_ROWS && (tid & 3) == 0) {   // one reducer per row
+            u32* dg = digits + row * DS;
+            gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
+        }
+    }
+    __syncthreads();
+#else
+    u32* digits = reinterpret_cast<u32*>(sX);
+    if (tid < CRT2_ROWS) {
+        u32* dg = digits + tid * DS;
+        const u64* xs = sX + tid * cfg.SX;
+        u64 carry = 0;
+        const unsigned words = cfg.NT * 2;
+        for (unsigned w = 0; w < words; ++w) {
+            carry += xs[w];
+            dg[w] = u32(carry);
+            carry >>= 32;
+        }
+        for (unsigned w = words; w < l + 2; ++w) {
+            dg[w] = u32(carry);
+            carry >>= 32;
+        }
+        gpu31::reduce_sum<1>(dg, l, pl.bits, pl.gap, pl.q);
+    }
+    __syncthreads();
+#endif
+
+    TCP_T(t4);
+    // 5. store the tile's rows
+    const unsigned rows = (n - start < CRT2_ROWS) ? (n - start) : CRT2_ROWS;
+    if (slot_logN == 0) {
+        const u64 obase = u64(pair) * n * l + u64(start) * l;
+        for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
+            const unsigned r = idx / l, cc = idx - r * l;
+            out[obase + idx] = digits[r * DS + cc];
+        }
+    } else {
+        const u64 obase = u64(pair) * n * l;
+        for (unsigned idx = tid; idx < rows * l; idx += blockDim.x) {
+            const unsigned r = idx / l, cc = idx - r * l;
+            const unsigned pos = __brev(start + r) >> (32 - slot_logN);
+            out[obase + u64(pos) * l + cc] = digits[r * DS + cc];
+        }
+    }
+    TCP_T(t5);
+    TCP_ADD(0, t0, t1); TCP_ADD(1, t1, t2); TCP_ADD(2, t2, t3);
+    TCP_ADD(3, t3, t4); TCP_ADD(4, t4, t5);
+}
+
+// Persistent CRT: 1 CTA/SM, each CTA walks the tile list with grid stride.
+__global__ void __launch_bounds__(128, 3)
+crt_persist(gpu31::CrtArgs pl, const u32* __restrict__ residues, u32* __restrict__ out,
+            const uint2* __restrict__ frag, CrtTc cfg,
+            const gpu31::Prime* __restrict__ primes, const u32* __restrict__ untw_inv,
+            unsigned slot_logN, const u32* __restrict__ corr_m, unsigned ntiles,
+            const u32* __restrict__ pki, unsigned r8f, unsigned total) {
+    for (unsigned v = blockIdx.x; v < total; v += gridDim.x)
+        crt_tc2_dev_p7b(pl, residues, out, frag, cfg, primes, untw_inv, slot_logN,
+                        corr_m, ntiles, pki, r8f, v);
+}
+
+// Persistent fused_high: 2 CTA/SM, grid-stride over (16, K, pairs) tiles.
+__global__ void __launch_bounds__(256, 3)
+fh_persist(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restrict__ rc,
+           const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
+           const u32* __restrict__ twi, unsigned n, unsigned K, unsigned logH,
+           const u32* __restrict__ pkf, unsigned ef256,
+           const u32* __restrict__ pki, unsigned r8f, unsigned total) {
+    constexpr unsigned FT = NT_TILE / NT_COLS;
+    for (unsigned v = blockIdx.x; v < total; v += gridDim.x) {
+        const unsigned bx = v % FT;
+        const unsigned by = (v / FT) % K;
+        const unsigned bz = v / (FT * K);
+        fused_high_dev(ra, rb, rc, primes, twf, twi, n, K, logH, pkf, ef256,
+                       bx, by, bz, (u64(bz) * K + by) * n, pki, nullptr, r8f);
+    }
+}
+#if P7C_PROBE
+// P7c concurrency controls: fixed-duration ALU and tensor-core spinners.
+// 188 CTA x 128 threads x 1 KiB shared, timing only.
+__global__ void spin_alu_probe(long long cycles, u32* out) {
+    __shared__ u32 pad[256];
+    const unsigned tid = threadIdx.x;
+    pad[tid] = tid;
+    u32 acc = tid;
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles)
+        acc = acc * 1664525u + 1013904223u + pad[(tid + acc) & 255u];
+    if (tid == 0) out[blockIdx.x] = acc + pad[0];
+}
+
+__global__ void spin_mma_probe(long long cycles, u32* out) {
+    __shared__ u32 pad[256];
+    const unsigned tid = threadIdx.x;
+    pad[tid] = tid;
+    const u32 a0 = 0x01010101u, a1 = 0x02020202u, a2 = 0x03030303u, a3 = 0x04040404u;
+    const u32 b0 = 0x05050505u, b1 = 0x06060606u;
+    int c[4] = {0, 0, 0, 0};
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) {
+        mma_u8(c, a0, a1, a2, a3, b0, b1);
+        c[0] = c[0] + 1;   // keep the chain live
+    }
+    if (tid == 0) out[blockIdx.x] = u32(c[0]) + pad[0];
+}
+#endif // P7C_PROBE
+#endif // P7B_PROBE || P7C_PROBE
 
 // R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
 // grid (16, K, B), block (32, 8); requires logH == 7 (one row per warp) and

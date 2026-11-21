@@ -765,6 +765,9 @@ void* fherma_init(const fherma::Point& p) {
                     std::fprintf(stderr, "[TC] selfcheck enc=%d crt=%d fuse_decode=%d ntt=%d efl=%d chunk=%d\n",
                                  int(d.tc_enc), int(d.tc_crt), int(d.tc_fuse_decode), int(d.tc_ntt),
                                  int(d.tc_efl), int(d.tc_chunk));
+                    d.p7_probe();   // P7 (H5): init-time timing-only core-residency probe
+                    d.p7b_probe();  // P7b (H5 retry): persistent small-grid coresidency probe
+                    d.p7c_probe();  // P7c (H5 final): stream concurrency + resource separation
                 }
 
                 // Try the conflict-free CRT, keeping it only if bit-identical to

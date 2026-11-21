@@ -24,6 +24,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <functional>
+
+// P7 probe (H5 core-residency): timing-only, init-time.  Set to 0 to compile
+// exactly the master code path.  The flag is defined before the first #if.
+#ifndef P7_PROBE
+#define P7_PROBE 0   // P7 already measured; this branch runs the P7b retry
+#endif
 
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
@@ -1183,6 +1190,491 @@ struct Device {
                              dim3(crt_tile_x, crt_tile_y), crt_shared_, stream>>>(
             crt_args_, residues, out);
         return cudaGetLastError();
+    }
+
+    // P7 probe (H5 core-residency).  Init-time, timing-only: launches the
+    // *unmodified* working kernels with a PER-LAUNCH shared-memory carveout so
+    // they can share an SM.  No global CUDA function attribute is touched, so
+    // the timed pipeline after the probe cannot be affected by it.
+    void p7_probe() {
+#if P7_PROBE
+        if (!tc_ntt || !tc_crt2 || !tc_efl || capacity_ < 128) return;
+        const unsigned n = plan_.N, k = plan_.K, l = plan_.L, logN = plan_.logN;
+        const unsigned logH = logN - 9;
+        const bool ef256 = TC29_EF256 && TC22_MERGED && tc_efl && logH >= 4;
+        const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC &&
+                         tc_crt2 && !crt2_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
+        if (!ef256 || n % tc::NT_TILE || n % tc::E2_ROWS) return;
+        const unsigned P = 64;   // pairs per timed launch
+        const std::size_t fh_dyn = 2 * (n / tc::NT_TILE) *
+                                   (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+        const dim3 g_fh(tc::NT_TILE / tc::NT_COLS, k, P);
+        const dim3 g_crt((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, P);
+        const dim3 g_enc(n / tc::E2_ROWS, 2, P);
+
+        u32 *d_out = nullptr, *d_encin = nullptr;
+        // crt_tc2 stores N*L u32 per pair (out[pair*n*l + ...]), not N u32.
+        if (cudaMalloc(&d_out, std::size_t(P) * n * l * sizeof(u32)) != cudaSuccess ||
+            cudaMalloc(&d_encin, std::size_t(P) * n * l * sizeof(u32)) != cudaSuccess) {
+            cudaGetLastError();
+            if (d_out) cudaFree(d_out);
+            if (d_encin) cudaFree(d_encin);
+            std::fprintf(stderr, "[P7] alloc failed\n");
+            return;
+        }
+
+        cudaStream_t s0 = cs_[0] ? cs_[0] : 0, s1 = cs_[1] ? cs_[1] : s0;
+        bool owned_s1 = false;
+        if (s1 == s0) {
+            if (cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking) == cudaSuccess) owned_s1 = true;
+            else s1 = s0;
+        }
+        cudaEvent_t e0, e1, e0b, e2;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventCreate(&e0b); cudaEventCreate(&e2);
+
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceProp prop{}; cudaGetDeviceProperties(&prop, dev);
+        const std::size_t smem = prop.sharedMemPerMultiprocessor
+                               ? prop.sharedMemPerMultiprocessor
+                               : (prop.sharedMemPerBlockOptin
+                                      ? prop.sharedMemPerBlockOptin : std::size_t(100) * 1024);
+        auto pct = [&](std::size_t bytes, unsigned slots) -> int {
+            int v = int(double(bytes) * double(slots) * 100.0 / double(smem)) + 2;
+            return v < 1 ? 1 : (v > 100 ? 100 : v);
+        };
+        const int co_fh = pct(fh_dyn, 2);        // at most 2 fh CTAs / SM
+        const int co_crt = pct(crt2_shared, 1);  // at most 1 crt CTA / SM
+        const int co_enc = pct(40u * 1024u, 1);  // at most 1 encode CTA / SM
+
+        // Argument lists are copied verbatim from tc_pipeline; only the pair
+        // offset and the output scratch differ.
+        const u32* cr_res = (r8f ? d_rc : (OC31_TILE_RC ? d_ra : d_rc)) +
+                            std::size_t(P) * k * n;          // CRT works on pairs 64..127
+        const unsigned cr_ntiles = r8f ? n / 32 : (OC31_TILE_RC ? n / tc::NT_TILE : 0);
+        const unsigned cr_r8f = r8f ? (d_fenc_b ? 2u : 1u) : 0u;
+        tc::CrtTc c2 = crt_cfg; c2.SA = crt2_SA;
+        int launch_err = 0;
+
+        auto config = [](dim3 grid, dim3 block, std::size_t dyn, cudaStream_t st,
+                         int co, cudaLaunchAttribute* a) {
+            cudaLaunchConfig_t c{};
+            c.gridDim = grid; c.blockDim = block; c.dynamicSmemBytes = dyn; c.stream = st;
+            a[0].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+            a[0].val.sharedMemCarveout = unsigned(co);
+            c.attrs = a; c.numAttrs = 1;
+            return c;
+        };
+        auto launch_fh = [&](unsigned first, cudaStream_t st, int co) {
+            cudaLaunchAttribute a[1];
+            cudaLaunchConfig_t c = config(g_fh, dim3(tc::NT_COLS, 8), fh_dyn, st, co, a);
+            cudaError_t e = cudaLaunchKernelEx(&c, tc::fused_high,
+                d_ra + std::size_t(first) * k * n, d_rb + std::size_t(first) * k * n,
+                d_rc + std::size_t(first) * k * n, d_primes, d_twf, d_twi,
+                n, k, logH, d_pk_fwd, ef256 ? 1u : 0u,
+                r8f ? d_pk_inv : nullptr, r8f ? 1u : 0u);
+            if (e != cudaSuccess) {
+                if (launch_err < 4) std::fprintf(stderr, "[P7] fh launch err=%d co=%d\n", int(e), co);
+                ++launch_err; cudaGetLastError();
+            }
+        };
+        auto launch_crt = [&](cudaStream_t st, int co) {
+            cudaLaunchAttribute a[1];
+            cudaLaunchConfig_t c = config(g_crt, 128, crt2_shared, st, co, a);
+            cudaError_t e = cudaLaunchKernelEx(&c, tc::crt_tc2,
+                crt_args_, cr_res, d_out, d_fcrt, c2, d_primes, d_untw_slot, logN,
+                d_corr_m, cr_ntiles, d_pk_inv, cr_r8f);
+            if (e != cudaSuccess) {
+                if (launch_err < 4) std::fprintf(stderr, "[P7] crt launch err=%d co=%d\n", int(e), co);
+                ++launch_err; cudaGetLastError();
+            }
+        };
+        auto launch_enc = [&](cudaStream_t st, int co) {
+            // encode writes pairs 0..63 into d_ra/d_rb; the input is scratch so
+            // the store cannot corrupt the source of a concurrent kernel.
+            cudaLaunchAttribute a[1];
+            cudaLaunchConfig_t c = config(g_enc, 256, 0, st, co, a);
+            cudaError_t e = cudaLaunchKernelEx(&c, tc::encode_fwdlow256,
+                d_encin, d_encin, d_ra, d_rb, d_fenc, d_primes, d_weights,
+                d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,
+                r8f ? d_fenc_b : nullptr);
+            if (e != cudaSuccess) {
+                if (launch_err < 4) std::fprintf(stderr, "[P7] enc launch err=%d co=%d\n", int(e), co);
+                ++launch_err; cudaGetLastError();
+            }
+        };
+
+        // Plain <<<>>> launches need no launch attribute at all.  They are used
+        // for the warm-up and the full-occupancy baselines, so a unsupported
+        // carveout attribute can never affect the timed pipeline.
+        auto plain_fh = [&](unsigned first, cudaStream_t st) {
+            tc::fused_high<<<g_fh, dim3(tc::NT_COLS, 8), fh_dyn, st>>>(
+                d_ra + std::size_t(first) * k * n, d_rb + std::size_t(first) * k * n,
+                d_rc + std::size_t(first) * k * n, d_primes, d_twf, d_twi,
+                n, k, logH, d_pk_fwd, ef256 ? 1u : 0u,
+                r8f ? d_pk_inv : nullptr, r8f ? 1u : 0u);
+        };
+        auto plain_crt = [&](cudaStream_t st) {
+            tc::crt_tc2<<<g_crt, 128, crt2_shared, st>>>(
+                crt_args_, cr_res, d_out, d_fcrt, c2, d_primes, d_untw_slot, logN,
+                d_corr_m, cr_ntiles, d_pk_inv, cr_r8f);
+        };
+        auto plain_enc = [&](cudaStream_t st) {
+            tc::encode_fwdlow256<<<g_enc, 256, 0, st>>>(
+                d_encin, d_encin, d_ra, d_rb, d_fenc, d_primes, d_weights,
+                d_pk_fwd, n, l, k, logN, enc_KS, enc_NT, r8f ? 1u : 0u,
+                r8f ? d_fenc_b : nullptr);
+        };
+
+        plain_fh(0, s0); plain_crt(s0); plain_enc(s0);
+        cudaStreamSynchronize(s0); cudaGetLastError();   // warm up
+
+        auto best1 = [&](const std::function<void(cudaStream_t)>& launch) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, s0);
+                launch(s0);
+                cudaEventRecord(e1, s0);
+                cudaStreamSynchronize(s0);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (t < best) best = t;
+            }
+            return best;
+        };
+        auto best2 = [&](const std::function<void(cudaStream_t)>& a,
+                         const std::function<void(cudaStream_t)>& b) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, s0);
+                a(s0);
+                cudaEventRecord(e1, s0);
+                cudaEventRecord(e0b, s1);
+                b(s1);
+                cudaEventRecord(e2, s1);
+                cudaStreamSynchronize(s0);
+                cudaStreamSynchronize(s1);
+                float ta = 0.f, tb = 0.f;
+                cudaEventElapsedTime(&ta, e0, e1);
+                cudaEventElapsedTime(&tb, e0b, e2);
+                const float t = ta > tb ? ta : tb;
+                if (t < best) best = t;
+            }
+            return best;
+        };
+
+        const float fh64 = best1([&](cudaStream_t st) { plain_fh(0, st); });
+        const float crt64 = best1(plain_crt);
+        const float enc64 = best1(plain_enc);
+
+
+        const float fh_c = best1([&](cudaStream_t st) { launch_fh(0, st, co_fh); });
+        const float crt_c = best1([&](cudaStream_t st) { launch_crt(st, co_crt); });
+        const float enc_c = best1([&](cudaStream_t st) { launch_enc(st, co_enc); });
+        // fh (pairs 0..63) on s0, crt (pairs 64..127) on s1.
+        const float both_fhcrt = best2([&](cudaStream_t st) { launch_fh(0, st, co_fh); },
+                                       [&](cudaStream_t st) { launch_crt(st, co_crt); });
+        // encode (pairs 0..63) on s0, fh (pairs 64..127) on s1.
+        const float both_encfh = best2([&](cudaStream_t st) { launch_enc(st, co_enc); },
+                                       [&](cudaStream_t st) { launch_fh(64, st, co_fh); });
+
+        std::fprintf(stderr, "[P7] fh64=%.3f crt64=%.3f both=%.3f (fh2+crt1)\n",
+                     fh64, crt64, both_fhcrt);
+        std::fprintf(stderr,
+            "[P7] detail: fh_c=%.3f crt_c=%.3f enc64=%.3f enc_c=%.3f both_encfh=%.3f "
+            "(enc1+fh1) co=%d/%d/%d err=%d smem=%zu fh=%zu crt=%zu\n",
+            fh_c, crt_c, enc64, enc_c, both_encfh,
+            co_fh, co_crt, co_enc, launch_err, smem, fh_dyn, crt2_shared);
+
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaEventDestroy(e0b); cudaEventDestroy(e2);
+        if (owned_s1) cudaStreamDestroy(s1);
+        cudaFree(d_out); cudaFree(d_encin);
+        cudaGetLastError();
+#endif
+    }
+
+    // P7b probe (H5 retry): persistent kernels with small grids, so the two
+    // kernels are resident on the same SM from the start instead of one
+    // draining its whole grid first.  Init-time, timing-only, separate copies
+    // of the kernels; no working kernel is modified.
+    void p7b_probe() {
+#if P7B_PROBE
+        if (!tc_ntt || !tc_crt2 || !tc_efl || capacity_ < 128) return;
+        const unsigned n = plan_.N, k = plan_.K, l = plan_.L, logN = plan_.logN;
+        const unsigned logH = logN - 9;
+        const bool ef256 = TC29_EF256 && TC22_MERGED && tc_efl && logH >= 4;
+        const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC &&
+                         tc_crt2 && !crt2_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
+        if (!ef256 || n % tc::NT_TILE || n % tc::E2_ROWS) return;
+        const unsigned P = 64;
+        const std::size_t fh_dyn = 2 * (n / tc::NT_TILE) *
+                                   (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+        const unsigned total_fh = (tc::NT_TILE / tc::NT_COLS) * k * P;
+        const unsigned total_crt = ((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS) * P;
+        u32* d_out = nullptr;
+        if (cudaMalloc(&d_out, std::size_t(P) * n * l * sizeof(u32)) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "[P7b] alloc failed\n");
+            return;
+        }
+
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceProp prop{}; cudaGetDeviceProperties(&prop, dev);
+        const unsigned sms = prop.multiProcessorCount ? unsigned(prop.multiProcessorCount) : 188u;
+        const dim3 g_fh_p(sms * 2, 1, 1);   // 2 CTA/SM x 32 KiB = 64 KiB
+        const dim3 g_crt_p(sms, 1, 1);      // 1 CTA/SM x 31.5 KiB
+        const dim3 b_fh(tc::NT_COLS, 8, 1), b_crt(128, 1, 1);
+        const dim3 g_fh_plain(tc::NT_TILE / tc::NT_COLS, k, P);
+        const dim3 g_crt_plain((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS, 1, P);
+
+        cudaStream_t s0 = cs_[0] ? cs_[0] : 0, s1 = cs_[1] ? cs_[1] : s0;
+        bool owned_s1 = false;
+        if (s1 == s0) {
+            if (cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking) == cudaSuccess) owned_s1 = true;
+            else s1 = s0;
+        }
+        cudaEvent_t e0, e1, e0b, e2;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventCreate(&e0b); cudaEventCreate(&e2);
+
+        const u32* cr_res = (r8f ? d_rc : (OC31_TILE_RC ? d_ra : d_rc)) +
+                            std::size_t(P) * k * n;
+        const unsigned cr_ntiles = r8f ? n / 32 : (OC31_TILE_RC ? n / tc::NT_TILE : 0);
+        const unsigned cr_r8f = r8f ? (d_fenc_b ? 2u : 1u) : 0u;
+        tc::CrtTc c2 = crt_cfg; c2.SA = crt2_SA;
+
+        auto fh_plain = [&](cudaStream_t st) {
+            tc::fused_high<<<g_fh_plain, b_fh, fh_dyn, st>>>(
+                d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd,
+                ef256 ? 1u : 0u, r8f ? d_pk_inv : nullptr, r8f ? 1u : 0u);
+        };
+        auto crt_plain = [&](cudaStream_t st) {
+            tc::crt_tc2<<<g_crt_plain, 128, crt2_shared, st>>>(
+                crt_args_, cr_res, d_out, d_fcrt, c2, d_primes, d_untw_slot, logN,
+                d_corr_m, cr_ntiles, d_pk_inv, cr_r8f);
+        };
+        auto fh_persist = [&](cudaStream_t st) {
+            tc::fh_persist<<<g_fh_p, b_fh, fh_dyn, st>>>(
+                d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd,
+                ef256 ? 1u : 0u, r8f ? d_pk_inv : nullptr, r8f ? 1u : 0u, total_fh);
+        };
+        auto crt_persist = [&](cudaStream_t st) {
+            tc::crt_persist<<<g_crt_p, 128, crt2_shared, st>>>(
+                crt_args_, cr_res, d_out, d_fcrt, c2, d_primes, d_untw_slot, logN,
+                d_corr_m, cr_ntiles, d_pk_inv, cr_r8f, total_crt);
+        };
+
+        fh_plain(s0); crt_plain(s0); fh_persist(s0); crt_persist(s0);
+        cudaStreamSynchronize(s0); cudaGetLastError();   // warm up
+
+        auto best1 = [&](const std::function<void(cudaStream_t)>& launch) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, s0);
+                launch(s0);
+                cudaEventRecord(e1, s0);
+                cudaStreamSynchronize(s0);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (t < best) best = t;
+            }
+            return best;
+        };
+        auto best2 = [&](const std::function<void(cudaStream_t)>& a,
+                         const std::function<void(cudaStream_t)>& b) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, s0);
+                a(s0);
+                cudaEventRecord(e1, s0);
+                cudaEventRecord(e0b, s1);
+                b(s1);
+                cudaEventRecord(e2, s1);
+                cudaStreamSynchronize(s0);
+                cudaStreamSynchronize(s1);
+                float ta = 0.f, tb = 0.f;
+                cudaEventElapsedTime(&ta, e0, e1);
+                cudaEventElapsedTime(&tb, e0b, e2);
+                const float t = ta > tb ? ta : tb;
+                if (t < best) best = t;
+            }
+            return best;
+        };
+
+        const float fh64 = best1(fh_plain);
+        const float crt64 = best1(crt_plain);
+        const float fh_p = best1(fh_persist);
+        const float crt_p = best1(crt_persist);
+        const float both_p = best2(fh_persist, crt_persist);
+
+        std::fprintf(stderr,
+            "[P7b] fh_p=%.3f crt_p=%.3f both_p=%.3f | fh64=%.3f crt64=%.3f sum64=%.3f "
+            "(fh2cta+crt1cta sms=%u tiles=%u/%u)\n",
+            fh_p, crt_p, both_p, fh64, crt64, fh64 + crt64,
+            sms, total_fh, total_crt);
+
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaEventDestroy(e0b); cudaEventDestroy(e2);
+        if (owned_s1) cudaStreamDestroy(s1);
+        cudaFree(d_out);
+        cudaGetLastError();
+#endif
+    }
+
+    // P7c probe (H5 final check).  Init-time, timing-only.  Two questions:
+    // (a) do two streams overlap at all on this platform (spin/spin control),
+    // (b) do spinners overlap with the persistent kernels.  Uses its OWN
+    // non-blocking streams so the pipeline's streams/access-policy windows
+    // cannot be the cause of a serial result.
+    void p7c_probe() {
+#if P7C_PROBE
+        if (!tc_ntt || !tc_crt2 || !tc_efl || capacity_ < 128) return;
+        const unsigned n = plan_.N, k = plan_.K, l = plan_.L, logN = plan_.logN;
+        const unsigned logH = logN - 9;
+        const bool ef256 = TC29_EF256 && TC22_MERGED && tc_efl && logH >= 4;
+        const bool r8f = R8F_FULL && tc_r8f && ef256 && logH == 7 && OC31_TILE_RC &&
+                         tc_crt2 && !crt2_r64 && !tc_invcrt && k <= tc::CRT_KMAX_C && d_untw_slot;
+        if (!ef256 || n % tc::NT_TILE || n % tc::E2_ROWS) return;
+        const unsigned P = 64;
+        const std::size_t fh_dyn = 2 * (n / tc::NT_TILE) *
+                                   (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32);
+        const unsigned total_fh = (tc::NT_TILE / tc::NT_COLS) * k * P;
+        const unsigned total_crt = ((n + tc::CRT2_ROWS - 1) / tc::CRT2_ROWS) * P;
+        u32 *d_out = nullptr, *d_spin = nullptr;
+        if (cudaMalloc(&d_out, std::size_t(P) * n * l * sizeof(u32)) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "[P7c] alloc failed\n");
+            return;
+        }
+        int dev = 0; cudaGetDevice(&dev);
+        cudaDeviceProp prop{}; cudaGetDeviceProperties(&prop, dev);
+        const unsigned sms = prop.multiProcessorCount ? unsigned(prop.multiProcessorCount) : 188u;
+        if (cudaMalloc(&d_spin, std::size_t(sms) * sizeof(u32)) != cudaSuccess) {
+            cudaGetLastError(); cudaFree(d_out);
+            std::fprintf(stderr, "[P7c] alloc failed\n");
+            return;
+        }
+        cudaStream_t sa = nullptr, sb = nullptr;
+        if (cudaStreamCreateWithFlags(&sa, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking) != cudaSuccess) {
+            cudaGetLastError();
+            if (sa) cudaStreamDestroy(sa);
+            if (sb) cudaStreamDestroy(sb);
+            cudaFree(d_out); cudaFree(d_spin);
+            std::fprintf(stderr, "[P7c] no streams\n");
+            return;
+        }
+        cudaEvent_t e0, e1, e0b, e2;
+        cudaEventCreate(&e0); cudaEventCreate(&e1);
+        cudaEventCreate(&e0b); cudaEventCreate(&e2);
+
+        const long long cycles = 3000000LL;   // ~2 ms at ~1.5 GHz
+        const dim3 g_spin(sms, 1, 1), b_spin(128, 1, 1);
+        const dim3 g_fh_p(sms * 2, 1, 1), g_crt_p(sms, 1, 1);
+        const dim3 b_fh(tc::NT_COLS, 8, 1);
+        const u32* cr_res = (r8f ? d_rc : (OC31_TILE_RC ? d_ra : d_rc)) +
+                            std::size_t(P) * k * n;
+        const unsigned cr_ntiles = r8f ? n / 32 : (OC31_TILE_RC ? n / tc::NT_TILE : 0);
+        const unsigned cr_r8f = r8f ? (d_fenc_b ? 2u : 1u) : 0u;
+        tc::CrtTc c2 = crt_cfg; c2.SA = crt2_SA;
+
+        auto spinA = [&](cudaStream_t st) { tc::spin_alu_probe<<<g_spin, b_spin, 1024, st>>>(cycles, d_spin); };
+        auto spinB = [&](cudaStream_t st) { tc::spin_alu_probe<<<g_spin, b_spin, 1024, st>>>(cycles, d_spin); };
+        auto spinM = [&](cudaStream_t st) { tc::spin_mma_probe<<<g_spin, b_spin, 1024, st>>>(cycles, d_spin); };
+        auto crtP = [&](cudaStream_t st) {
+            tc::crt_persist<<<g_crt_p, 128, crt2_shared, st>>>(
+                crt_args_, cr_res, d_out, d_fcrt, c2, d_primes, d_untw_slot, logN,
+                d_corr_m, cr_ntiles, d_pk_inv, cr_r8f, total_crt);
+        };
+        auto fhP = [&](cudaStream_t st) {
+            tc::fh_persist<<<g_fh_p, b_fh, fh_dyn, st>>>(
+                d_ra, d_rb, d_rc, d_primes, d_twf, d_twi, n, k, logH, d_pk_fwd,
+                ef256 ? 1u : 0u, r8f ? d_pk_inv : nullptr, r8f ? 1u : 0u, total_fh);
+        };
+
+        spinA(sa); crtP(sa); spinM(sa); fhP(sa);
+        cudaStreamSynchronize(sa); cudaGetLastError();   // warm up
+
+        // ptxas -v equivalent (registers / local-memory spill) at runtime.
+        cudaFuncAttributes fa_plain{}, fa_pers{};
+        cudaError_t efa = cudaFuncGetAttributes(&fa_plain, (const void*)tc::fused_high);
+        cudaError_t efb = cudaFuncGetAttributes(&fa_pers, (const void*)tc::fh_persist);
+        cudaGetLastError();
+        std::fprintf(stderr,
+            "[P7c] attrs fused_high: regs=%d lmem=%zu smem=%zu (e=%d) | "
+            "fh_persist: regs=%d lmem=%zu smem=%zu (e=%d)\n",
+            fa_plain.numRegs, fa_plain.localSizeBytes, fa_plain.sharedSizeBytes, int(efa),
+            fa_pers.numRegs, fa_pers.localSizeBytes, fa_pers.sharedSizeBytes, int(efb));
+
+        auto best1 = [&](const std::function<void(cudaStream_t)>& launch) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, sa);
+                launch(sa);
+                cudaEventRecord(e1, sa);
+                cudaStreamSynchronize(sa);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (t < best) best = t;
+            }
+            return best;
+        };
+        auto best2 = [&](const std::function<void(cudaStream_t)>& a,
+                         const std::function<void(cudaStream_t)>& b) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, sa);
+                a(sa);
+                cudaEventRecord(e1, sa);
+                cudaEventRecord(e0b, sb);
+                b(sb);
+                cudaEventRecord(e2, sb);
+                cudaStreamSynchronize(sa);
+                cudaStreamSynchronize(sb);
+                float ta = 0.f, tb = 0.f;
+                cudaEventElapsedTime(&ta, e0, e1);
+                cudaEventElapsedTime(&tb, e0b, e2);
+                const float t = ta > tb ? ta : tb;
+                if (t < best) best = t;
+            }
+            return best;
+        };
+        auto seq2 = [&](const std::function<void(cudaStream_t)>& a,
+                        const std::function<void(cudaStream_t)>& b) -> float {
+            float best = 1e9f;
+            for (int r = 0; r < 3; ++r) {
+                cudaEventRecord(e0, sa);
+                a(sa);
+                b(sa);
+                cudaEventRecord(e1, sa);
+                cudaStreamSynchronize(sa);
+                float t = 0.f; cudaEventElapsedTime(&t, e0, e1);
+                if (t < best) best = t;
+            }
+            return best;
+        };
+
+        const float spinA_ms = best1(spinA);
+        const float spinB_ms = best1(spinB);
+        const float ab_seq = seq2(spinA, spinB);
+        const float ab_par = best2(spinA, spinB);
+        const float crt_p = best1(crtP);
+        const float crt_spin = best2(crtP, spinB);
+        const float fh_p = best1(fhP);
+        const float spin_m = best1(spinM);
+        const float fh_spinm = best2(fhP, spinM);
+
+        std::fprintf(stderr,
+            "[P7c] ab_seq=%.3f ab_par=%.3f (spinA=%.3f spinB=%.3f) | "
+            "crt_p=%.3f spin=%.3f crt+spin=%.3f | fh_p=%.3f spinm=%.3f fh+spinm=%.3f "
+            "sms=%u cycles=%lld\n",
+            ab_seq, ab_par, spinA_ms, spinB_ms,
+            crt_p, spinB_ms, crt_spin, fh_p, spin_m, fh_spinm, sms, cycles);
+
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaEventDestroy(e0b); cudaEventDestroy(e2);
+        cudaStreamDestroy(sa); cudaStreamDestroy(sb);
+        cudaFree(d_out); cudaFree(d_spin);
+        cudaGetLastError();
+#endif
     }
 
     // Read and print the stage times. Call after the stream has synchronised.
