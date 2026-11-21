@@ -1290,7 +1290,7 @@ struct Device {
             if (r8f) {
                 // R8F: fused_high runs inverse low stages 8..5 and writes
                 // [pair][x>>5][K][32] into prc; crt_tc2 does stages 4..0.
-                if (M10_FH7 && logH == 7)
+                if (M10_FH7 && logH == 7 && (!M14_FHNK || (n == 65536 && k == 114)))
                 tc::fused_high7<<<dim3(tc::NT_TILE / tc::NT_COLS, k, B), dim3(tc::NT_COLS, 8),
                                  2 * (n / tc::NT_TILE) * (tc::NT_COLS + (TC31_S32 ? 0 : 1)) * sizeof(u32), stream>>>(
                     pra, prb, prc, d_primes, d_twf, d_twi, n, k, d_pk_fwd, d_pk_inv);

@@ -2275,6 +2275,9 @@ fused_high(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restri
                    pki, nullptr, r8f);
 }
 
+#ifndef M14_FHNK
+#define M14_FHNK 1
+#endif
 #ifndef M10_FH7
 #define M10_FH7 1
 #endif
@@ -2285,9 +2288,16 @@ fused_high7(const u32* __restrict__ ra, const u32* __restrict__ rb, u32* __restr
             const gpu31::Prime* __restrict__ primes, const u32* __restrict__ twf,
             const u32* __restrict__ twi, unsigned n, unsigned K,
             const u32* __restrict__ pkf, const u32* __restrict__ pki) {
+#if M14_FHNK
+    // M14: n and K as literals (launch is guarded to n=65536, K=114).
+    fused_high_dev<7>(ra, rb, rc, primes, twf, twi, 65536u, 114u, 7u, pkf, 1u,
+                      blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * 114u + blockIdx.y) * 65536u,
+                      pki, nullptr, 1u);
+#else
     fused_high_dev<7>(ra, rb, rc, primes, twf, twi, n, K, 7u, pkf, 1u,
                       blockIdx.x, blockIdx.y, blockIdx.z, (u64(blockIdx.z) * K + blockIdx.y) * n,
                       pki, nullptr, 1u);
+#endif
 }
 
 // R8: fused_high + inv_low.  Launch with cluster (16,1,1) (non-portable),
